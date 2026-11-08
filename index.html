@@ -178,11 +178,13 @@ body.freecur .edge{opacity:1}
 #chat.hidden{display:none}
 #kfeed{bottom:236px}
 #pNet{margin-top:12px;font-size:13px}
+#uw{position:fixed;inset:0;pointer-events:none;z-index:3;opacity:0;background:radial-gradient(ellipse at center,rgba(20,90,110,.35),rgba(5,30,40,.85));transition:opacity .25s}
+#glare{position:fixed;width:520px;height:520px;margin:-260px 0 0 -260px;pointer-events:none;z-index:3;opacity:0;background:radial-gradient(circle,rgba(255,244,214,.55) 0%,rgba(255,220,160,.18) 22%,rgba(255,200,140,0) 60%);mix-blend-mode:screen}
 </style>
 </head>
 <body>
 <canvas id="cv"></canvas>
-<div id="vig"></div><div class="edge" id="edgeL"></div><div class="edge" id="edgeR"></div><div id="dmg"></div>
+<div id="vig"></div><div id="uw"></div><div id="glare"></div><div class="edge" id="edgeL"></div><div class="edge" id="edgeR"></div><div id="dmg"></div>
 <div id="loading" class="hidden">GENERATING ISLAND…</div>
 
 <div id="menu">
@@ -229,7 +231,7 @@ body.freecur .edge{opacity:1}
     <tr><td>E</td><td>Interact: pick up, open, drink, doors</td></tr>
     <tr><td>Tab</td><td>Inventory &amp; crafting</td></tr>
     <tr><td>G / M</td><td>Field Guide / Map</td></tr>
-    <tr><td>Arrow keys</td><td>Turn (backup if mouse look doesn't work)</td></tr>
+    <tr><td>C</td><td>Crouch (quieter, more accurate) · dive when swimming</td></tr><tr><td>Arrow keys</td><td>Turn (backup if mouse look doesn't work)</td></tr>
   </table>
   <div id="pNet"></div><div class="actions" style="justify-content:center;margin-top:14px"><button class="btn gray" id="pSound">Sound: on</button><button class="btn gray" id="pMenu">Main menu</button></div>
 </div></div>
@@ -396,7 +398,7 @@ function buildTerrain(){
     const dm=dist2(x,z,MON.x,MON.z);if(dm<MON.pad-6)tmp.copy(C.conc).lerp(C.dirt,fbm(x*.1,z*.1,2)*.5);
     cols[i*3]=tmp.r;cols[i*3+1]=tmp.g;cols[i*3+2]=tmp.b}
   g.setAttribute('color',new THREE.BufferAttribute(cols,3));g.computeVertexNormals();
-  {const tm=new THREE.MeshStandardMaterial({vertexColors:true,map:TEX.ground,roughness:.95,normalMap:TEX.groundN,normalScale:new THREE.Vector2(.8,.8)});tm.onBeforeCompile=sh=>{sh.fragmentShader=sh.fragmentShader.replace('#include <map_fragment>','#ifdef USE_MAP\nvec4 texelColor=texture2D(map,vUv)*texture2D(map,vUv*.137+vec2(.31,.17))*1.16;\ntexelColor=mapTexelToLinear(texelColor);\ndiffuseColor*=texelColor;\n#endif')};terrain=new THREE.Mesh(g,tm)}terrain.receiveShadow=true;scene.add(terrain);
+  {const tm=new THREE.MeshStandardMaterial({vertexColors:true,map:TEX.ground,roughness:.95,normalMap:TEX.groundN,normalScale:new THREE.Vector2(.8,.8)});tm.onBeforeCompile=sh=>{terrainShaderExtra(sh);sh.fragmentShader=sh.fragmentShader.replace('#include <map_fragment>','#ifdef USE_MAP\nvec4 texelColor=texture2D(map,vUv)*texture2D(map,vUv*.137+vec2(.31,.17))*1.16;\ntexelColor=mapTexelToLinear(texelColor);\ndiffuseColor*=texelColor;\n#endif')};terrain=new THREE.Mesh(g,tm)}terrain.receiveShadow=true;scene.add(terrain);
   water=new THREE.Mesh(new THREE.PlaneGeometry(5000,5000).rotateX(-Math.PI/2),new THREE.MeshStandardMaterial({color:col('#2a6a80'),roughness:.06,metalness:.25,transparent:true,opacity:.88,normalMap:TEX.waterN,normalScale:new THREE.Vector2(.55,.55)}));
   water.position.set(WS/2,0,WS/2);scene.add(water);
   // grass tufts
@@ -568,7 +570,7 @@ const world=new THREE.Group();scene.add(world);
 function newGame(seed){const restoreRng=seed?seedRandom(seed):null;NET.nextId=1;NET.nid=1;NET.aid=1;for(const k in remoteBases)delete remoteBases[k];for(const k in avatars)delete avatars[k];
   // cleanup
   while(world.children.length)world.remove(world.children[0]);
-  dying=[];falling=[];shrink=[];parts.length=0;if(plane){scene.remove(plane.obj);plane=null}if(drop){scene.remove(drop.obj);drop=null}ents=[];animals=[];npcs=[];projs=[];fx=[];pieces=[];cells=new Map();edges=new Map();roofs=new Map();boxes=[];deps=[];
+  debrisL.length=0;ngC={x:-999,z:-999};dying=[];falling=[];shrink=[];parts.length=0;if(plane){scene.remove(plane.obj);plane=null}if(drop){scene.remove(drop.obj);drop=null}ents=[];animals=[];npcs=[];projs=[];fx=[];pieces=[];cells=new Map();edges=new Map();roofs=new Map();boxes=[];deps=[];
   const sp=beachSpawn(380,420);
   P={gear:{head:null,chest:null,legs:null},mag:0,bleed:0,regen:0,temp:18,wet:0,draw:0,x:sp.x,z:sp.z,y:groundH(sp.x,sp.z),vy:0,yaw:Math.PI/2*-1,pitch:0,hp:60,cal:150,hyd:110,rad:0,poison:0,alive:true,inv:{rock:1,torch:1},
      hot:['rock','torch',null,null,null,null],sel:0,swing:0,cd:0,bob:0,vx:0,vz:0,onGround:true};
@@ -781,6 +783,7 @@ function sfx(type,vol=1,pos){if(muted||!ac())return;if(AC.state==='suspended')AC
    case 'yelp':tn(t,'triangle',900,500,.4,.005,.18,d);break;
    case 'howl':{const o=AC.createOscillator();o.type='sine';o.frequency.setValueAtTime(380,t);o.frequency.linearRampToValueAtTime(720,t+.8);o.frequency.linearRampToValueAtTime(560,t+2.2);const lfo=AC.createOscillator();lfo.frequency.value=5.5;const lg=AC.createGain();lg.gain.value=12;lfo.connect(lg);lg.connect(o.frequency);
      const g=AC.createGain();g.gain.setValueAtTime(.0001,t);g.gain.exponentialRampToValueAtTime(.35,t+.4);g.gain.exponentialRampToValueAtTime(.0001,t+2.4);o.connect(g);g.connect(d);const rs=AC.createGain();rs.gain.value=.6;g.connect(rs);rs.connect(REV);o.start(t);lfo.start(t);o.stop(t+2.5);lfo.stop(t+2.5);break}
+   case 'rattle':for(let i=0;i<9;i++){tn(t+i*.045,'square',R(1800,3200),0,.15,.001,.03,d)}break;
    case 'whiz':nz(t,.15,'bandpass',3000,3,.3,.01,.12,d,1200);break;
    case 'reload':tn(t,'square',1800,1700,.12,.001,.03,d);tn(t+.6,'square',1500,1400,.12,.001,.03,d);tn(t+1.6,'square',2200,2000,.15,.001,.04,d);break;
    case 'splash':nz(t,.3,'lowpass',1500,.7,.4,.01,.28,d);break;
@@ -1019,7 +1022,7 @@ function actionTick(dt){P.cd=Math.max(0,P.cd-dt);const id=P.hot[P.sel];
   if(mouseL&&id!=='bow')primary();
   const pd=P.pending;if(pd&&!pd.done&&P.anim&&P.anim.t>=pd.at){pd.done=true;if(pd.m){if(meleeHit(pd.m,pd.id)&&P.anim)P.anim.impact=1}else pd.fn()}
   if(pd&&(pd.done||!P.anim))P.pending=null;
-  P.flashT=Math.max(0,(P.flashT||0)-dt)}
+  P.flashT=Math.max(0,(P.flashT||0)-dt);P.bloom=Math.max(0,(P.bloom||0)-dt*3)}
 function secondary(){const id=P.hot[P.sel];if(id==='revolver'){reloadRevolver();return}if(id==='building_plan'){S.piece=PIECES[(PIECES.indexOf(S.piece)+1)%PIECES.length];sfx('pick');return}
   if(id==='hammer'){const a=aim(4);if(a.kind==='piece'||a.kind==='door')openUpgrade(a.e);else feedMsg('Look at a building piece')}}
 function eat(id){if(!has(id))return;const f=ITEMS[id].food;take(id,1);P.cal=Math.min(500,P.cal+f.cal);P.hyd=Math.min(250,P.hyd+f.hyd);sfx('pick');
@@ -1039,11 +1042,11 @@ function meleeHit(m,id){const a=aim(m.reach+.6);
       if(id==='rock'&&(S.gathered.wood||0)>150)tip('tools','Rock is slow','Open crafting (Tab) and make a Stone Hatchet and Pickaxe — they gather far faster.');
       if(e.amt<=0){netGone(e,isTree?'fell':'crumble');if(e.t==='metal')gain('hqm_ore',RI(2,4));ents=ents.filter(x=>x!==e);respawnLater(e.t,60);if(isTree){gain('wood',20);fellTree(e)}else crumble(e)}
       else if(!isTree)e.obj.scale.setScalar(1.25*(.55+.45*e.amt/e.max));return true}
-    if(e.t==='barrel'){e.hp--;e.shake=.3;netEnt(e);sfx('thud');burst(a.point,CHIP.barrel,6,2,1.5);if(e.hp<=0){netGone(e,'barrel');lootBarrel(e);burst(new V3(e.x,e.y+.5,e.z),CHIP.barrel,24,4,3);sfx('crack',.7);world.remove(e.obj);ents=ents.filter(x=>x!==e);respawnLater('barrel',70)}return true}
+    if(e.t==='barrel'){e.hp--;e.shake=.3;netEnt(e);sfx('thud');burst(a.point,CHIP.barrel,6,2,1.5);if(e.hp<=0){debris(new V3(e.x,e.y+.5,e.z),e.obj.material===MAT.barrelB?'#2d5d8c':'#9b3a2a',8,.2,'box');netGone(e,'barrel');lootBarrel(e);burst(new V3(e.x,e.y+.5,e.z),CHIP.barrel,24,4,3);sfx('crack',.7);world.remove(e.obj);ents=ents.filter(x=>x!==e);respawnLater('barrel',70)}return true}
     sfx('hit',.4);burst(a.point,CHIP.build,4,1.5,1.2);return true}
   if(a.kind==='animal'){damageAnimal(a.e,m.dmg,'player');hitmark();burst(a.point,CHIP.flesh,9,2,1.6);return true}
   if(a.kind==='corpse'){harvest(a.e,id);burst(a.point,CHIP.flesh,7,1.8,1.5);return true}
-  if(a.kind==='npc'){const hd=a.point.y>a.e.y+1.55;damageNpc(a.e,m.dmg*(hd?1.5:1),'player',hd,ITEMS[id].n);hitmark(hd);burst(a.point,CHIP.flesh,10,2,1.6);return true}
+  if(a.kind==='npc'){const zd=zoneDamage(a.e,m.dmg,a.point.y,'melee');damageNpc(a.e,zd.dmg,'player',zd.head,ITEMS[id].n);hitmark(zd.head);burst(a.point,CHIP.flesh,10,2,1.6);return true}
   if(a.kind==='piece'||a.kind==='door'||a.kind==='dep'){sfx('thud',.5);burst(a.point,CHIP.build,7,2,1.4);return true}
   return false}
 let falling=[],shrink=[],dying=[];
@@ -1059,13 +1062,13 @@ function updateFalling(dt){const q=new THREE.Quaternion();
   for(const s of shrink){s.t+=dt;const k=1-s.t/.45;if(k<=0)world.remove(s.obj);else s.obj.scale.setScalar(s.s0*k)}shrink=shrink.filter(s=>s.t<.45);
   for(const d of dying){d.t+=dt;const k=Math.min(1,d.t/.7);const n=d.n;n.obj.rotation.order='YXZ';n.obj.rotation.x=-Math.PI/2*k*k*.95;n.obj.position.y=n.y+.12*k;if(d.t>8)world.remove(n.obj)}dying=dying.filter(d=>d.t<=8)}
 const arrowGeo=buildGeo([{g:new THREE.CylinderGeometry(.008,.008,.72,5),c:'#c2a070',r:[Math.PI/2,0,0]},{g:new THREE.ConeGeometry(.018,.07,5),c:'#6a6a6a',p:[0,0,.39],r:[Math.PI/2,0,0]},{g:new THREE.BoxGeometry(.002,.035,.1),c:'#d8d0c0',p:[0,0,-.3]},{g:new THREE.BoxGeometry(.035,.002,.1),c:'#b84a3a',p:[0,0,-.3]}]);const arrowMat=MAT.vc;
-function fireRevolver(r){const {o,d}=aimRay();noise(P.x,P.z,90);sfx('shot');P.flashT=.06;P.camShake=Math.max(P.camShake||0,.22);P.pitch=clamp(P.pitch+.02,-1.5,1.5);
-  const a=aim(120);const mw=new V3(.2,-.13,-.75).applyMatrix4(camera.matrixWorld);const tEnd=a.kind?a.point:o.clone().addScaledVector(d,120);tracer(mw,tEnd);if(NET.role)netSend({k:'tr',a:[mw.x,mw.y,mw.z],b:[tEnd.x,tEnd.y,tEnd.z],m:1});
-  if(a.kind==='npc'){const hd=a.point.y>a.e.y+1.55;damageNpc(a.e,r.dmg*(hd?2:1),'player',hd,'Revolver');hitmark(hd);burst(a.point,CHIP.flesh,10,2,1.6)}else if(a.kind==='animal'){damageAnimal(a.e,r.dmg,'player');hitmark();burst(a.point,CHIP.flesh,8,2,1.6)}else if(a.point)burst(a.point,['#8a7a62','#b0a48a','#ffd27a'],8,2.5,2);
-  if(vmCur&&vmCur.userData.drum)vmCur.userData.drumSpin=(vmCur.userData.drumSpin||0)+Math.PI/3}
-function fireBow(power){take('arrow',1);const {o,d}=aimRay();noise(P.x,P.z,20);sfx('bow',.6+power*.4);P.cd=.45;P.stringT=.35;spawnProj(o.clone().addScaledVector(d,.5),d.clone().multiplyScalar(18+32*power),'player',Math.round(40*(.35+.65*power)));
+function fireRevolver(r){const {o,d}=aimRay();noise(P.x,P.z,90);sfx('shot');P.flashT=.06;P.camShake=Math.max(P.camShake||0,.22);P.pitch=clamp(P.pitch+.02+R(0,.01),-1.5,1.5);P.yaw+=R(-.008,.008);
+  const dir=coneDir(d,aimCone());P.bloom=Math.min(4,(P.bloom||0)+1.3);spawnProj(o.clone().addScaledVector(dir,.6),dir.multiplyScalar(300),'player',r.dmg,{kind:'bullet',wname:'Revolver'});
+  if(vmCur&&vmCur.userData.drum)vmCur.userData.drumSpin=(vmCur.userData.drumSpin||0)+Math.PI/3;
+  tip('ballistics','Bullets are physical','In Rust bullets travel and drop, and lose damage with range (pistols lose ~40% by 30 m). Moving or jumping widens your aim cone — stand still or crouch (C) for accuracy. Headshots do ×2.')}
+function fireBow(power){take('arrow',1);const {o,d}=aimRay();noise(P.x,P.z,20);sfx('bow',.6+power*.4);P.cd=.45;P.stringT=.35;{const dir=coneDir(d,((Math.hypot(P.vx,P.vz)>1?1.6:.25)*(P.crouch?.6:1))*Math.PI/180);spawnProj(o.clone().addScaledVector(dir,.5),dir.multiplyScalar(18+32*power),'player',Math.round(50*(.35+.65*power)),{wname:'Hunting Bow'})};
   if(power<.5)tip('bowdraw','Draw the bow','Hold left click longer to draw the bow fully — a full draw flies faster and flatter and hits harder.')}
-function spawnProj(pos,vel,owner,dmg){if(owner&&owner.t==='npc'&&NET.role==='host')netBroadcast({k:'proj',p:[pos.x,pos.y,pos.z],v:[vel.x,vel.y,vel.z]});if(owner==='player'&&NET.role)netSend({k:'pfx',p:[pos.x,pos.y,pos.z],v:[vel.x,vel.y,vel.z]});const m=new THREE.Mesh(arrowGeo,arrowMat);m.position.copy(pos);m.castShadow=true;world.add(m);projs.push({pos,vel,owner,dmg,mesh:m,life:6,stuck:0})}
+function spawnProj(pos,vel,owner,dmg,opt){if(owner&&owner.t==='npc'&&NET.role==='host')netBroadcast({k:'proj',p:[pos.x,pos.y,pos.z],v:[vel.x,vel.y,vel.z]});if(owner==='player'&&NET.role)netSend({k:'pfx',p:[pos.x,pos.y,pos.z],v:[vel.x,vel.y,vel.z],b:opt&&opt.kind==='bullet'?1:0});const bul=opt&&opt.kind==='bullet';const m=new THREE.Mesh(bul?bulletGeo:arrowGeo,bul?bulletMat:arrowMat);m.position.copy(pos);m.castShadow=!bul;world.add(m);projs.push(Object.assign({pos,vel,owner,dmg,mesh:m,life:bul?2:6,stuck:0,dist:0},opt||{}))}
 function tracer(a,b){const g=new THREE.BufferGeometry().setFromPoints([a,b]);const l=new THREE.Line(g,new THREE.LineBasicMaterial({color:0xffe08a,transparent:true,opacity:.85,blending:THREE.AdditiveBlending}));world.add(l);fx.push({obj:l,life:.06})}
 const npcFlash=new THREE.PointLight(0xffc870,0,18,2);scene.add(npcFlash);let npcFlashT=0;
 function npcMuzzle(p){npcFlash.position.copy(p);npcFlash.intensity=3;npcFlashT=.07;burst(p,['#ffe08a','#ffb040'],6,1.5,1,0,.12)}
@@ -1082,6 +1085,7 @@ function harvest(a,id){const mult=TOOLEFF.corpse[id]||.4;sfx('thud',.6);let any=
 /* ================= INTERACT ================= */
 function interactTarget(){const a=aim(3);if(!a.kind)return null;
   if(a.kind==='ent'&&['hemp','mushroom','corn','crate','recycler','airdrop'].includes(a.e.t))return{kind:a.e.t,e:a.e};
+  if(a.kind==='animal'&&a.e.t==='cow')return{kind:'milk',e:a.e};
   if(a.kind==='lootbag')return{kind:'lootbag',e:a.e};
   if(a.kind==='water'){const p=a.point;return{kind:inLake(p.x,p.z,30)?'water':'ocean'}}
   if(a.kind==='dep'&&['tc','box','furnace','campfire','wb','rt'].includes(a.e.type))return{kind:a.e.type,e:a.e};
@@ -1092,9 +1096,10 @@ function interact(){if(!P.alive)return;const t=interactTarget();if(!t)return;sfx
   if(t.kind==='hemp'){gain('cloth',10);removeEnt(t.e,'hemp',120);tip('cloth','That was Cloth','Hemp gives 10 cloth. Cloth is woven fibre — Sleeping Bag (30), Bandage (4), Bow (50), and with animal fat it makes Low Grade Fuel.')}
   else if(t.kind==='mushroom'||t.kind==='corn'){gain(t.kind,1);removeEnt(t.e,t.kind,180);tip('food','Food','Food goes to your hotbar. Select it and left click to eat.')}
   else if(t.kind==='water'){P.hyd=Math.min(250,P.hyd+40);S.drank=true;feedMsg('+40 hydration')}
-  else if(t.kind==='ocean'){P.hyd=Math.max(0,P.hyd-20);feedMsg('Salt water! -20 hydration');tip('salt','Don\'t drink the ocean','Salt water dehydrates you. Drink at the inland lake or rivers.',true)}
+  else if(t.kind==='ocean'){P.hyd=Math.max(0,P.hyd-10);P.hp-=5;feedMsg('Salt water! -10 hydration, -5 HP');tip('salt','Don\'t drink the ocean','Salt water dehydrates you. Drink at the inland lake or rivers.',true)}
   else if(t.kind==='crate'){lootCrate();removeEnt(t.e,null);if(NET.role!=='client')setTimeout(()=>{if(S)netSpawned(spawnCrate(t.e.x,t.e.z))},120000)}
   else if(t.kind==='recycler')recycle();
+  else if(t.kind==='milk'){if((t.e.milkT||0)>S.time)feedMsg('This cow needs time before you can milk it again');else{t.e.milkT=S.time+90;gain('milk',1);sfx('splash',.4,t.e);tip('milk','Livestock','Cows and sheep arrived in Rust\'s October 2026 Livestock update: milk, wool and a Ranch vendor that buys animals.')}}
   else if(t.kind==='airdrop')lootAirdrop();
   else if(t.kind==='lootbag'){if(NET.role&&t.e.id)netSend({k:'bagTaken',id:t.e.id});for(const [k,v] of Object.entries(t.e.inv))gain(k,v);world.remove(t.e.obj);S.lootbags=S.lootbags.filter(b=>b!==t.e);if(t.e.hadKey)S.diedSinceKey=false}
   else if(t.kind==='door'){toggleDoor(t.e)}
@@ -1104,7 +1109,7 @@ function removeEnt(e,respawnType,sec){netGone(e,'pick');world.remove(e.obj);ents
 /* ================= CREATURE DAMAGE ================= */
 function nameOf(x){if(x==='player'||x===P)return NET.role?NET.name:'You';if(x&&x.t==='rplayer')return x.name||'Friend';return x?(x.name||(INFO[x.t]&&INFO[x.t].t)||'?'):'?'}
 function damageAnimal(a,dmg,src){if(a.dead)return;if(NET.role==='client'){sfx('flesh',.6,a);hostSend({k:'da',id:a.id,dmg});return}src=src||'player';a.hp-=dmg;a.aggro=1;sfx(a.t==='wolf'?'yelp':'grunt',.6,a);const foe=src==='player'?P:src;
-  if(a.t==='deer'){a.state='flee';a.tt=R(5,8);a.fleeFrom=foe}else{a.state='attack';a.foe=foe}
+  if(a.t==='deer'||a.t==='cow'||a.t==='sheep'){a.state='flee';a.tt=R(5,8);a.fleeFrom=foe}else{a.state='attack';a.foe=foe}
   if(a.t==='wolf')for(const w of animals)if(w.t==='wolf'&&!w.dead&&dist2(w.x,w.z,a.x,a.z)<30){w.state='attack';w.foe=foe}
   if(a.hp<=0){a.dead=true;a.state='dead';a.deathT=0;a.deathDir=Math.random()<.5?1:-1;a.yields={...ANIM[a.t].y};sfx('fall',.5,a);
     if(src==='player'){feedMsg('Killed '+INFO[a.t].t);S.kills++;tip('corpse','You killed an animal','Hit the corpse with a tool to harvest meat, fat, leather and bone. Then craft a <b>Campfire</b> (100 wood) and press E on it to cook.')}
@@ -1123,7 +1128,7 @@ const bagMesh=()=>{const g=new THREE.Group();g.add(box(.5,.45,.35,M('#4a5a2e'),0
 function dropBag(x,z,inv,hadKey){const bb=makeBag((NET.myId||'l')+':'+(NET.bagN++),x,z,inv,!!NET.role);bb.hadKey=hadKey;return;const y=supportH(x,z,groundH(x,z)+3);const m=bagMesh();m.position.set(x,y,z);world.add(m);S.lootbags.push({x,z,y,inv,ttl:300,hadKey,obj:m})}
 function protection(){let p=0;for(const s of['head','chest','legs']){const id=P.gear[s];if(id)p+=ITEMS[id].prot||0}return Math.min(.6,p)}
 function warmth(){let w=0;for(const s of['head','chest','legs']){const id=P.gear[s];if(id)w+=ITEMS[id].warm||0}return w}
-function hurt(dmg,cause,fx_,fz_){if(!P.alive)return;if(cause==='npc'||cause==='animal')dmg*=1-protection();P.hp-=dmg;
+function hurt(dmg,cause,fx_,fz_){if(!P.alive)return;let zone=null;if(cause==='npc'||cause==='animal'){const r=Math.random();zone=cause==='animal'?(r<.5?'chest':'legs'):(r<.12?'head':r<.65?'chest':'legs');dmg*=ZMULT[zone]*(1-slotProt(zone));if(zone==='head'){feedMsg('Hit in the head!');tip('helmet','Headshots','Head hits do double damage in Rust. A Coffee Can Helmet blocks about 40% of it.',false)}}P.hp-=dmg;
   if(dmg>2)P.camShake=Math.max(P.camShake||0,.3+dmg/40);flashDmg(Math.min(.9,.3+dmg/30));if(dmg>1)sfx('hurt',.8);
   if(fx_!==undefined)showDir(fx_,fz_);
   if((cause==='npc'||cause==='animal')&&dmg>=7&&!P.bleed&&Math.random()<.45){P.bleed=1;tip('bleed','You\'re bleeding','Bleeding drains your health until you use a <b>Bandage</b> (4 cloth) or a Medical Syringe.',true)}
@@ -1333,12 +1338,12 @@ function simulateRaid(){const b=baseCheck();const log=[],tips=[];let lost=false,
   $('#panel').classList.add('hidden');openOverlay('#raid');checkObjective()}
 
 /* ================= DEATH ================= */
-const LESSONS={npc:'A hostile player killed you. Fresh spawns are easy targets — fight with a spear or bow, break line of sight, or hide behind a locked door. At night, a lit torch lets them see you from far away.',animal:'An animal killed you. Wolves are faster than you — face them with a spear instead of running. Boars hit hard when angry.',starve:'You starved or dehydrated. Food is scarce: hunt animals, cook the meat, drink at the lake.',rad:'Radiation killed you. Grab what you can at monuments and get out before the meter climbs.',poison:'Raw meat poisoned you. Always cook meat at a campfire.',bleed:'You bled out. Bandages (4 cloth) and syringes stop bleeding — always carry a few.',cold:'You froze. Wear clothes, avoid water at night and stay near a campfire.',fall:'Falls hurt in Rust. Watch your step on cliffs and roofs.'};
+const LESSONS={npc:'A hostile player killed you. Fresh spawns are easy targets — fight with a spear or bow, break line of sight, or hide behind a locked door. At night, a lit torch lets them see you from far away.',animal:'An animal killed you. Wolves are faster than you — face them with a spear instead of running. Boars hit hard when angry.',starve:'You starved or dehydrated. Food is scarce: hunt animals, cook the meat, drink at the lake.',rad:'Radiation killed you. Grab what you can at monuments and get out before the meter climbs.',poison:'Raw meat poisoned you. Always cook meat at a campfire.',bleed:'You bled out. Bandages (4 cloth) and syringes stop bleeding — always carry a few.',drown:'You drowned. You can hold your breath for about 30 seconds — watch the O₂ meter and surface with Space.',cold:'You froze. Wear clothes, avoid water at night and stay near a campfire.',fall:'Falls hurt in Rust. Watch your step on cliffs and roofs.'};
 function die(cause,detail){if(!P.alive)return;P.alive=false;S.deaths++;
   refundQueue();for(const sl of['head','chest','legs'])if(P.gear[sl]){P.inv[P.gear[sl]]=(P.inv[P.gear[sl]]||0)+1;P.gear[sl]=null}P.mag=0;P.bleed=0;P.regen=0;const inv={...P.inv};const hadKey=!!inv.door_key;delete inv.rock;delete inv.torch;if(Object.keys(inv).length)dropBag(P.x,P.z,inv,hadKey);if(hadKey)S.diedSinceKey=true;
   P.inv={rock:1,torch:1};P.hot=['rock','torch',null,null,null,null];P.sel=0;updateHotbar();
   ['#inv','#panel','#guide','#raid','#mapov'].forEach(s=>$(s).classList.add('hidden'));S.active=false;mouseL=false;if(document.pointerLockElement)document.exitPointerLock();$('#pause').classList.add('hidden');
-  $('#dCause').textContent=detail||({starve:'Died of starvation',rad:'Radiation poisoning',poison:'Food poisoning',bleed:'Bled out',cold:'Froze to death',fall:'Fell to death'}[cause]||'You died');
+  $('#dCause').textContent=detail||({starve:'Died of starvation',rad:'Radiation poisoning',poison:'Food poisoning',bleed:'Bled out',drown:'Drowned',cold:'Froze to death',fall:'Fell to death'}[cause]||'You died');
   $('#dLesson').innerHTML=(LESSONS[cause]||'')+(Object.keys(inv).length?'<br><br>Everything you carried is in a <b>backpack</b> where you died. Go get it before it disappears.':'')+(hadKey?'<br><br><span class="warn">Your Door Key was in that backpack.</span>':'');
   renderSpawns();$('#death').classList.remove('hidden')}
 function renderSpawns(){if(P.alive)return;let h=`<button class="btn gray" onclick="respawn(-1)"><span>Respawn on a random beach</span><span>ready</span></button>`;
@@ -1346,7 +1351,7 @@ function renderSpawns(){if(P.alive)return;let h=`<button class="btn gray" onclic
   if(!S.bags.length)h+='<div style="color:var(--dim);font-size:13px;margin-top:6px">No sleeping bags placed. Craft one with 30 cloth.</div>';$('#dSpawns').innerHTML=h}
 function respawn(i){if(i>=0){const b=S.bags[i];if(b.ready>S.time)return;P.x=b.x+.6;P.z=b.z+.6;b.ready=S.time+45;S.bags.forEach(o=>{if(o!==b&&dist2(o.x,o.z,b.x,b.z)<50)o.ready=Math.max(o.ready,S.time+45)})}
   else{const p=beachSpawn();P.x=p.x;P.z=p.z;if(S.npcOn)tip('beachspawn','Back on the beach','No bag means a random beach — far from your stuff and right where roamers patrol. Head inland fast.',true)}
-  P.y=supportH(P.x,P.z,groundH(P.x,P.z)+3);P.vy=0;P.hp=60;P.cal=Math.max(P.cal,140);P.hyd=Math.max(P.hyd,100);P.rad=0;P.poison=0;P.bleed=0;P.temp=Math.max(P.temp,12);P.wet=0;P.alive=true;
+  P.y=supportH(P.x,P.z,groundH(P.x,P.z)+3);P.vy=0;P.hp=60;P.cal=Math.max(P.cal,140);P.hyd=Math.max(P.hyd,100);P.rad=0;P.poison=0;P.bleed=0;P.oxy=30;P.comfort=0;P.temp=Math.max(P.temp,12);P.wet=0;P.alive=true;
   for(const n of npcs){if(n.foe===P){n.foe=null;n.state='wander';n.target=null}}
   $('#death').classList.add('hidden');resume();
   if(S.deaths===1)tip('firstdeath','Dying in Rust','Death is normal. What matters is what you lose and where you respawn. Bag up, store your loot, and only carry what you\'re willing to lose.',true)}
@@ -1359,25 +1364,32 @@ function frame(now,hidden){const dt=Math.min(hidden?.25:.05,(now-last)/1000);las
     if(NET.role)netTick(dt);if(!hidden)render(dt)}}
 let lastRafT=0;function loop(now){lastRafT=performance.now();frame(now,false);requestAnimationFrame(loop)}
 setInterval(()=>{if(NET.role&&inGame()&&(document.hidden||performance.now()-lastRafT>300))frame(performance.now(),true)},100);
-function worldTick(dt){updateAnimals(dt);if(S.npcOn||S.time>200){S.npcOn=true;updateNpcs(dt)}updateProjs(dt);updateParticles(dt);updateFalling(dt);updateEvents(dt);S.noise=S.noise.filter(n=>S.time-n.t<2);for(const f of fx){f.life-=dt;if(f.life<=0)world.remove(f.obj)}fx=fx.filter(f=>f.life>0)}
-function clientWorldTick(dt){netClientUpdate(dt);updateProjs(dt);updateParticles(dt);updateFalling(dt);updateEvents(dt)}
+function worldTick(dt){updateAnimals(dt);if(S.npcOn||S.time>200){S.npcOn=true;updateNpcs(dt)}updateProjs(dt);updateParticles(dt);updateFalling(dt);updateDebris(dt);updateEvents(dt);S.noise=S.noise.filter(n=>S.time-n.t<2);for(const f of fx){f.life-=dt;if(f.life<=0)world.remove(f.obj)}fx=fx.filter(f=>f.life>0)}
+function clientWorldTick(dt){netClientUpdate(dt);updateProjs(dt);updateParticles(dt);updateFalling(dt);updateDebris(dt);updateEvents(dt)}
 function update(dt){S.time+=dt;
   const turn=(keys.arrowleft?1:0)-(keys.arrowright?1:0);P.yaw+=turn*2.2*dt;P.pitch=clamp(P.pitch+((keys.arrowup?1:0)-(keys.arrowdown?1:0))*1.6*dt,-1.5,1.5);
   if(freeCursor()&&mouseIn&&mouseX>=0&&!mouseR){const ex=mouseX/innerWidth,ey=mouseY/innerHeight,Z=.18,ZT=.12,ZB=.07;const t=ex<Z?(Z-ex)/Z:ex>1-Z?-(ex-1+Z)/Z:0;const v=ey<ZT?(ZT-ey)/ZT:ey>1-ZB?-(ey-1+ZB)/ZB:0;const yv=Math.sign(t)*Math.pow(Math.abs(t),1.5)*2.8,pv=Math.sign(v)*Math.pow(Math.abs(v),1.5)*1.5;P.yaw+=yv*dt;P.pitch=clamp(P.pitch+pv*dt,-1.5,1.5);P.lookDX=(P.lookDX||0)-yv*dt/SENS*.5}
-  const fw=(keys.w?1:0)-(keys.s?1:0),st=(keys.d?1:0)-(keys.a?1:0);const inWater=P.y<-.4;let sp=(keys.shift&&fw>0?8:5)*(inWater?.5:1);
+  const gh0=groundH(P.x,P.z),deep=gh0<-1.45;P.swim=deep&&P.y<-.9;const inWater=P.y<-.4;
+  P.crouch=!!keys.c&&!P.swim&&P.onGround;P.eye=lerp(P.eye||1.62,P.crouch?1.05:1.62,Math.min(1,dt*12));
+  const fw=(keys.w?1:0)-(keys.s?1:0),st=(keys.d?1:0)-(keys.a?1:0);let sp=P.swim?(keys.shift?4:3):P.crouch?2.3:(keys.shift&&fw>0?8:5)*(inWater?.6:1);if(P.temp<0)sp*=.9;
   const sx=Math.sin(P.yaw),cz=Math.cos(P.yaw);let mx=-sx*fw+cz*st,mz=-cz*fw-sx*st;const l=Math.hypot(mx,mz);
-  const tvx=l?mx/l*sp:0,tvz=l?mz/l*sp:0;const acc=P.onGround?12:3;P.vx=lerp(P.vx,tvx,Math.min(1,acc*dt));P.vz=lerp(P.vz,tvz,Math.min(1,acc*dt));P.strafeV=lerp(P.strafeV||0,st*sp,Math.min(1,dt*8));
+  const tvx=l?mx/l*sp:0,tvz=l?mz/l*sp:0;const acc=P.swim?4:P.onGround?12:3;P.vx=lerp(P.vx,tvx,Math.min(1,acc*dt));P.vz=lerp(P.vz,tvz,Math.min(1,acc*dt));P.strafeV=lerp(P.strafeV||0,st*sp,Math.min(1,dt*8));
   const ox=P.x,oz=P.z;P.x+=P.vx*dt;P.z+=P.vz*dt;const o={x:P.x,z:P.z};collide(o,.32,P.y);P.x=clamp(o.x,6,WS-6);P.z=clamp(o.z,6,WS-6);
-  const sup=Math.max(supportH(P.x,P.z,P.y),-1.3);P.vy-=22*dt;if(keys[' ']&&P.onGround&&!inWater){P.vy=7;P.onGround=false}P.y+=P.vy*dt;
-  if(P.y<=sup){if(P.vy<-4&&!P.onGround)P.landT=Math.min(1,-P.vy/12);if(P.vy<-15)hurt((-P.vy-15)*4,'fall');P.y=sup;P.vy=0;P.onGround=true}else P.onGround=P.y-sup<.05;
-  if(inWater&&!P.wasWater)sfx('splash',.7);P.wasWater=inWater;
-  const mv=Math.hypot(P.x-ox,P.z-oz);S.moved+=mv;if(keys.shift&&mv>0&&Math.random()<dt*4)noise(P.x,P.z,16);
+  const gh=groundH(P.x,P.z);
+  if(P.swim){const want=keys.c?-2.2:keys[' ']?2.2:(P.y<-1.35?1.6:-.4);P.vy=lerp(P.vy,want,Math.min(1,dt*3));P.y+=P.vy*dt;if(!keys.c&&!keys[' ']&&P.y>-1.42)P.y=lerp(P.y,-1.35+Math.sin(S.time*1.7)*.05,Math.min(1,dt*3));P.y=Math.max(P.y,gh+.05);P.onGround=false;P.airPeak=P.y;
+    if(l&&Math.random()<dt*2.2)sfx('splash',.18);if(P.y<-1.6)tip('dive','Underwater','Hold <b>C</b> to dive and <b>Space</b> to swim up. You can hold your breath for about 30 seconds before you start drowning.')}
+  else{const sup=Math.max(supportH(P.x,P.z,P.y),deep?-99:-1.3);P.vy-=22*dt;if(keys[' ']&&P.onGround&&!inWater&&!P.crouch){P.vy=7;P.onGround=false}
+    if(!P.onGround)P.airPeak=Math.max(P.airPeak===undefined?P.y:P.airPeak,P.y);P.y+=P.vy*dt;
+    if(P.y<=sup){if(!P.onGround){const h=(P.airPeak===undefined?P.y:P.airPeak)-sup;if(P.vy<-4)P.landT=Math.min(1,-P.vy/12);if(h>5&&!deep)fallDamage(h)}P.y=sup;P.vy=0;P.onGround=true;P.airPeak=P.y}else{P.onGround=P.y-sup<.05;if(P.onGround)P.airPeak=P.y}}
+  if(inWater&&!P.wasWater){sfx('splash',.8);burst(new V3(P.x,.05,P.z),['#cfe6f0','#9fc6d8'],16,2,3,9,.6)}P.wasWater=inWater;
+  if(P.y+(P.eye||1.62)<-.05){P.oxy=Math.max(0,(P.oxy===undefined?30:P.oxy)-dt);if(P.oxy<=0){P.hp-=5*dt;flashDmg(.3);if(P.hp<=0)return die('drown')}}else P.oxy=Math.min(30,(P.oxy===undefined?30:P.oxy)+dt*6);
+  const mv=Math.hypot(P.x-ox,P.z-oz);S.moved+=mv;if(keys.shift&&!P.crouch&&mv>0&&Math.random()<dt*4)noise(P.x,P.z,16);
   // vitals
-  const run=keys.shift&&l?1.6:1;updateTemp(dt);const cold=P.temp<5;
-  P.cal=Math.max(0,P.cal-.22*dt*run*(cold?1.8:1));P.hyd=Math.max(0,P.hyd-.32*dt*run);
-  if(P.cal<=0||P.hyd<=0){hurt(1.2*dt,'starve');if(!P.alive)return}else if(P.cal>120&&P.hyd>70&&P.hp<100&&P.poison<=0&&!P.bleed&&!cold)P.hp=Math.min(100,P.hp+.5*dt);
+  const run=keys.shift&&l?1.6:1;updateTemp(dt);updateComfort(dt);updateAlarms(dt);const cold=P.temp<5;
+  P.cal=Math.max(0,P.cal-.22*dt*run*(cold?1.8:1)*(1-.3*(P.comfort||0)));P.hyd=Math.max(0,P.hyd-.32*dt*run);
+  if(P.cal<=0||P.hyd<=0){hurt(1.2*dt,'starve');if(!P.alive)return}else if(P.cal>120&&P.hyd>70&&P.hp<100&&P.poison<=0&&!P.bleed&&!cold)P.hp=Math.min(100,P.hp+.5*dt*(1+(P.comfort||0)));
   if(P.regen>0){const r=Math.min(P.regen,6*dt);P.regen-=r;P.hp=Math.min(100,P.hp+r)}
-  if(P.bleed){P.hp-=.7*dt;if(Math.random()<dt*2)burst(new V3(P.x,P.y+.9,P.z),CHIP.flesh,1,.4,.2);if(P.hp<=0)return die('bleed')}
+  if(P.bleed){P.hp-=1*dt;if(Math.random()<dt*2)burst(new V3(P.x,P.y+.9,P.z),CHIP.flesh,1,.4,.2);if(P.hp<=0)return die('bleed')}
   if(P.temp<0){P.hp-=.4*dt;if(P.hp<=0)return die('cold')}
   if(cold)tip('cold','You\'re cold','Night, rain and water make you cold. Cold burns calories fast, and freezing hurts. Craft burlap clothes (cloth) and wear them from your inventory, or stand next to a campfire.');
   if(P.poison>0){const d=Math.min(P.poison,2*dt);P.poison-=d;P.hp-=d;P.hyd=Math.max(0,P.hyd-d);if(P.hp<=0)return die('poison')}
@@ -1388,7 +1400,7 @@ function update(dt){S.time+=dt;
   actionTick(dt);
   if(isNight())tip('night','Night time','It\'s dark — and hostile players can barely see you either. <b>A lit torch</b> (select it) lets you see, but makes you visible from far away. Put it away to hide.');
   if(NET.role==='client')netClientUpdate(dt);else updateAnimals(dt);if(NET.role==='client'){}else if(S.npcOn||S.time>200){S.npcOn=true;updateNpcs(dt)}else idleNpcs(dt);
-  updateProjs(dt);updateParticles(dt);updateFalling(dt);updateEvents(dt);for(const f of fx){f.life-=dt;if(f.life<=0)world.remove(f.obj)}fx=fx.filter(f=>f.life>0);
+  updateProjs(dt);updateParticles(dt);updateFalling(dt);updateDebris(dt);updateEvents(dt);for(const f of fx){f.life-=dt;if(f.life<=0)world.remove(f.obj)}fx=fx.filter(f=>f.life>0);
   for(const e of ents)if(e.shake>0){e.shake-=dt;if(e.t==='tree')setTreeMatrix(e,e.shake>0?Math.sin(e.shake*40)*.03:0);else if(e.obj)e.obj.position.x=e.x+(e.shake>0?Math.sin(e.shake*60)*.04:0)}
   for(const lb of S.lootbags){lb.ttl-=dt;if(lb.ttl<=0)world.remove(lb.obj)}S.lootbags=S.lootbags.filter(l=>l.ttl>0);
   S.noise=S.noise.filter(n=>S.time-n.t<2);
@@ -1426,7 +1438,7 @@ function updateAnimals(dt){const night=isNight();
     animateAnimal(a,dt)}}
 /* ---- npcs ---- */
 function idleNpcs(dt){for(const n of npcs){n.speed=0;animateNpc(n,dt)}}
-function npcVision(n,t){const night=isNight();const base=(n.role==='roamer'?85:75)*(1-.35*(S.rain||0));if(!night)return base;if(t===P)return torchOn()?80:20;if(t.t==='rplayer')return t.torch?80:20;return 24}
+function npcVision(n,t){const night=isNight();const base=(n.role==='roamer'?85:75)*(1-.35*(S.rain||0));if(!night)return base*(t===P&&P.crouch?.65:1);if(t===P)return torchOn()?80:(P.crouch?13:20);if(t.t==='rplayer')return t.torch?80:20;return 24}
 function canSeeT(n,t){if(!alive(t))return false;const d=dist2(n.x,n.z,t.x,t.z);if(d>npcVision(n,t))return false;
   const ang=Math.atan2(t.x-n.x,t.z-n.z);const df=Math.abs(((ang-n.yaw+Math.PI*3)%(Math.PI*2))-Math.PI);if(df>1.3&&d>7)return false;if(t===P&&playerInside())return false;
   return los(n.x,n.y+1.7,n.z,t.x,eyeY(t),t.z)}
@@ -1473,18 +1485,18 @@ function npcAttack(n,t,d){const night=isNight();n.atkT=1;const wn=KITS[n.kit].na
 function npcLootDrop(n){if(!drop||!drop.landed)return;n.extra=Object.assign(n.extra||{},drop.loot);removeDrop();if(NET.role)netSend({k:'dropGone'});n.hp=100;killfeed(`${n.name} looted the supply drop`);
   if(n.kit!=='revolver'){world.remove(n.obj);n.kit='revolver';n.m=makeHuman('revolver');n.obj=n.m.g;world.add(n.obj);n.ammo=6}n.state='wander';n.target=null;
   if(dist2(n.x,n.z,P.x,P.z)<200)tip('droplost','They got the drop','A hostile player looted the supply drop first. Kill them and their backpack will hold the loot.',true)}
-function updateProjs(dt){for(const pr of projs){pr.life-=dt;if(pr.stuck)continue;pr.vel.y-=9.8*.6*dt;const step=pr.vel.clone().multiplyScalar(dt);const L=step.length();const dir=step.clone().normalize();const o=pr.pos.clone();
+function updateProjs(dt){for(const pr of projs){pr.life-=dt;if(pr.stuck)continue;pr.vel.y-=9.8*(pr.kind==='bullet'?1:.6)*dt;const step=pr.vel.clone().multiplyScalar(dt);const L=step.length();pr.dist=(pr.dist||0)+L;const dir=step.clone().normalize();const o=pr.pos.clone();
     let hitT=null,hw=null;const test=(tag,e,r,y0,y1)=>{const tt=rayCyl(o,dir,e.x,e.z,r,y0,y1,L);if(tt!==null&&(hitT===null||tt<hitT)){hitT=tt;hw=tag}};
     if(pr.owner!=='fx')for(const n of npcs)if(n!==pr.owner&&!n.dead)test(['npc',n],n,.42,n.y,n.y+1.9);
     if(pr.owner!=='fx')for(const a of animals)if(!a.dead)test(['animal',a],a,.6,a.y,a.y+a.ph);
-    if(pr.owner!=='player'&&pr.owner!=='fx'&&P.alive)test(['player'],P,.4,P.y,P.y+1.8);if(pr.owner!=='player'&&pr.owner!=='fx'&&NET.role==='host')for(const r of remoteList())if(!r.dead)test(['rp',r],r,.4,r.y,r.y+1.8);
+    if(pr.owner!=='player'&&pr.owner!=='fx'&&P.alive)test(['player'],P,.4,P.y,P.y+(P.crouch?1.2:1.8));if(pr.owner!=='player'&&pr.owner!=='fx'&&NET.role==='host')for(const r of remoteList())if(!r.dead)test(['rp',r],r,.4,r.y,r.y+1.8);
     for(const b of nearBoxes(o.x,o.z,L+1)){const t=rayBox(o,dir,b,L);if(t!==null&&(hitT===null||t<hitT)){hitT=t;hw=['wall']}}
     for(const e of nearEnts(o.x,o.z,L+2)){if(!e.solid)continue;const t=rayCyl(o,dir,e.x,e.z,e.r,e.y,e.y+(e.t==='tree'?4:e.ph),L);if(t!==null&&(hitT===null||t<hitT)){hitT=t;hw=['wall']}}
-    const np=o.clone().addScaledVector(dir,hitT!==null?hitT:L);if(hitT===null&&np.y<groundH(np.x,np.z)){hw=['wall'];np.y=groundH(np.x,np.z)+.05}
+    const np=o.clone().addScaledVector(dir,hitT!==null?hitT:L);if(hitT===null&&np.y<0&&groundH(np.x,np.z)<0){np.y=0;burst(np,['#cfe6f0','#9fc6d8'],8,1.5,3,9,.6);sfx('splash',.3,np);pr.life=0;world.remove(pr.mesh);continue}if(hitT===null&&np.y<groundH(np.x,np.z)){hw=['wall'];np.y=groundH(np.x,np.z)+.05}
     pr.pos.copy(np);pr.mesh.position.copy(np);pr.mesh.lookAt(np.clone().add(pr.vel));
     if(hw){pr.stuck=1;pr.life=Math.min(pr.life,4);const src=pr.owner==='player'?'player':pr.owner;
-      if(hw[0]==='wall'){burst(np,CHIP.dirt,4,1.2,1);sfx('arrowhit',.5,np)}
-      else if(hw[0]==='npc'){const head=np.y>hw[1].y+1.55;damageNpc(hw[1],pr.dmg*(head?2:1),src,head,src==='player'?'Arrow':KITS[pr.owner.kit].name);if(src==='player')hitmark(head);burst(np,CHIP.flesh,8,1.8,1.4);pr.life=0}
+      if(hw[0]==='wall'){burst(np,CHIP.dirt,pr.kind==='bullet'?7:4,1.6,1.2);sfx(pr.kind==='bullet'?'rockhit':'arrowhit',.4,np);if(pr.kind==='bullet')pr.life=0}
+      else if(hw[0]==='npc'){let bd=pr.dmg;if(pr.kind==='bullet')bd*=falloff(pr.dist||0);const zd=zoneDamage(hw[1],bd,np.y,pr.xbow?'xbow':'proj');damageNpc(hw[1],zd.dmg,src,zd.head,pr.wname||(src==='player'?'Arrow':KITS[pr.owner.kit].name));if(src==='player')hitmark(zd.head);burst(np,CHIP.flesh,8,1.8,1.4);pr.life=0}
       else if(hw[0]==='animal'){damageAnimal(hw[1],pr.dmg,src);if(src==='player')hitmark();burst(np,CHIP.flesh,6,1.5,1.2);pr.life=0}
       else if(hw[0]==='rp'){netHurtRemote(hw[1],pr.dmg,pr.owner,'Hunting Bow');pr.life=0}
       else if(hw[0]==='player'){hurt(pr.dmg,'npc',pr.owner.x,pr.owner.z);if(!P.alive)$('#dCause').textContent=`Killed by ${pr.owner.name} (Hunting Bow)`;pr.life=0}}}
@@ -1521,7 +1533,7 @@ function wear(id){const it=ITEMS[id];if(!it.wear||!has(id))return;const old=P.ge
 function unwear(slot){const id=P.gear[slot];if(!id)return;P.gear[slot]=null;gain(id,1,true);renderInv()}
 // --- weapons ---
 function reloadRevolver(){if((P.mag||0)>=6||!has('pistol_ammo')||(P.anim&&P.anim.type==='reload'))return;startAnim('reload',2.2);sfx('reload',.8);P.cd=2.2;P.pending={fn:()=>{const n=Math.min(6-(P.mag||0),P.inv.pistol_ammo||0);take('pistol_ammo',n);P.mag=(P.mag||0)+n;updateHotbar()},at:.85,done:false}}
-function fireXbow(r){take('arrow',1);const {o,d}=aimRay();noise(P.x,P.z,25);sfx('bow',1);spawnProj(o.clone().addScaledVector(d,.5),d.clone().multiplyScalar(r.speed),'player',r.dmg);setTimeout(()=>sfx('reload',.4),400)}
+function fireXbow(r){take('arrow',1);const {o,d}=aimRay();noise(P.x,P.z,25);sfx('bow',1);spawnProj(o.clone().addScaledVector(d,.5),d.clone().multiplyScalar(r.speed),'player',r.dmg,{xbow:1,wname:'Crossbow'});setTimeout(()=>sfx('reload',.4),400)}
 // --- supply drop ---
 let plane=null,drop=null;
 function planeMesh(){const g=new THREE.Group();const m=M('#6a7058',{metalness:.3,roughness:.6}),dk=M('#3a3d32');const f=new THREE.Mesh(new THREE.CylinderGeometry(1.7,1.2,18,10),m);f.rotation.x=Math.PI/2;g.add(f);
@@ -1652,7 +1664,7 @@ function onMsg(m,conn){const from=m.from;
    case 'build':NET.builds[m.from]=m.d;buildRemote(m.from,m.d);break;
    case 'chat':showChat(NET.names[m.from]||'Friend',m.txt);break;
    case 'kf':killfeed(m.txt);break;
-   case 'pfx':{const p=new V3(...m.p);spawnProj(p,new V3(...m.v),'fx',0);sfx('bow',.6,p);break}
+   case 'pfx':{const p=new V3(...m.p);spawnProj(p,new V3(...m.v),'fx',0,m.b?{kind:'bullet'}:undefined);sfx(m.b?'shot':'bow',m.b?1:.6,p);break}
    case 'proj':{const p=new V3(...m.p);spawnProj(p,new V3(...m.v),'fx',0);sfx('bow',.7,p);break}
    case 'tr':{const a=new V3(...m.a),b=new V3(...m.b);tracer(a,b);if(m.m){sfx('shot',1,a);npcMuzzle(a)}break}
    case 'plane':if(!plane&&!drop)startAirdrop(m.tg,m.ang);break;
@@ -1719,6 +1731,101 @@ $('#lCopy').onclick=()=>{const i=$('#lLink');i.select();try{navigator.clipboard.
 $('#lStart').onclick=()=>{$('#lobby').classList.add('hidden');startGame(NET.seed,()=>tip('mphost','You are hosting','Your browser runs the island — keep this tab open. Invite link: <b>'+inviteLink()+'</b> (also on the pause screen). Press <b>Enter</b> to chat.',true))};
 {const q=new URLSearchParams(location.search).get('join');if(q){$('#lCode').value=q.toUpperCase();openLobby();netStatus('Your friend invited you. Enter your name and press <b>Join</b>.')}}
 
+/* ================= MECHANICS & EFFECTS (v6) ================= */
+// ---- items from 2026 updates & balance from research ----
+Object.assign(ITEMS,{
+ sandbag:{n:'Sandbag Barricade',c:'#b8a070',cat:'Deployable',hot:1,dep:'sandbag',d:'Stackable cover that stops bullets and arrows (overhauled in Rust\'s Oct 2026 Livestock update).',f:'Craft: 20 cloth, 50 stones (approx).',u:'Place it as cover near your base or in a fight. Blocks line of sight.'},
+ tin_alarm:{n:'Tin Can Alarm',c:'#a8a8a0',cat:'Deployable',hot:1,dep:'alarm',d:'Rattles when something walks past — an early-warning trap (improved in the May 2026 update).',f:'Craft: 1 rope, 20 metal fragments (approx).',u:'Place it around your base. You hear it and get a message when a player or animal comes close.'},
+ wool:{n:'Wool',c:'#ece6d8',cat:'Resource',d:'From sheep, added with Rust\'s Oct 2026 Livestock update.',f:'Harvest a sheep.',u:'Training shortcut: craft into cloth (1 wool → 2 cloth).'},
+ milk:{n:'Milk',c:'#f4f2ea',cat:'Food',d:'Fresh milk from a cow (Livestock update, Oct 2026).',f:'Press E on a cow (it needs time between milkings).',u:'Left click to drink: +30 calories, +45 hydration.',food:{cal:30,hyd:45}},
+});
+ITEMS.burlap_headwrap.prot=.05;ITEMS.burlap_shirt.prot=.05;ITEMS.burlap_trousers.prot=.05;ITEMS.coffee_can_helmet.prot=.4;ITEMS.roadsign_jacket.prot=.4;
+ITEMS.bow.ranged.dmg=50;ITEMS.crossbow.ranged.dmg=60;ITEMS.revolver.ranged.dmg=35;
+ITEMS.revolver.u='Press R to load 6 rounds. Bullets travel, drop and lose damage with range. Headshots ×2. Stand still or crouch for accuracy.';
+RECIPES.splice(RECIPES.findIndex(r=>r.id==='lgf')+1,0,{id:'cloth',cost:{wool:1},out:2,time:5,cat:'Survival'});
+RECIPES.splice(RECIPES.findIndex(r=>r.wb),0,{id:'sandbag',cost:{cloth:20,stone:50},time:15,cat:'Building'},{id:'tin_alarm',cost:{rope:1,metal_frag:20},time:10,cat:'Building'});
+Object.assign(DEPS,{sandbag:{size:[2.2,1.1,.8],solid:1},alarm:{size:[.4,.6,.4]}});
+Object.assign(INFO,{
+ cow:{k:'Livestock',t:'Cow',d:'Passive. Press E to milk it; harvest for lots of meat and leather.',rows:[['2026','Added in Rust\'s Livestock update (Oct 2026), with ranch vendors that buy animals.']],g:'rust2026'},
+ sheep:{k:'Livestock',t:'Sheep',d:'Passive. Harvest it for wool and meat.',rows:[['2026','Livestock update, Oct 2026.']],g:'rust2026'},
+ milk:{k:'Livestock',t:'Cow',d:'Press E to milk.',rows:[],g:'rust2026'},
+ sandbag:{k:'Cover',t:'Sandbag Barricade',d:'Blocks bullets, arrows and line of sight.',rows:[],g:'rust2026'},
+ alarm:{k:'Trap',t:'Tin Can Alarm',d:'Rattles when something passes within ~7 m.',rows:[],g:'rust2026'},
+});
+PROMPTS.milk='Milk cow';
+ANIM.cow={hp:150,speed:5.5,dmg:0,y:{raw_meat:10,leather:20,bone:12,animal_fat:10}};ANIM.sheep={hp:70,speed:6.5,dmg:0,y:{raw_meat:5,wool:12,bone:6}};
+const _makeAnimal=makeAnimal;makeAnimal=function(sp){if(sp!=='cow'&&sp!=='sheep')return _makeAnimal(sp);const g=new THREE.Group(),body=new THREE.Group();g.add(body);const legs=[],head=new THREE.Group();const fl={flatShading:true};let tail=null;
+  if(sp==='cow'){const w=M('#ece6dc',fl),bk=M('#2a2622',fl);body.add(ell(.55,w,1.45,.75,.7,0,1.05,0));for(const [x,y,z,r] of[[.2,1.25,.28,.22],[-.35,1.05,-.3,.25],[.4,.95,-.25,.18]])body.add(ell(r,bk,1,.6,.5,x,y,z));
+    head.position.set(.85,1.15,0);head.add(box(.42,.32,.3,w,.05,0,0));head.add(box(.16,.16,.26,M('#d8a8a0'),.3,-.08,0));for(const z of[.13,-.13])head.add(box(.04,.12,.04,M('#d8d0c0'),-.05,.2,z));body.add(head);tail=box(.04,.5,.04,w,-.8,.9,0);body.add(tail);
+    for(const [x,z] of [[.45,.2],[.45,-.2],[-.45,.2],[-.45,-.2]]){const l=legGroup(.13,.75,.13,w,x,.78,z);legs.push(l);g.add(l)}}
+  else{const wl=M('#efe9dc',fl),dk=M('#2e2a26',fl);for(const [x,y,z,r] of[[0,.75,0,.42],[.25,.8,.1,.3],[-.25,.78,-.1,.32],[0,.9,.15,.28],[.1,.85,-.18,.28]])body.add(ell(r,wl,1,.85,.9,x,y,z));
+    head.position.set(.5,.85,0);head.add(box(.26,.2,.18,dk,.05,0,0));for(const z of[.1,-.1])head.add(box(.05,.03,.1,dk,-.02,.06,z*1.4));body.add(head);
+    for(const [x,z] of [[.25,.13],[.25,-.13],[-.25,.13],[-.25,-.13]]){const l=legGroup(.07,.5,.07,dk,x,.5,z);legs.push(l);g.add(l)}}
+  shadowAll(g);return{g,legs,body,head,tail}};
+const _spawnWorld=spawnWorld;spawnWorld=function(){_spawnWorld();for(let h=0;h<2;h++){const c=randLand((x,z)=>landOK(x,z,3)&&forest(x,z)<.33&&x>180&&x<520);if(!c)continue;for(let i=0;i<4;i++){const p=randLand((x,z)=>landOK(x,z)&&dist2(x,z,c.x,c.z)<30);if(p)spawnAnimal(h?'sheep':'cow',p.x,p.z)}}};
+const _depMesh=depMesh;depMesh=function(type){if(type==='sandbag'){const g=new THREE.Group();const m=M('#b8a070',{flatShading:true});for(let r=0;r<3;r++)for(let i=0;i<4;i++){const b=ell(.3,m,1.2,.5,.7,-.8+i*.53+(r%2)*.26-.13,.17+r*.32,0);b.rotation.y=R(-.15,.15);g.add(b)}return shadowAll(g)}
+  if(type==='alarm'){const g=new THREE.Group();g.add(box(.04,.6,.04,M('#5a4a3a'),0,.3,0));const cm=M('#b8b8b0',{metalness:.7,roughness:.4});for(let i=0;i<4;i++){const c=new THREE.Mesh(new THREE.CylinderGeometry(.05,.05,.11,8),cm);c.position.set(Math.cos(i*1.57)*.09,.5,Math.sin(i*1.57)*.09);g.add(c)}return shadowAll(g)}
+  return _depMesh(type)};
+// ---- hit zones & armour (Rust: head x2 for bullets/arrows, limbs reduced) ----
+const ZMULT={head:2,chest:1,legs:.65};
+function zoneOf(t,y){if(y>t.y+1.55)return'head';if(y>t.y+.9)return'chest';return'legs'}
+function zoneDamage(n,dmg,y,weapon){const z=zoneOf(n,y);let m=ZMULT[z];if(z==='head'&&(weapon==='melee'||weapon==='xbow'))m=1.5;const arm=n.kit==='revolver'&&z==='chest'?.4:0;return{dmg:dmg*m*(1-arm),head:z==='head',zone:z}}
+function slotProt(zone){const id=P.gear[zone==='legs'?'legs':zone==='head'?'head':'chest'];return id?(ITEMS[id].prot||0):0}
+// ---- aim cone & ballistics ----
+function aimCone(){let c=.4+(Math.hypot(P.vx,P.vz)>1?2.2:0)+(P.onGround||P.swim?0:4)+(P.bloom||0);if(P.crouch)c*=.6;return c*Math.PI/180}
+function coneDir(d,c){const v=d.clone();const a=Math.random()*Math.PI*2,r=Math.tan(c)*Math.sqrt(Math.random());const up=Math.abs(v.y)>.99?new V3(1,0,0):new V3(0,1,0);const s1=new V3().crossVectors(v,up).normalize(),s2=new V3().crossVectors(v,s1).normalize();return v.addScaledVector(s1,Math.cos(a)*r).addScaledVector(s2,Math.sin(a)*r).normalize()}
+function falloff(d){return d<10?1:Math.max(.6,1-(d-10)/20*.4)}
+const bulletGeo=new THREE.CylinderGeometry(.012,.012,1.6,4).rotateX(Math.PI/2),bulletMat=new THREE.MeshBasicMaterial({color:0xffe2a0,transparent:true,opacity:.9,blending:THREE.AdditiveBlending,depthWrite:false});
+function fallDamage(h){const d=h<10?2+(h-5)*1.6:h<15?15+(h-10)*3:50+(h-15)*8;hurt(d,'fall');tip('fall','Fall damage','In Rust, falls over ~5 m hurt and over ~15 m usually kill. Landing in deep water negates fall damage.',true)}
+// ---- comfort & alarms ----
+function updateComfort(dt){let src=playerInside();for(const d of deps){const dd=dist2(d.x,d.z,P.x,P.z);if((d.type==='campfire'&&dd<4)||(d.type==='furnace'&&dd<3))src=true}
+  P.comfort=clamp((P.comfort||0)+(src?dt*.25:-dt*.12),0,1);if(P.comfort>.5)tip('comfort','Comfort','Near a campfire or inside your base you build <b>comfort</b>: health regenerates faster, hunger drains slower and radiation fades faster.')}
+function updateAlarms(dt){for(const d of deps){if(d.type!=='alarm')continue;d.cd=(d.cd||0)-dt;if(d.cd>0)continue;const near=[...npcs,...animals.filter(a=>!a.dead),...remoteList().filter(r=>!r.dead)].find(c=>dist2(c.x,c.z,d.x,d.z)<7);if(near){d.cd=8;sfx('rattle',1.2,d);feedMsg('🔔 Tin can alarm: '+nameOf(near)+' near your alarm');}}}
+// ---- physics debris ----
+const debrisL=[],dGeo={box:new THREE.BoxGeometry(1,1,1),rock:new THREE.DodecahedronGeometry(.6,0)},dMats={};
+function debris(p,color,n,size,kind='box'){const mat=dMats[color+kind]||(dMats[color+kind]=M(color,{flatShading:true}));for(let i=0;i<n;i++){const m=new THREE.Mesh(dGeo[kind],mat);const s=size*R(.5,1.2);m.scale.set(s*R(.7,1.3),s*R(.5,1),s*R(.7,1.3));m.position.set(p.x+R(-.3,.3),p.y+R(-.2,.3),p.z+R(-.3,.3));m.castShadow=true;world.add(m);
+  debrisL.push({m,v:new V3(R(-3,3),R(2.5,6),R(-3,3)),w:new V3(R(-9,9),R(-9,9),R(-9,9)),t:0,s,b:0})}while(debrisL.length>90){const d=debrisL.shift();world.remove(d.m)}}
+function updateDebris(dt){for(const d of debrisL){d.t+=dt;if(d.rest&&d.t<5)continue;d.v.y-=18*dt;d.m.position.addScaledVector(d.v,dt);d.m.rotation.x+=d.w.x*dt;d.m.rotation.y+=d.w.y*dt;d.m.rotation.z+=d.w.z*dt;
+  const g=Math.max(groundH(d.m.position.x,d.m.position.z),-3)+d.s*.3;if(d.m.position.y<g){d.m.position.y=g;if(d.v.y<-3&&d.b<2){d.b++;if(dist2(d.m.position.x,d.m.position.z,P.x,P.z)<20&&Math.random()<.3)sfx('click',.25,d.m.position)}d.v.y*=-.35;d.v.x*=.55;d.v.z*=.55;d.w.multiplyScalar(.55);if(Math.abs(d.v.y)<.6&&Math.hypot(d.v.x,d.v.z)<.3)d.rest=1}
+  if(d.t>5)d.m.scale.multiplyScalar(Math.max(0,1-dt*2.5));if(d.t>6.5)world.remove(d.m)}for(let i=debrisL.length-1;i>=0;i--)if(debrisL[i].t>6.5)debrisL.splice(i,1)}
+const _crumble=crumble;crumble=function(e){_crumble(e);debris(new V3(e.x,e.y+.9,e.z),e.t==='metal'?'#8a6a50':e.t==='sulfur'?'#bfae4a':'#8b8880',10,.24,'rock')};
+// ---- graphics: cloud shadows on terrain ----
+const cloudU={uT:{value:0},uDay:{value:1}};
+const cloudTex=(()=>{const s=256,c=document.createElement('canvas');c.width=c.height=s;const g=c.getContext('2d');const img=g.createImageData(s,s);const Wv=[];for(let i=0;i<10;i++)Wv.push([RI(-4,4)||1,RI(-4,4),R(0,6.28),R(.4,1)]);
+  for(let y=0;y<s;y++)for(let x=0;x<s;x++){let v=0;for(const [a,b,ph,am] of Wv)v+=Math.sin(2*Math.PI*(a*x+b*y)/s+ph)*am;v=smooth(-.6,1.6,v);const o=(y*s+x)*4;img.data[o]=img.data[o+1]=img.data[o+2]=255*(1-v*.85);img.data[o+3]=255}
+  g.putImageData(img,0,0);const t=new THREE.CanvasTexture(c);t.wrapS=t.wrapT=THREE.RepeatWrapping;return t})();
+function terrainShaderExtra(sh){sh.uniforms.uT=cloudU.uT;sh.uniforms.uDay=cloudU.uDay;sh.uniforms.uCloud={value:cloudTex};
+  sh.vertexShader=sh.vertexShader.replace('#include <common>','#include <common>\nvarying vec3 vWP;').replace('#include <begin_vertex>','#include <begin_vertex>\nvWP=(modelMatrix*vec4(transformed,1.)).xyz;');
+  sh.fragmentShader=sh.fragmentShader.replace('#include <common>','#include <common>\nvarying vec3 vWP;uniform float uT;uniform float uDay;uniform sampler2D uCloud;').replace('#include <lights_fragment_end>','#include <lights_fragment_end>\nfloat cs=texture2D(uCloud,vWP.xz*.0028+vec2(uT*.004,uT*.0015)).r;reflectedLight.directDiffuse*=mix(1.,cs,uDay);reflectedLight.directSpecular*=mix(1.,cs,uDay);')}
+// ---- graphics: waves (two rings that follow the player) ----
+const waveU={uT:{value:0},uC:{value:new THREE.Vector2()}};let waveRing=null,farRing=null;
+function setWaterUV(mesh){const p=mesh.geometry.attributes.position,uv=mesh.geometry.attributes.uv;for(let i=0;i<p.count;i++)uv.setXY(i,(p.getX(i)+mesh.position.x)/5000,-(p.getZ(i)+mesh.position.z)/5000);uv.needsUpdate=true}
+function setupWater(){scene.remove(water);const mat=water.material;mat.onBeforeCompile=sh=>{sh.uniforms.uT=waveU.uT;sh.uniforms.uC=waveU.uC;sh.vertexShader='uniform float uT;uniform vec2 uC;\n'+sh.vertexShader.replace('#include <begin_vertex>','#include <begin_vertex>\nvec4 wp0=modelMatrix*vec4(transformed,1.);float fd=1.-smoothstep(120.,190.,distance(wp0.xz,uC));transformed.y+=(sin(wp0.x*.15+uT*1.2)*.12+sin(wp0.z*.11+uT*.9)*.1+sin((wp0.x+wp0.z)*.31+uT*2.1)*.045)*fd;')};
+  mat.needsUpdate=true;TEX.waterN.repeat.set(230,230);
+  waveRing=new THREE.Mesh(new THREE.RingGeometry(.01,195,128,64).rotateX(-Math.PI/2),mat);farRing=new THREE.Mesh(new THREE.RingGeometry(195,3200,96,1).rotateX(-Math.PI/2),mat);
+  for(const m of[waveRing,farRing]){m.position.y=-.06;scene.add(m)}water=farRing;moveWater(WS/2,WS/2)}
+function moveWater(x,z){const sx=Math.round(x/10)*10,sz=Math.round(z/10)*10;for(const m of[waveRing,farRing]){m.position.x=sx;m.position.z=sz;setWaterUV(m)}waveU.uC.value.set(sx,sz)}
+const _buildTerrain=buildTerrain;buildTerrain=function(){_buildTerrain();setupWater();setupNearGrass()};
+// ---- graphics: dense grass near the player ----
+let nearGrass=null,ngC={x:-999,z:-999};
+function setupNearGrass(){const bl=buildGeo([0,1,2,3,4].map(i=>({g:new THREE.ConeGeometry(.04,.5,3),c:'#ffffff',p:[Math.cos(i*1.26)*.1,.24,Math.sin(i*1.26)*.1],r:[R(-.35,.35),0,R(-.35,.35)],j:.25})));
+  nearGrass=new THREE.InstancedMesh(bl,windify(new THREE.MeshLambertMaterial({vertexColors:true}),.12,0),9000);nearGrass.frustumCulled=false;scene.add(nearGrass)}
+function updateNearGrass(){if(!nearGrass||dist2(P.x,P.z,ngC.x,ngC.z)<22)return;ngC={x:P.x,z:P.z};const m4=new THREE.Matrix4(),q=new THREE.Quaternion(),c=new THREE.Color();let k=0;
+  for(let t=0;t<16000&&k<9000;t++){const a=Math.random()*6.283,r=Math.sqrt(Math.random())*48;const x=P.x+Math.cos(a)*r,z=P.z+Math.sin(a)*r;const h=groundH(x,z);if(h<2.7||Math.abs(x-ROAD_X)<6||dist2(x,z,MON.x,MON.z)<MON.pad||forest(x,z)>.62)continue;
+    const s=R(.6,1.3);q.setFromEuler(new THREE.Euler(0,R(0,6.28),0));m4.compose(new V3(x,h-.04,z),q,new V3(s,s*R(.7,1.3),s));nearGrass.setMatrixAt(k,m4);c.copy(col(pick(['#5a7a32','#6e8a3a','#4e6a2c','#7d8a40','#66803a'])));nearGrass.setColorAt(k,c);k++}
+  nearGrass.count=k;nearGrass.instanceMatrix.needsUpdate=true;if(nearGrass.instanceColor)nearGrass.instanceColor.needsUpdate=true}
+// ---- graphics: pollen / dust motes ----
+const MOTE_N=160,moteGeo=new THREE.BufferGeometry(),motePos=new Float32Array(MOTE_N*3);moteGeo.setAttribute('position',new THREE.BufferAttribute(motePos,3));
+const moteMat=new THREE.PointsMaterial({color:0xfff6dc,size:.05,transparent:true,opacity:0,depthWrite:false}),motes=new THREE.Points(moteGeo,moteMat);motes.frustumCulled=false;scene.add(motes);
+const moteD=[];for(let i=0;i<MOTE_N;i++)moteD.push({x:R(-14,14),y:R(0,4),z:R(-14,14),p:R(0,6)});
+function updateMotes(dt){const D=S.dayF||0;moteMat.opacity=D*(1-(S.rain||0))*.7;motes.visible=moteMat.opacity>.02;if(!motes.visible)return;
+  for(let i=0;i<MOTE_N;i++){const m=moteD[i];m.p+=dt*.5;m.x+=Math.sin(m.p+i)*dt*.25+dt*.15;m.y+=Math.cos(m.p*1.3)*dt*.12;m.z+=Math.cos(m.p+i*.5)*dt*.25;if(m.x>14)m.x-=28;if(Math.abs(m.z)>14)m.z*=-.98;if(m.y<0||m.y>4)m.y=R(.3,3.5);motePos[i*3]=P.x+m.x;motePos[i*3+1]=P.y+m.y;motePos[i*3+2]=P.z+m.z}moteGeo.attributes.position.needsUpdate=true}
+// ---- graphics: sun glare & underwater ----
+const _sunV=new V3();
+function updateScreenFX(){const D=S.dayF||0;const el=$('#glare');const sd=skyU.sunDir.value;_sunV.copy(camera.position).addScaledVector(sd,500).project(camera);const fwd=new V3();camera.getWorldDirection(fwd);const dp=fwd.dot(sd);
+  if(dp>0&&_sunV.z<1&&D>.05){const x=(_sunV.x*.5+.5)*innerWidth,y=(-_sunV.y*.5+.5)*innerHeight;el.style.left=x+'px';el.style.top=y+'px';el.style.opacity=(Math.pow(Math.max(0,dp),6)*D*(1-(S.rain||0))*.8).toFixed(3)}else el.style.opacity=0;
+  const uw=camera.position.y<-.02;$('#uw').style.opacity=uw?.6:0;if(uw){scene.fog.color.set(0x0a3440);scene.fog.near=0;scene.fog.far=18}}
+
 /* ================= RENDER ================= */
 const tmpC=new THREE.Color(),tmpC2=new THREE.Color();
 const SKY={dayTop:new THREE.Color('#4a82c4'),dayBot:new THREE.Color('#bcd2de'),setTop:new THREE.Color('#3b4f7a'),setBot:new THREE.Color('#e8a26a'),nightTop:new THREE.Color('#03050b'),nightBot:new THREE.Color('#080b12'),
@@ -1726,7 +1833,7 @@ const SKY={dayTop:new THREE.Color('#4a82c4'),dayBot:new THREE.Color('#bcd2de'),s
 const WATERC=col('#2a6a80'),HEMI_SKY=col('#bcd4ff'),HEMI_SET=col('#ffc49a');const RAINTOP=new THREE.Color('#5a6470'),RAINBOT=new THREE.Color('#8a939b');
 function render(dt){
   const alive=P.alive;const bobY=alive?-Math.abs(Math.cos(P.bob))*.03*(P.bobAmp||0):0;const sh=P.camShake||0;P.camShake=Math.max(0,sh-dt*1.6);
-  camera.position.set(P.x+R(-1,1)*sh*.03,P.y+(alive?1.62:.35)+bobY-(P.landT||0)*.07,P.z+R(-1,1)*sh*.03);
+  camera.position.set(P.x+R(-1,1)*sh*.03,P.y+(alive?(P.eye||1.62):.35)+bobY-(P.landT||0)*.07,P.z+R(-1,1)*sh*.03);
   const roll=alive?clamp(-(P.strafeV||0)*.005,-.03,.03):.5;
   camera.rotation.set(P.pitch+R(-1,1)*sh*.015,P.yaw,roll+R(-1,1)*sh*.01,'YXZ');
   const spd=Math.hypot(P.vx,P.vz);const fov=75-10*(P.drawVis||0)+(keys.shift&&spd>6?5:0);if(Math.abs(camera.fov-fov)>.02){camera.fov=lerp(camera.fov,fov,Math.min(1,dt*9));camera.updateProjectionMatrix()}
@@ -1744,12 +1851,12 @@ function render(dt){
   const night=Math.max(0,1-D-set*.6);moon.intensity=.06*night;const md=new V3(-.4,.7,-.5).normalize();moon.position.set(P.x+md.x*100,P.y+md.y*100,P.z+md.z*100);moon.target.position.set(P.x,P.y,P.z);
   moonMesh.position.set(camera.position.x+md.x*900,camera.position.y+md.y*900,camera.position.z+md.z*900);moonMesh.visible=night>.2;
   scene.fog.color.copy(bot).convertSRGBToLinear();
-  scene.fog.near=lerp(2,60,D+set*.3);scene.fog.far=lerp(torchOn()?30:22,400,Math.min(1,D+set*.4));scene.fog.near*=1-.6*rn;scene.fog.far*=1-.5*rn;skyU.uCover.value=rn;terrain.material.roughness=.95-.4*rn;S.dayF=D;
+  scene.fog.near=lerp(2,60,D+set*.3);scene.fog.far=lerp(torchOn()?30:22,400,Math.min(1,D+set*.4));scene.fog.near*=1-.6*rn;scene.fog.far*=1-.5*rn;skyU.uCover.value=rn;cloudU.uT.value=S.time;cloudU.uDay.value=D*(1-.6*rn);waveU.uT.value=S.time;if(waveRing&&dist2(P.x,P.z,waveU.uC.value.x,waveU.uC.value.y)>15)moveWater(P.x,P.z);terrain.material.roughness=.95-.4*rn;S.dayF=D;
   windU.value=S.time;TEX.waterN.offset.set(S.time*.012,S.time*.007);
   water.material.color.copy(WATERC).multiplyScalar(.2+.8*D+set*.2);
   S.light=clamp(.12+.88*Math.max(D,set*.6)+(torchOn()?.25:0),0,1);
   if(npcFlashT>0){npcFlashT-=dt;if(npcFlashT<=0)npcFlash.intensity=0}
-  updateRain(dt);updateFireflies(dt);ambUpdate(dt);updateVM(dt);updateGhost();
+  updateRain(dt);updateFireflies(dt);updateMotes(dt);updateNearGrass();ambUpdate(dt);updateVM(dt);updateGhost();updateScreenFX();
   renderer.render(scene,camera);updateHud()}
 
 /* ================= HUD ================= */
@@ -1790,7 +1897,7 @@ function drawMinimap(){const s=170/WS;const m=mctx;m.drawImage(mmImg,0,0,170,170
   m.strokeStyle='#e8c84a';m.beginPath();m.arc(MON.x*s,MON.z*s,MON.r*s,0,7);m.stroke();
   if(drop){m.fillStyle='#b070ff';m.beginPath();m.arc(drop.x*s,drop.z*s,4,0,7);m.fill()}if(plane){m.fillStyle='#fff';m.fillRect(plane.x*s-2,plane.z*s-2,4,4)}m.save();m.translate(P.x*s,P.z*s);m.rotate(-P.yaw);m.fillStyle='#3fb0ff';m.beginPath();m.moveTo(0,-6);m.lineTo(4,4);m.lineTo(-4,4);m.closePath();m.fill();m.restore()}
 
-function renderStatus(){const o=[];const t=Math.round(P.temp);o.push(`<span style="color:${t<5?'#7fc0ff':'#ddd'}">${t}°C${t<5?' COLD':''}</span>`);if(P.bleed)o.push('<span style="color:#ff6a5a">BLEEDING</span>');if(P.poison>0)o.push('<span style="color:#b8e05a">SICK</span>');if(P.rad>1)o.push(`<span style="color:#e8c84a">RAD ${Math.round(P.rad)}</span>`);if(P.wet>0)o.push('<span style="color:#7fc0ff">WET</span>');if(wbLevel())o.push('<span style="color:#a4c35a">WORKBENCH 1</span>');if(protection()>0)o.push(`<span>ARMOUR ${Math.round(protection()*100)}%</span>`);$('#status').innerHTML=o.join('')}
+function renderStatus(){const o=[];const t=Math.round(P.temp);o.push(`<span style="color:${t<5?'#7fc0ff':'#ddd'}">${t}°C${t<5?' COLD':''}</span>`);if(P.bleed)o.push('<span style="color:#ff6a5a">BLEEDING</span>');if(P.poison>0)o.push('<span style="color:#b8e05a">SICK</span>');if(P.rad>1)o.push(`<span style="color:#e8c84a">RAD ${Math.round(P.rad)}</span>`);if(P.wet>0)o.push('<span style="color:#7fc0ff">WET</span>');if(wbLevel())o.push('<span style="color:#a4c35a">WORKBENCH 1</span>');if(protection()>0)o.push(`<span>ARMOUR ${Math.round(protection()*100)}%</span>`);if(P.comfort>.05)o.push(`<span style="color:#ffcf8a">COMFORT ${Math.round(P.comfort*100)}%</span>`);if((P.oxy===undefined?30:P.oxy)<29.5)o.push(`<span style="color:#7fd0ff">O₂ ${Math.ceil(P.oxy)}s</span>`);if(P.crouch)o.push('<span>CROUCHED</span>');$('#status').innerHTML=o.join('')}
 /* ================= GUIDE ================= */
 let guideSel='basics';
 function openGuide(id){if(!id){const el=$('#info');id=!el.classList.contains('hidden')&&el.dataset.g||guideSel}guideSel=id;['#inv','#panel','#raid'].forEach(s=>$(s).classList.add('hidden'));renderGuide();openOverlay('#guide')}
