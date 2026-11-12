@@ -6758,6 +6758,489 @@ function dogMarkTick(){const e=DOG.markE;if(!e||!DOG.mark)return;if(!DOG.find){d
 ITEMS.bone_biscuit={n:'Bone Biscuit',c:'#cfae78',cat:'Companion',d:'A rock-hard biscuit baked from ground bone and animal fat. Humans shouldn\'t. Dogs absolutely should.',f:'Craft: 10 Bone Fragments + 4 Animal Fat → 2.',u:'Look at a stray or your dog and press E. Counts as a taming meal and fully heals your dog.'};
 {const i=RECIPES.findIndex(r=>r.wb);RECIPES.splice(i<0?RECIPES.length:i,0,{id:'bone_biscuit',cost:{bone:10,animal_fat:4},out:2,time:10,cat:'Companion'})}
 
+/* ================= FISHING ================= */
+// Fishing (genre mechanic): craft a rod + bait, charge and cast a physical bobber, strike when it is pulled under, then win a
+// line-tension mini-game to land the fish. Species depend on lake / sea, time of day, weather, depth and bubbling ripple
+// hotspots. Raw fish cook into Cooked Fish at a campfire. Local only (no network messages).
+// Integration without core patches: hooks + wrapped core functions (vmFor, heldMesh, sfx, gain, eat, cook, renderDepPanel,
+// hintFor, rollLoot / lootCrate) and the INTERACT_EXT / PROMPTS / INFO tables.
+const FSH={}; // public/debug handle: FSH.F (state), FSH.SP (species), FSH.fight(dt,reeling), FSH.active()
+{
+const FS_LO=.26,FS_HI=.78,FS_SNAP=1.5,FS_SLACK=3,FS_MAXLINE=38,FS_HANG=.3,FS_LN=26;
+const fsN=v=>{v=+v;return v===v&&v>-1e9&&v<1e9?v:0};
+const fsTry=f=>{try{return f()}catch(e){return null}};
+
+// ---------- species ----------
+// str: pull strength · burst: how often/hard it runs · err: erratic side-swimming · stam: seconds-ish of fight · win: strike window (s)
+const FS_SP={
+ fish_perch:{n:'Perch',water:'lake',rar:0,w:[.15,.9],str:.3,burst:.3,err:.25,stam:5,win:1.1,col:['#5f7a36','#e3cc62','#dc7a2e','#33441e'],sh:{h:.4,w:.2,l:1,bars:1},
+   d:'Small, striped and everywhere in the lake. The first fish most anglers ever land.',when:'Day · shallow water',fight:'Light'},
+ fish_trout:{n:'Trout',water:'lake',rar:0,w:[.4,2.6],str:.46,burst:.5,err:.5,stam:7,win:.95,col:['#6e7d5c','#efe6d6','#b58e78','#d98585'],sh:{h:.3,w:.18,l:1.1,stripe:1},
+   d:'A quick, speckled lake fish with a rosy stripe down its side. Rain makes it bold.',when:'Day · rain',fight:'Lively, darting'},
+ fish_catfish:{n:'Catfish',water:'lake',rar:1,w:[1.2,9],str:.6,burst:.25,err:.2,stam:11,win:1.2,col:['#4b453a','#b9ab8e','#3c372f','#2a2620'],sh:{h:.3,w:.24,l:1.15,whisk:1},
+   d:'A whiskered bottom-feeder that cruises the deep middle of the lake after dark.',when:'Night · deep water',fight:'Heavy, steady pull'},
+ fish_pike:{n:'Pike',water:'lake',rar:1,w:[1.5,11],str:.7,burst:.65,err:.55,stam:10,win:.8,col:['#4c6a37','#d8dcb0','#7a8a3a','#c8d49a'],sh:{h:.24,w:.16,l:1.45,spots:1},
+   d:'A long, toothy ambush hunter. It strikes hardest while the light is changing.',when:'Dawn & dusk · deep water',fight:'Violent runs and jumps'},
+ fish_mackerel:{n:'Mackerel',water:'ocean',rar:0,w:[.3,1.6],str:.42,burst:.75,err:.55,stam:6,win:.85,col:['#2b6b7c','#d6dde3','#3a5a66','#173c48'],sh:{h:.28,w:.17,l:1.15,bars:1},
+   d:'A sleek sea fish with tiger-striped blue sides. Travels the coast in fast schools.',when:'Day',fight:'Short, fast bursts'},
+ fish_bass:{n:'Sea Bass',water:'ocean',rar:0,w:[.8,6],str:.58,burst:.45,err:.4,stam:9,win:1,col:['#4d5b52','#c4ccc6','#48544c','#39443d'],sh:{h:.38,w:.22,l:1.05},
+   d:'A thick-shouldered coastal fish that feeds hardest in rough, rainy weather.',when:'Rain & storms',fight:'Strong and stubborn'},
+ fish_flounder:{n:'Flounder',water:'ocean',rar:1,w:[.4,4],str:.48,burst:.15,err:.15,stam:8,win:1.2,col:['#7e6a4c','#efe8da','#6a583e','#5a4a34'],sh:{h:.66,w:.07,l:.85,spots:1},
+   d:'A flat fish that hides on the sea bed with both eyes on one side of its head.',when:'Night · deep water',fight:'Heavy but slow'},
+ fish_goldfin:{n:'Goldfin',water:'both',rar:2,w:[1,5],str:.76,burst:.7,err:.75,stam:12,win:.75,col:['#e9b53a','#fbe7a0','#e86a24','#fff2b0'],sh:{h:.34,w:.18,l:1.05,spots:1},
+   d:'A rare fish with fins like beaten gold. Old anglers swear it only rises when nobody is watching.',when:'Ripples · bait · dawn & dusk',fight:'Wild and tireless'},
+};
+const FS_IDS=Object.keys(FS_SP);
+const FS_RAR=['Common','Uncommon','Rare'],FS_RCOL=['#9fc6e8','#8fc04a','#ffd84a'];
+const fsWaterName=w=>w==='lake'?'Lake':w==='ocean'?'Sea':'Lake & sea';
+
+// ---------- state ----------
+const F={st:'idle',pow:0,bx:0,by:0,bz:0,vx:0,vy:0,vz:0,tip:null,hang:{x:0,y:0,z:0},hprev:{x:0,y:0,z:0},hangOk:false,hangReset:true,
+  water:'lake',depth:0,waitT:0,bite:null,fish:null,useBait:true,baited:false,useFrame:false,prevDown:false,noExt:false,
+  tension:0,prog:0,overT:0,slackT:0,stam:1,burst:0,burstT:0,burstDir:1,runEvt:0,tired:false,clk:0,strainT:0,fx:0,fy:0,fz:0,want:0,d0:0,lineLen:0,
+  jumpT:1,jumpSplash:true,pose:0,pv:0,bend:0,bv:0,side:0,crankA:0,crankV:0,landT:0,lx0:0,ly0:0,lz0:0,retT:0,onLand:false,flyT:0,twitch:0,
+  spotHit:null,seed:0,endMsg:'',endCls:'',endT:0,cardT:0,caught:0,jumpOn:false,jump:null};
+FSH.F=F;FSH.SP=FS_SP;FSH.active=()=>F.st!=='idle';
+
+// ---------- items, recipes, info ----------
+Object.assign(ITEMS,{
+ fishing_rod:{n:'Fishing Rod',c:'#9a7448',cat:'Tool',hot:1,d:'A springy wooden rod with a cloth-wrapped grip, a little side reel and a red-and-white bobber.',f:'Craft: 100 wood, 10 cloth, 1 rope (crafting → Fishing).',
+   u:'Hold left click to swing back, release to cast into deep water. Click when the bobber is pulled under, then hold to reel — keep the line tension in the green.',
+   onUse:()=>{F.useFrame=true},onSecondary:()=>fsSecondary()},
+ bait:{n:'Bait',c:'#9c5a3c',cat:'Fishing',d:'Meat scraps and mushroom paste rolled into hook-sized pieces.',f:'Craft: 1 raw meat → 4, or 1 mushroom → 2 (crafting → Fishing). Sometimes found in crates.',
+   u:'Goes on the hook automatically when you cast: fish bite about twice as fast and rare fish take more interest. R with the rod toggles bait use.'},
+ bait_mush:{n:'Bait',c:'#b09060',cat:'Fishing',d:'Mushroom paste bait.',f:'Craft: 1 mushroom → 2 bait.',u:'Same as Bait — it goes on the hook when you cast.'},
+ cooked_fish:{n:'Cooked Fish',c:'#c98a4a',cat:'Food',food:{cal:55,hyd:10},d:'Flaky, smoky and safe to eat.',f:'Cook any raw fish at a campfire (1 wood each).',u:'Left click to eat: +55 calories, +10 hydration.'},
+});
+for(const id of FS_IDS){const s=FS_SP[id];ITEMS[id]={n:s.n,c:s.col[0],cat:'Food',food:{cal:18,hyd:4},d:s.d,
+  f:`Fishing — ${s.water==='lake'?'the lake':s.water==='ocean'?'the sea':'lake or sea (rare)'}. Bites: ${s.when}.`,u:'Cook it at a campfire (1 wood → Cooked Fish, +55 calories). Eating it raw may make you sick.'}}
+{const i=RECIPES.findIndex(r=>r.wb);RECIPES.splice(i<0?RECIPES.length:i,0,
+  {id:'fishing_rod',cost:{wood:100,cloth:10,rope:1},time:20,cat:'Fishing'},{id:'bait',cost:{raw_meat:1},out:4,time:3,cat:'Fishing'},{id:'bait_mush',cost:{mushroom:1},out:2,time:3,cat:'Fishing'})}
+INFO.fishing_rod={k:'Tool',t:'Fishing Rod',d:'Cast into deep water, strike when the bobber goes under, then reel with care.',rows:[['Cast','Hold LMB, release — aim higher to throw farther'],['Strike','Click when the bobber is pulled under (!)'],['Reel','Hold LMB, keep the needle in the green']],g:'fishing'};
+INFO.cooked_fish={k:'Food',t:'Cooked Fish',d:'+55 calories, +10 hydration. Safe to eat.',rows:[['Make it','Campfire: 1 wood per raw fish']],g:'fishing'};
+for(const id of FS_IDS){const s=FS_SP[id];INFO[id]={k:'Fish · '+FS_RAR[s.rar],t:s.n,d:s.d,rows:[['Water',fsWaterName(s.water)],['Bites',s.when],['Weight',`${s.w[0]}–${s.w[1]} kg`],['Fight',s.fight]],g:'fishing'}}
+INFO.fsh_lake={k:'Fishing water',t:'Lake',d:'Fresh water: drink it, or cast a Fishing Rod into it.',rows:[['Fish','Perch, Trout, Catfish, Pike'],['Rare','Goldfin'],['Tip','Catfish bite at night in deep water, pike at dawn and dusk.']],g:'fishing'};
+INFO.fsh_sea={k:'Fishing water',t:'Sea',d:'Salt water: never drink it — but it is full of fish.',rows:[['Fish','Mackerel, Sea Bass, Flounder'],['Rare','Goldfin'],['Tip','Sea bass love rain; flounder bite at night.']],g:'fishing'};
+if(INFO.campfire)INFO.campfire.d='Press E to cook raw meat and fish.';
+if(ITEMS.campfire)ITEMS.campfire.u='Place it, press E to cook raw meat and fish (1 wood each).';
+PROMPTS.fsh_lake='Drink';PROMPTS.fsh_sea='Drink salt water';
+
+// ---------- field guide chapter ----------
+if(typeof GUIDE!=='undefined'&&Array.isArray(GUIDE)&&!GUIDE.some(g=>g&&g.id==='fishing'))GUIDE.push({id:'fishing',t:'Fishing',h:`<h2>Fishing</h2><p class="lead">A quiet way to eat well: a rod, some bait and patience at the water's edge.</p>
+<h3>Gear</h3><ul><li><b>Fishing Rod</b> — 100 wood, 10 cloth, 1 rope (crafting → <b>Fishing</b>).</li><li><b>Bait</b> — 1 raw meat → 4, or 1 mushroom → 2. Carried bait goes on the hook automatically and roughly <b>halves the wait</b> for a bite. Press <b>R</b> with the rod (line in) to switch bait use on or off.</li></ul>
+<h3>1 · Cast</h3><p>Stand at the shore of the lake or the sea. <b>Hold left click</b> to swing the rod back while the power bar fills, then <b>release</b> to cast. Aim higher to throw farther. The bobber has to land in water deeper than your knees, otherwise it is reeled straight back. Click again (or press R) to reel in.</p>
+<h3>2 · Strike</h3><p>Fish first <b>nibble</b>: the bobber twitches — don't click yet. Then it is <b>pulled under</b> with a splash and a yellow <b>!</b> appears: click within about a second to set the hook. Too early scares the fish off; too late and it steals your bait.</p>
+<h3>3 · Reel</h3><p><b>Hold left click</b> to reel, release to give line. Keep the white needle inside the <b>green band</b>:</p><ul><li>In the <b>red</b> for 1.5 seconds → the line snaps and the bait is gone.</li><li>In the grey <b>slack</b> zone for 3 seconds → the fish shakes the hook.</li><li>Fish make sudden runs: let go when the needle jumps, then reel again. Tired fish pull less, so patience wins. Reeling costs stamina.</li></ul>
+<h3>What bites where</h3><table><tr><th>Fish</th><th>Water</th><th>Best</th><th>Weight</th></tr>${FS_IDS.map(id=>{const s=FS_SP[id];return `<tr><td><b>${s.n}</b>${s.rar?` <span class="tag">${FS_RAR[s.rar]}</span>`:''}</td><td>${fsWaterName(s.water)}</td><td>${s.when}</td><td>${s.w[0]}–${s.w[1]} kg</td></tr>`}).join('')}</table>
+<div class="box">Bubbling <b>ripples</b> on the water mark a feeding school: cast into them for faster bites and bigger fish. The rare <b>Goldfin</b> loves ripples, bait, dawn and dusk.</div>
+<h3>Eating</h3><p>Cook fish at a <b>Campfire</b> (press E on it): 1 wood per fish → <b>Cooked Fish</b> (+55 calories, +10 hydration). Raw fish is not put on your hotbar by itself; you can put it there from the inventory, but eating it raw may make you sick.</p>`});
+
+// ---------- HUD (DOM) ----------
+{const st=document.createElement('style');st.textContent=`
+#fshPanel{position:absolute;left:50%;bottom:112px;line-height:1.1;transform:translateX(-50%);min-width:270px;max-width:calc(100vw - 32px);background:rgba(20,20,18,.74);border-left:3px solid #3f87bf;padding:3px 12px 4px;text-shadow:0 1px 2px #000;white-space:nowrap;overflow:hidden}
+#fshPanel .a{display:flex;justify-content:space-between;align-items:baseline;gap:16px;font-weight:700;font-size:14px}
+#fshPanel .a i{font-style:normal;color:#9fc6e8;font-size:12px}
+#fshPanel .b{color:#cfc7b8;font-size:12px;margin-top:1px}
+#fshPanel.bite{border-left-color:#ffd84a;background:rgba(70,56,12,.82)}#fshPanel.fight{border-left-color:#8fc04a}
+#fshPow{position:absolute;left:50%;top:50%;width:150px;height:9px;margin:44px 0 0 -75px;background:rgba(20,20,18,.78);box-shadow:0 0 0 1px rgba(255,255,255,.16)}
+#fshPow i{position:absolute;left:0;top:0;bottom:0;width:0;background:linear-gradient(90deg,#3f87bf,#8fc04a 55%,#ffd84a)}
+#fshPow b{position:absolute;left:-20px;right:-20px;top:-17px;text-align:center;font-size:11px;letter-spacing:.22em;color:#e3dccf;text-shadow:0 1px 2px #000}
+#fshBang{position:absolute;left:50%;top:50%;width:54px;height:54px;margin:-98px 0 0 -27px;border-radius:50%;background:#ffd84a;color:#2a2010;font-weight:700;font-size:42px;line-height:54px;text-align:center;box-shadow:0 0 0 4px rgba(0,0,0,.35),0 0 26px rgba(255,216,74,.75);animation:fshPulse .3s ease-in-out infinite alternate}
+@keyframes fshPulse{from{transform:scale(.86)}to{transform:scale(1.14)}}
+#fshFight{position:absolute;left:50%;top:50%;margin-top:62px;transform:translateX(-50%);width:330px;max-width:calc(100vw - 32px);background:rgba(20,20,18,.8);padding:7px 11px 8px;border-top:3px solid #3f87bf;text-shadow:0 1px 2px #000}
+#fshFight .h{display:flex;justify-content:space-between;align-items:baseline;font-size:11px;letter-spacing:.16em;font-weight:700;color:#9fc6e8}
+#fshFight .h b{letter-spacing:.03em;color:#e3dccf;font-size:13.5px}
+#fshFight .bar{position:relative;height:18px;margin-top:6px;background:#2a2824}
+#fshFight .z0{position:absolute;top:0;bottom:0;left:0;background:repeating-linear-gradient(45deg,#3b3934 0 5px,#2e2c28 5px 10px)}
+#fshFight .z1{position:absolute;top:0;bottom:0;background:linear-gradient(#7d9440,#5c6f2e)}
+#fshFight .z2{position:absolute;top:0;bottom:0;right:0;background:linear-gradient(#d4492f,#9c2d1c)}
+#fshFight .nd{position:absolute;top:-3px;bottom:-3px;width:4px;margin-left:-2px;background:#fff;box-shadow:0 0 6px rgba(255,255,255,.9)}
+#fshFight .tm{position:absolute;left:0;bottom:-5px;height:3px;width:0;background:#ff6a4a}
+#fshFight .pr{height:6px;margin-top:8px;background:#2a2824}
+#fshFight .pr i{display:block;height:100%;width:0;background:linear-gradient(90deg,#3f87bf,#7fc0ff)}
+#fshFight .m{margin-top:5px;font-size:12.5px;font-weight:700;text-align:center;color:#cfc7b8;min-height:16px}
+#fshFight .m.hot{color:#ff7a5a}#fshFight .m.slack{color:#9fc6e8}#fshFight .m.end{color:#ff6a4a;font-size:15px;letter-spacing:.06em}
+#fshFight.hot .bar{box-shadow:0 0 0 2px rgba(255,90,60,.9)}#fshFight.slack .bar{box-shadow:0 0 0 2px rgba(159,198,232,.7)}#fshFight.end{border-top-color:#cd412b}
+#fshCatch{position:absolute;left:50%;top:14%;width:340px;max-width:calc(100vw - 32px);transform:translateX(-50%);background:rgba(44,42,37,.96);border-top:3px solid #9fc6e8;padding:10px 14px 12px;box-shadow:0 10px 40px rgba(0,0,0,.5);animation:fshPop .4s cubic-bezier(.2,1.5,.4,1)}
+#fshCatch .k{font-size:11px;letter-spacing:.22em;font-weight:700}
+#fshCatch .t{font-size:23px;font-weight:700;margin:2px 0 1px}
+#fshCatch .w{font-size:14px;color:#e3dccf}
+#fshCatch .d{font-size:12.5px;color:#cfc7b8;line-height:1.35;margin-top:5px;clear:both}
+#fshCatch .rb{display:inline-block;margin:7px 6px 0 0;padding:1px 7px;font-size:11px;font-weight:700;letter-spacing:.12em;background:#d8b24a;color:#1a1608}
+#fshCatch .rb.g{background:#71863a;color:#fff}
+#fshCatch svg{float:right;margin:0 0 4px 10px}
+@keyframes fshPop{from{opacity:0;transform:translate(-50%,-14px) scale(.9)}to{opacity:1;transform:translate(-50%,0) scale(1)}}`;document.head.appendChild(st)}
+const fsEl=(id,html)=>{const e=document.createElement('div');e.id=id;e.className='hidden';e.innerHTML=html;$('#hud').appendChild(e);return e};
+const FD={panel:fsEl('fshPanel','<div class="a"><span class="s"></span><i></i></div><div class="b"></div>'),pow:fsEl('fshPow','<b>CAST POWER</b><i></i>'),bang:fsEl('fshBang','!'),
+  fight:fsEl('fshFight','<div class="h"><span>FISH ON</span><b></b></div><div class="bar"><div class="z0"></div><div class="z1"></div><div class="z2"></div><div class="nd"></div><div class="tm"></div></div><div class="pr"><i></i></div><div class="m"></div>'),
+  card:fsEl('fshCatch','')};
+const fsQ=(e,s)=>e.querySelector(s);
+const FQ={ps:fsQ(FD.panel,'.s'),pi:fsQ(FD.panel,'i'),pb:fsQ(FD.panel,'.b'),pow:fsQ(FD.pow,'i'),fh:fsQ(FD.fight,'.h b'),nd:fsQ(FD.fight,'.nd'),tm:fsQ(FD.fight,'.tm'),pr:fsQ(FD.fight,'.pr i'),m:fsQ(FD.fight,'.m')};
+{const z0=fsQ(FD.fight,'.z0'),z1=fsQ(FD.fight,'.z1'),z2=fsQ(FD.fight,'.z2');z0.style.width=FS_LO*100+'%';z1.style.left=FS_LO*100+'%';z1.style.width=(FS_HI-FS_LO)*100+'%';z2.style.width=(1-FS_HI)*100+'%'}
+const fsVis=(e,on)=>{on=!!on;if(e._fv!==on){e._fv=on;e.classList.toggle('hidden',!on)}};
+const fsSet=(e,k,v)=>{const c='_f'+k;if(e[c]!==v){e[c]=v;e[k]=v}};
+
+// ---------- 3D assets (created once; persistent objects live in scene, hidden when unused) ----------
+const fsMat={cork:M('#b98d5c',{roughness:1,flatShading:true}),blank:M('#4a2e1a',{roughness:.35,metalness:.1}),wrap:M('#a8322a',{roughness:.6}),
+  metal:M('#aab0b6',{metalness:.75,roughness:.3}),dark:M('#262628',{metalness:.5,roughness:.45}),line:M('#e6ecef',{roughness:.6})};
+const fsFishMat=new THREE.MeshStandardMaterial({vertexColors:true,flatShading:true,roughness:.42,metalness:.12});
+function fsBuild(parts){const pos=[],nor=[],cl=[];const m4=new THREE.Matrix4(),q=new THREE.Quaternion(),e=new THREE.Euler(),tc=new THREE.Color();
+  for(const p of parts){const g=p.g.index?p.g.toNonIndexed():p.g;m4.compose(new V3(...(p.p||[0,0,0])),q.setFromEuler(e.set(...(p.r||[0,0,0]))),new V3(...(p.s||[1,1,1])));g.applyMatrix4(m4);
+    const P_=g.attributes.position.array,N_=g.attributes.normal.array,base=p.c?col(p.c):null;
+    for(let i=0;i<P_.length;i+=3){pos.push(P_[i],P_[i+1],P_[i+2]);nor.push(N_[i],N_[i+1],N_[i+2]);const c=p.cf?p.cf(P_[i],P_[i+1],P_[i+2],tc):base;const j=1+(Math.random()-.5)*.08;cl.push(c.r*j,c.g*j,c.b*j)}}
+  const geo=new THREE.BufferGeometry();geo.setAttribute('position',new THREE.Float32BufferAttribute(pos,3));geo.setAttribute('normal',new THREE.Float32BufferAttribute(nor,3));geo.setAttribute('color',new THREE.Float32BufferAttribute(cl,3));return geo}
+const fsGeos={};
+function fsFishGeo(id){if(fsGeos[id])return fsGeos[id];const s=FS_SP[id]||FS_SP.fish_trout,ck=id==='cooked',sh=ck?{h:.3,w:.18,l:1.1,bars:1}:s.sh;
+  const C=(ck?['#7a4a22','#c08a50','#5a3418','#3a2210']:s.col).map(col),h=sh.h,w=sh.w,L=sh.l;
+  const body=(x,y,z,tc)=>{tc.copy(C[1]).lerp(C[0],smooth(-.3*h,.22*h,y));if(sh.bars&&y>-.12*h&&Math.sin((z+.4)*21)>.5)tc.lerp(C[3],ck?.75:.6);if(sh.stripe&&Math.abs(y+.03*h)<.08*h)tc.lerp(C[3],.65);
+    if(sh.spots&&y>-.2*h&&fbm(x*40+z*23+3,y*38+z*9,1)>.6)tc.lerp(C[3],.7);if(Math.abs(z+L*.5)<.06*L)tc.multiplyScalar(.82);return tc};
+  const parts=[{g:new THREE.IcosahedronGeometry(1,1),s:[w/2,h/2,L/2],cf:body},
+    {g:new THREE.ConeGeometry(h*.46,L*.27,4),c:ck?'#4a2a12':s.col[2],p:[0,0,L*.6],r:[-Math.PI/2,0,0],s:[.16,1,1]},
+    {g:new THREE.ConeGeometry(h*.2,h*.34,4),c:ck?'#4a2a12':s.col[2],p:[0,h*.47,L*.06],s:[.16,1,2.3]},
+    {g:new THREE.ConeGeometry(h*.14,h*.24,4),c:ck?'#4a2a12':s.col[2],p:[0,-h*.44,L*.18],r:[Math.PI,0,0],s:[.16,1,1.6]},
+    {g:new THREE.ConeGeometry(h*.12,h*.3,3),c:ck?'#4a2a12':s.col[2],p:[w*.5,-h*.12,-L*.22],r:[.3,0,-1.1],s:[.3,1,1.2]},
+    {g:new THREE.ConeGeometry(h*.12,h*.3,3),c:ck?'#4a2a12':s.col[2],p:[-w*.5,-h*.12,-L*.22],r:[.3,0,1.1],s:[.3,1,1.2]}];
+  if(!ck)for(const sx of[1,-1])parts.push({g:new THREE.IcosahedronGeometry(1,0),c:'#0c0c0c',p:[sx*w*.37,h*.1,-L*.36],s:[.024,.024,.024]});
+  if(sh.whisk)for(const sx of[1,-1])parts.push({g:new THREE.BoxGeometry(.006,.006,L*.3),c:s.col[3],p:[sx*w*.32,-h*.12,-L*.6],r:[.25,sx*.45,0]});
+  return fsGeos[id]=fsBuild(parts)}
+const fsBob=new THREE.Mesh(buildGeo([{g:new THREE.SphereGeometry(.055,12,6,0,Math.PI*2,0,Math.PI/2),c:'#e2332a',j:.04},{g:new THREE.SphereGeometry(.055,12,6,0,Math.PI*2,Math.PI/2,Math.PI/2),c:'#f2efe6',j:.04},
+  {g:new THREE.TorusGeometry(.055,.006,4,16),c:'#222222',r:[Math.PI/2,0,0]},{g:new THREE.CylinderGeometry(.006,.008,.08,6),c:'#e2332a',p:[0,.09,0]},{g:new THREE.CylinderGeometry(.008,.004,.05,5),c:'#333333',p:[0,-.075,0]}]),
+  new THREE.MeshStandardMaterial({vertexColors:true,flatShading:true,roughness:.4,emissive:col('#4a0c08'),emissiveIntensity:0}));
+fsBob.visible=false;scene.add(fsBob);
+const fsLinePos=new Float32Array(FS_LN*3),fsLineGeo=new THREE.BufferGeometry();fsLineGeo.setAttribute('position',new THREE.BufferAttribute(fsLinePos,3));
+const fsLineMat=new THREE.LineBasicMaterial({color:0xe8ecee,transparent:true,opacity:.85});const fsLine=new THREE.Line(fsLineGeo,fsLineMat);fsLine.frustumCulled=false;fsLine.visible=false;scene.add(fsLine);
+const fsBangTex=canvasTex(64,(g,s)=>{g.clearRect(0,0,s,s);g.fillStyle='#ffd84a';g.beginPath();g.arc(s/2,s/2,s*.42,0,7);g.fill();g.lineWidth=4;g.strokeStyle='rgba(0,0,0,.45)';g.stroke();
+  g.fillStyle='#2a2010';g.font='bold 44px Arial';g.textAlign='center';g.textBaseline='middle';g.fillText('!',s/2,s/2+2)});
+const fsBang=new THREE.Sprite(new THREE.SpriteMaterial({map:fsBangTex,transparent:true,depthTest:false,depthWrite:false,fog:false}));fsBang.visible=false;fsBang.renderOrder=6;scene.add(fsBang);
+const fsFish=new THREE.Mesh(fsFishGeo('fish_perch'),fsFishMat);fsFish.visible=false;scene.add(fsFish);
+const fsJump=new THREE.Mesh(fsFishGeo('fish_perch'),fsFishMat);fsJump.visible=false;scene.add(fsJump);
+const fsSetGeo=(m,id)=>{const g=fsFishGeo(id);if(m.geometry!==g)m.geometry=g};
+const FS_RINGS=[];{const rg=new THREE.RingGeometry(.84,1,28).rotateX(-Math.PI/2);for(let i=0;i<12;i++){const m=new THREE.Mesh(rg,new THREE.MeshBasicMaterial({color:0xe6f4ff,transparent:true,opacity:0,depthWrite:false}));
+  m.visible=false;m.renderOrder=2;scene.add(m);FS_RINGS.push({m,on:false,t:0,life:1,size:1,a:0,x:0,z:0})}}
+let fsRingI=0;
+function fsRing(x,z,size,life,a){const r=FS_RINGS[fsRingI++%FS_RINGS.length];Object.assign(r,{on:true,t:0,life,size,a,x,z});r.m.visible=true;r.m.material.color.setScalar(.3+.7*(S&&S.light!==undefined?S.light:1))}
+const FS_SPL=['#e8f6fc','#b8dcea','#ffffff','#9cc8da'];
+function fsSplash(x,z,n,spd,up){burst(new V3(x,fsWaterY(x,z)+.05,z),FS_SPL,n,spd||1.6,up||2.2,9.8,.55)}
+
+// ---------- viewmodel: rod (root → g → arm + it, like the core) and fish in hand ----------
+const FS_W=[1,2,3,4,5,6,7].map(i=>i/28);
+function fsRodVM(){const root=new THREE.Group(),g=new THREE.Group();g.position.z=-.25;root.add(g);g.add(armMesh());const it=new THREE.Group();it.position.set(0,0,-.06);g.add(it);const U=root.userData;
+  const pivot=new THREE.Group();it.add(pivot);
+  const cyl=(rt,rb,h,mat,seg)=>{const geo=new THREE.CylinderGeometry(rt,rb,h,seg||8);geo.rotateX(-Math.PI/2);geo.translate(0,0,-h/2);return new THREE.Mesh(geo,mat)}; // along -Z from the origin
+  const grip=cyl(.017,.019,.27,fsMat.cork,10);grip.position.z=.14;pivot.add(grip);const cap=cyl(.022,.022,.03,fsMat.dark,10);cap.position.z=.17;pivot.add(cap);
+  const fer=cyl(.011,.016,.03,fsMat.metal,8);fer.position.z=-.125;pivot.add(fer);
+  const reel=new THREE.Group();reel.position.set(0,-.052,.05);pivot.add(reel);reel.add(box(.012,.04,.034,fsMat.dark,0,.026,0));
+  const spool=new THREE.Mesh(new THREE.CylinderGeometry(.036,.036,.026,16),fsMat.metal);spool.rotation.z=Math.PI/2;reel.add(spool);
+  const wound=new THREE.Mesh(new THREE.CylinderGeometry(.029,.029,.028,16),fsMat.line);wound.rotation.z=Math.PI/2;reel.add(wound);
+  const crank=new THREE.Group();crank.position.x=.02;reel.add(crank);crank.add(box(.005,.055,.01,fsMat.dark,0,.022,0));
+  const knob=new THREE.Mesh(new THREE.CylinderGeometry(.008,.008,.022,8),fsMat.cork);knob.rotation.z=Math.PI/2;knob.position.set(.012,.046,0);crank.add(knob);
+  const N=7,SL=.205;let par=new THREE.Group();par.position.z=-.13;pivot.add(par);const segs=[];
+  for(let i=0;i<N;i++){const s=new THREE.Group();if(i)s.position.z=-SL;par.add(s);const r0=Math.max(.0035,.0105-.00105*i),r1=Math.max(.003,.0105-.00105*(i+1));
+    s.add(cyl(r1,r0,SL+.003,fsMat.blank,6));if(i===0||i===3||i===N-1){const wr=cyl(r0+.0024,r0+.0024,.022,fsMat.wrap,8);wr.position.z=-.005;s.add(wr)}
+    if(i%2===1||i===N-1){const gd=new THREE.Mesh(new THREE.TorusGeometry(Math.max(.004,.0085-.0006*i),.0015,4,10),fsMat.metal);gd.position.set(0,-.013,-SL*.85);s.add(gd);s.add(box(.002,.012,.004,fsMat.metal,0,-.007,-SL*.85))}
+    segs.push(s);par=s}
+  const tipO=new THREE.Object3D();tipO.position.set(0,-.004,-SL);par.add(tipO);
+  pivot.rotation.x=.55;it.rotation.z=-.06;Object.assign(U,{pivot,segs,tip:tipO,crank,fsRod:1});shadowAll(root,false,false);return root}
+function fsFishVM(id){const root=new THREE.Group(),g=new THREE.Group();g.position.z=-.25;root.add(g);g.add(armMesh());const it=new THREE.Group();it.position.set(0,0,-.06);g.add(it);
+  const m=new THREE.Mesh(fsFishGeo(id==='cooked_fish'?'cooked':id),fsFishMat);m.scale.setScalar(.21);m.rotation.set(.2,Math.PI/2,.12);m.position.set(-.015,.035,-.07);it.add(m);shadowAll(root,false,false);return root}
+VMB.fishing_rod=[.25,-.29,-.17];
+{const _vmFor=vmFor;vmFor=function(id){if(id==='fishing_rod'||id==='cooked_fish'||FS_SP[id]){if(!vmCache[id])vmCache[id]=id==='fishing_rod'?fsRodVM():fsFishVM(id);return vmCache[id]}return _vmFor.apply(this,arguments)}}
+// other players see a rod in the avatar's hand
+let fsHeldMats=null;
+{const _hm=heldMesh;heldMesh=function(id){if(id!=='fishing_rod')return _hm.apply(this,arguments);const H=fsHeldMats||(fsHeldMats={c:M('#b98d5c'),b:M('#4a2e1a'),m:M('#aab0b6',{metalness:.6,roughness:.35})});
+  const g=new THREE.Group(),r=new THREE.Group();r.rotation.x=.75;g.add(r);r.add(box(.04,.04,.3,H.c,0,0,.02));r.add(box(.022,.022,1.7,H.b,0,0,-.95));r.add(box(.05,.07,.06,H.m,0,-.05,.06));return shadowAll(g)}}
+
+// ---------- sounds (synth, via the sfx wrapper) ----------
+const FSFX={
+ fcast:(t,d)=>{nz(t,.4,'bandpass',420,1.1,.55,.05,.3,d,2600);for(let i=0;i<9;i++)tn(t+.1+i*.032,'square',2600-i*90,0,.035,.001,.012,d)},
+ fwhip:(t,d)=>{nz(t,.16,'bandpass',800,1.2,.5,.012,.13,d,3200)},
+ fplop:(t,d)=>{tn(t,'sine',620,170,.4,.003,.13,d);nz(t,.12,'lowpass',1500,.7,.28,.004,.11,d)},
+ fnib:(t,d)=>{tn(t,'sine',980,560,.13,.002,.05,d)},
+ fbite:(t,d)=>{tn(t,'sine',380,110,.45,.003,.2,d);nz(t,.28,'lowpass',1300,.7,.55,.006,.24,d)},
+ freel:(t,d)=>{tn(t,'square',R(1650,1900),0,.06,.001,.012,bp(d,2300,3))},
+ fdrag:(t,d)=>{nz(t,.03,'bandpass',3200,4,.16,.001,.025,d)},
+ fstrain:(t,d)=>{tn(t,'sawtooth',R(360,430),R(480,540),.07,.03,.2,bp(d,1700,7))},
+ fsnap:(t,d)=>{nz(t,.07,'highpass',3600,.7,.85,.001,.06,d);tn(t,'sawtooth',1500,80,.35,.002,.32,bp(d,1300,2))},
+ fsplash:(t,d)=>{nz(t,.42,'lowpass',950,.7,.6,.01,.36,d);nz(t+.04,.25,'bandpass',2300,1,.22,.01,.2,d)},
+ fcatch:(t,d)=>{tn(t,'sine',660,0,.22,.005,.22,d);tn(t+.09,'sine',880,0,.2,.005,.28,d);tn(t+.18,'sine',1320,0,.18,.005,.42,d)},
+ frare:(t,d)=>{[523,659,784,1047,1319,1568].forEach((f,i)=>tn(t+i*.075,'triangle',f,0,.16,.004,.35,d));nz(t+.3,.8,'highpass',6000,.7,.12,.05,.7,d)},
+};
+{const _sfx=sfx;sfx=function(type,vol,pos){if(F.noExt&&type==='pick')return;const f=FSFX[type];if(!f)return _sfx.apply(this,arguments);if(muted||!ac())return;if(AC.state==='suspended')AC.resume();
+  try{f(AC.currentTime+.005,bus(pos,vol===undefined?1:vol,type==='fsplash'||type==='frare'?.22:.05))}catch(e){}}}
+
+// ---------- core wrappers: hotbar, eating, cooking, campfire panel, hints, loot ----------
+{const _gain=gain;gain=function(id,n,silent){if(id==='bait_mush')id='bait';if(!FS_SP[id]||!P||!P.hot)return _gain.call(this,id,n,silent);
+  const before=P.hot.slice(),r=_gain.call(this,id,n,silent);let ch=false;for(let i=0;i<P.hot.length;i++)if(P.hot[i]===id&&before[i]!==id){P.hot[i]=before[i];ch=true}if(ch)updateHotbar();return r}}
+{const _eat=eat;eat=function(id){if(!FS_SP[id]||!ITEMS[id]||!ITEMS[id].food)return _eat.apply(this,arguments);if(!has(id))return;
+  const f=ITEMS[id].food,p0=f.poison,sick=Math.random()<.4;f.poison=sick?RI(5,8):0;try{_eat.apply(this,arguments)}finally{f.poison=p0}
+  if(sick)tip('rawfish','Raw fish','That fish didn\'t sit well — you feel sick for a moment. Cook fish at a <b>Campfire</b> (1 wood each) to make it safe and far more filling.',true)}}
+function fsRawCount(){let n=0;for(const id of FS_IDS)n+=P.inv[id]||0;return n}
+{const _cook=cook;cook=function(){const r=_cook.apply(this,arguments);
+  if(S&&S.feed){const n0=S.feed.length;S.feed=S.feed.filter(f=>!(f.id!=='msg'&&f.n===0));if(S.feed.length!==n0)renderFeed()}
+  let n=0;for(const id of FS_IDS){const k=Math.min(P.inv[id]||0,P.inv.wood||0);if(k>0){take(id,k);take('wood',k);feed(id,-k);n+=k}}
+  if(n>0){gain('cooked_fish',n);sfx('fsplash',.25);tip('fish_cooked','Cooked fish','Cooked fish is safe and filling: +55 calories, +10 hydration each. It went to your hotbar.')}
+  renderDepPanel();return r}}
+{const _rdp=renderDepPanel;renderDepPanel=function(){const r=_rdp.apply(this,arguments);if(curDep&&curDep.type==='campfire'&&P)fsCampfirePanel();return r}}
+function fsCampfirePanel(){const pb=$('#panelBody');if(!pb||!pb.querySelector)return;const L=FS_IDS.filter(id=>P.inv[id]>0).map(id=>`${P.inv[id]} ${ITEMS[id].n}`),n=fsRawCount();
+  const kv=pb.querySelector('.kv');if(kv&&kv.insertAdjacentHTML)kv.insertAdjacentHTML('beforeend',`<span>Raw fish</span><div>${L.length?L.join(', '):'None'}</div>`);
+  const b=pb.querySelector('button[onclick="cook()"]');if(b){if(n>0&&has('wood'))b.disabled=false;b.textContent='Cook all food'}}
+{const _hint=hintFor;hintFor=function(id){if(id==='fishing_rod')return `Hold left click to cast · R reels in / bait ${F.useBait?'on':'off'} · ${P.inv.bait||0} bait`;
+  if(FS_SP[id])return'Cook it at a campfire · left click eats it raw (risky)';return _hint.apply(this,arguments)}}
+// a little bait (and very rarely a rod) in containers: through the items module's loot roller when present, else crates
+if(typeof rollLoot==='function'){try{const _rl=rollLoot;rollLoot=function(kind,mult){const r=_rl.apply(this,arguments);
+  if(r&&typeof r==='object'&&['crate','cabinet','trunk','toolbox','town'].includes(kind)){if(Math.random()<.14)r.bait=(r.bait||0)+RI(2,4);if(kind!=='cabinet'&&kind!=='crate'&&Math.random()<.03)r.fishing_rod=(r.fishing_rod||0)+1}return r}}catch(e){}}
+else{const _lc=lootCrate;lootCrate=function(){const r=_lc.apply(this,arguments);if(Math.random()<.16)gain('bait',RI(2,4));return r}}
+// looking at water while holding the rod shows what lives there (E still drinks, through the normal path)
+INTERACT_EXT.push(a=>{if(F.noExt||!a||a.kind!=='water'||!a.point||!fsHolding())return null;return{kind:inLake(a.point.x,a.point.z,30)?'fsh_lake':'fsh_sea'}});
+INTERACT_DO.fsh_lake=INTERACT_DO.fsh_sea=()=>{F.noExt=true;try{interact()}finally{F.noExt=false}};
+
+// ---------- world helpers ----------
+function fsWaterY(x,z){let t=0,cx=x,cz=z;if(typeof waveU!=='undefined'&&waveU&&waveU.uT){t=fsN(waveU.uT.value);const c=waveU.uC&&waveU.uC.value;if(c){cx=fsN(c.x);cz=fsN(c.y)}}
+  const fd=1-smooth(120,190,Math.hypot(x-cx,z-cz));return -.06+(Math.sin(x*.15+t*1.2)*.12+Math.sin(z*.11+t*.9)*.1+Math.sin((x+z)*.31+t*2.1)*.045)*fd}
+const fsWaterKind=(x,z)=>inLake(x,z,30)?'lake':'ocean';
+function fsHolding(){return !!(S&&P&&P.alive&&P.hot&&P.hot[P.sel]==='fishing_rod')}
+function fsBlocked(){if(P.swim)return'swim';if(fsTry(()=>typeof isDriving==='function'&&isDriving()))return'drive';if(P.onZip||P.gliding)return'move';return null}
+const fsTipFB={x:0,y:0,z:0};
+function fsTip(){if(F.tip)return F.tip;fsTipFB.x=P.x;fsTipFB.y=P.y+(P.eye||1.62)+.4;fsTipFB.z=P.z;return fsTipFB}
+function fsCtx(x,z){const p=dayP(),storm=!!fsTry(()=>typeof stormActive==='function'&&stormActive());
+  return{night:isNight(),tw:(p>.58&&p<.72)||p>.95||p<.07,rain:(S.rain||0)>.4||storm,storm,red:!!fsTry(()=>typeof redMoon==='function'&&redMoon()),spot:fsSpotAt(x,z),depth:Math.max(0,-groundH(x,z)),bait:F.baited}}
+function fsPick(water,c){const L=[];const add=(id,w)=>{if(w>0)L.push([id,w])};
+  if(water==='lake'){add('fish_perch',40*(c.night?.45:1)*(c.rain?.8:1)*(c.depth<1.8?1.3:c.depth>3.2?.75:1));add('fish_trout',30*(c.night?.55:1)*(c.rain?1.7:1)*(c.tw?1.3:1));
+    add('fish_catfish',14*(c.night?2.8:.7)*(c.depth>3?1.5:c.depth<1.5?.5:1));add('fish_pike',12*(c.tw?1.9:1)*(c.depth>2.5?1.3:1))}
+  else{add('fish_mackerel',42*(c.night?.5:1)*(c.rain?1.2:1));add('fish_bass',30*(c.rain?1.9:1)*(c.storm?1.3:1)*(c.tw?1.2:1));add('fish_flounder',16*(c.night?2.5:.8)*(c.depth>3?1.4:1))}
+  add('fish_goldfin',2.4*(c.tw?1.8:1)*(c.spot?2.6:1)*(c.bait?1.5:1)*(c.red?3:1));if(c.spot)for(const e of L)if(FS_SP[e[0]].rar===1)e[1]*=1.6;
+  let tot=0;for(const e of L)tot+=e[1];let r=Math.random()*tot;for(const e of L){r-=e[1];if(r<=0)return e[0]}return L[0][0]}
+const fsWait=c=>Math.max(2.5,R(4,16)*(c.bait?.5:1)*(c.rain?.85:1)*(c.spot?.5:1)*(c.night?.9:1)*(c.red?1.3:1));
+
+// ---------- personal bests (per browser) ----------
+let fsRec={};try{fsRec=JSON.parse(localStorage.getItem('rss-fish-best')||'{}')||{}}catch(e){fsRec={}}
+function fsRecord(id,w){const prev=+fsRec[id]||0;if(w>prev){fsRec[id]=+w.toFixed(2);try{localStorage.setItem('rss-fish-best',JSON.stringify(fsRec))}catch(e){}}return !prev?'first':w>prev?'best':null}
+
+// ---------- ripple hotspots (local) ----------
+const FS_SPOTS=[];let fsSpotT=1;
+function fsSpotAt(x,z){for(const s of FS_SPOTS)if(s.t<s.life&&dist2(s.x,s.z,x,z)<3.6)return s;return null}
+function fsSpotsTick(dt){fsSpotT-=dt;for(const s of FS_SPOTS)s.t+=dt;for(let i=FS_SPOTS.length-1;i>=0;i--){const s=FS_SPOTS[i];if(s.t>s.life||dist2(s.x,s.z,P.x,P.z)>110)FS_SPOTS.splice(i,1)}
+  if(fsHolding()&&FS_SPOTS.some(s=>dist2(s.x,s.z,P.x,P.z)<32))tip('fish_spot','Ripples on the water','Bubbling ripples mark a feeding school. Cast into them for <b>faster bites</b> and <b>better fish</b> — the rare Goldfin likes them most.');
+  if(fsSpotT>0)return;fsSpotT=R(3,6);if(FS_SPOTS.length>=2)return;
+  for(let k=0;k<14;k++){const a=Math.random()*6.283,r=R(12,40),x=P.x+Math.sin(a)*r,z=P.z+Math.cos(a)*r;if(x<4||z<4||x>WS-4||z>WS-4||groundH(x,z)>-1.1)continue;
+    if(FS_SPOTS.some(s=>dist2(s.x,s.z,x,z)<10))continue;FS_SPOTS.push({x,z,t:0,life:R(40,85),ringT:0,bubT:0,jumpT:R(2,7)});break}}
+function fsStartJump(s){const a=Math.random()*6.283,id=inLake(s.x,s.z,30)?pick(['fish_perch','fish_trout']):pick(['fish_mackerel','fish_bass']);fsSetGeo(fsJump,id);
+  F.jump={x0:s.x-Math.sin(a)*.9,z0:s.z-Math.cos(a)*.9,x1:s.x+Math.sin(a)*.9,z1:s.z+Math.cos(a)*.9,t:0,len:R(.26,.4),yaw:a+Math.PI,end:false};F.jumpOn=true;
+  fsSplash(F.jump.x0,F.jump.z0,7,1,1.8);fsRing(F.jump.x0,F.jump.z0,.8,.9,.6);sfx('fsplash',.28,{x:s.x,z:s.z})}
+function fsSpotsRender(dt){for(const s of FS_SPOTS){const f=Math.min(1,s.t/3,(s.life-s.t)/4);if(f<=0||dist2(s.x,s.z,P.x,P.z)>75)continue;
+    s.ringT-=dt;if(s.ringT<=0){s.ringT=R(.45,1);fsRing(s.x+R(-1.2,1.2),s.z+R(-1.2,1.2),R(1,2.2),R(1.3,1.9),.42*f)}
+    s.bubT-=dt;if(s.bubT<=0){s.bubT=R(.12,.35);const x=s.x+R(-1.5,1.5),z=s.z+R(-1.5,1.5);burst(new V3(x,fsWaterY(x,z)+.02,z),['#f4fbff','#d8eef8'],1,.2,.7,5,.35)}
+    s.jumpT-=dt;if(s.jumpT<=0){s.jumpT=R(5,11);if(!F.jumpOn)fsStartJump(s)}}
+  const J=F.jump;if(F.jumpOn&&J){J.t+=dt/.75;const k=Math.min(1,J.t),x=lerp(J.x0,J.x1,k),z=lerp(J.z0,J.z1,k);
+    fsJump.visible=true;fsJump.position.set(x,fsWaterY(x,z)-.15+Math.sin(k*Math.PI)*.85,z);fsJump.rotation.set((.5-k)*2.4,J.yaw,Math.sin(k*9)*.25,'YXZ');fsJump.scale.setScalar(J.len);
+    if(k>=1){F.jumpOn=false;fsJump.visible=false;fsSplash(J.x1,J.z1,8,1.1,1.8);fsRing(J.x1,J.z1,.9,1,.6)}}else fsJump.visible=false}
+
+// ---------- state machine ----------
+function fsSecondary(){if(!S||!P||!P.alive)return;
+  if(F.st==='fly'||F.st==='float'){fsRetrieve();return}
+  if(F.st==='idle'||F.st==='charge'){F.useBait=!F.useBait;if(!F.useBait&&F.baited){F.baited=false;gain('bait',1,true)}feedMsg(F.useBait?'Bait on — it goes on the hook when you cast':'Bait off — saving your bait');sfx('click',.5)}}
+function fsEnd(msg,cls){F.endMsg=msg;F.endCls=cls;F.endT=performance.now()+1500}
+function fsCancel(){if(F.st==='land'){fsCatch();return}if(F.st==='fight'){F.baited=false;feedMsg('The fish got away');fsEnd('It got away','slack')}
+  F.st='idle';F.fish=null;F.bite=null;F.pow=0;F.hangReset=true}
+function fsCast(pow){pow=Math.max(.12,pow);
+  if(F.useBait&&!F.baited&&has('bait')){take('bait',1);F.baited=true}if(!F.baited)tip('fish_bait','No bait on the hook','Fish bite about <b>twice as fast</b> with bait. Craft it in the <b>Fishing</b> section: 1 raw meat → 4 bait, or 1 mushroom → 2. It goes on the hook automatically; <b>R</b> toggles it.');
+  const r=aimRay(),d=r&&r.d||{};let dx=fsN(d.x),dy=fsN(d.y)+.38,dz=fsN(d.z);const l=Math.hypot(dx,dy,dz)||1;dx/=l;dy/=l;dz/=l;const sp=6+15*pow;
+  const h=F.hangOk?F.hang:fsTip();F.bx=h.x;F.by=h.y;F.bz=h.z;F.vx=dx*sp+(P.vx||0)*.4;F.vy=dy*sp;F.vz=dz*sp+(P.vz||0)*.4;
+  F.st='fly';F.flyT=0;F.bite=null;F.fish=null;F.lineLen=0;F.seed=R(0,100);F.pv-=6*(.6+pow);sfx('fcast',.45+.45*pow);sfx('fwhip',.45)}
+function fsTether(max){const t=fsTip(),dx=F.bx-t.x,dy=F.by-t.y,dz=F.bz-t.z,d=Math.hypot(dx,dy,dz);if(!(d>max))return;const k=max/d;F.bx=t.x+dx*k;F.by=t.y+dy*k;F.bz=t.z+dz*k;
+  const nx=dx/d,ny=dy/d,nz=dz/d,vr=F.vx*nx+F.vy*ny+F.vz*nz;if(vr>0){F.vx-=nx*vr;F.vy-=ny*vr;F.vz-=nz*vr}}
+function fsFly(dt){F.flyT+=dt;F.vy-=9.8*dt;const k=1-.1*dt;F.vx*=k;F.vz*=k;F.bx+=F.vx*dt;F.by+=F.vy*dt;F.bz+=F.vz*dt;fsTether(FS_MAXLINE);
+  const gh=groundH(F.bx,F.bz),wy=fsWaterY(F.bx,F.bz);if(F.by<=Math.max(gh,wy)){if(gh<-.3)fsLandWater(wy);else fsMissWater(gh);return}
+  for(const b of nearBoxes(F.bx,F.bz,.2))if(F.bx>b.minx&&F.bx<b.maxx&&F.bz>b.minz&&F.bz<b.maxz&&F.by>b.miny&&F.by<b.maxy+.05){fsMissWater(b.maxy);return}
+  if(F.flyT>5)fsMissWater(Math.max(gh,0))}
+function fsLandWater(wy){F.by=wy;F.st='float';F.vx=F.vy=F.vz=0;const t=fsTip();F.lineLen=Math.hypot(F.bx-t.x,F.bz-t.z)+1.5;F.water=fsWaterKind(F.bx,F.bz);F.depth=Math.max(0,-groundH(F.bx,F.bz));
+  const c=fsCtx(F.bx,F.bz);F.spotHit=c.spot;F.waitT=fsWait(c);F.bite=null;sfx('fplop',.7,{x:F.bx,z:F.bz});fsRing(F.bx,F.bz,.9,1.1,.8);fsSplash(F.bx,F.bz,8,1.1,1.6);
+  if(c.spot)feedMsg('Right into the ripples!');
+  tip('fish_wait','Wait for the bite','Fish <b>nibble</b> first — the bobber twitches. Don\'t click yet! When it is <b>pulled under</b> and a yellow <b>!</b> appears, click within about a second. Clicking at any other time reels the line in.')}
+function fsMissWater(y){F.by=y+.06;F.vx=F.vy=F.vz=0;feedMsg(groundH(F.bx,F.bz)<0?'Too shallow — cast into deeper water':'Missed the water');sfx('thud',.2,{x:F.bx,z:F.bz});burst(new V3(F.bx,F.by,F.bz),CHIP.dirt,5,1,1.2);fsRetrieve()}
+function fsRetrieve(){F.st='reel';F.retT=0;F.bite=null;F.onLand=groundH(F.bx,F.bz)>-.05}
+function fsReelBack(dt){F.retT+=dt;const t=fsTip(),dx=t.x-F.bx,dy=t.y-F.by,dz=t.z-F.bz,dh=Math.hypot(dx,dz),d=Math.hypot(dx,dy,dz);
+  if(d<.5||F.retT>6){F.st='idle';F.hangReset=true;return}const sp=(F.onLand?13:10)*dt;
+  if(dh>2.2){const k=Math.min(1,sp/dh);F.bx+=dx*k;F.bz+=dz*k;const gh=groundH(F.bx,F.bz);if(gh<-.05){F.by=fsWaterY(F.bx,F.bz);if(Math.random()<dt*7)fsRing(F.bx,F.bz,.35,.5,.45)}else F.by=gh+.06}
+  else{const k=Math.min(1,sp*1.4/(d||1));F.bx+=dx*k;F.by+=dy*k;F.bz+=dz*k}
+  F.clk+=dt*15;if(F.clk>=1){F.clk=0;sfx('freel',.22)}F.crankV=16}
+function fsFloat(dt,press){const t=fsTip(),dx=F.bx-t.x,dz=F.bz-t.z,dh=Math.hypot(dx,dz);
+  if(dh>F.lineLen){const k=F.lineLen/dh;F.bx=t.x+dx*k;F.bz=t.z+dz*k;if(groundH(F.bx,F.bz)>-.3){feedMsg('You pulled the bobber out of the water');fsRetrieve();return}}
+  F.bx+=Math.sin(S.time*.21+F.seed)*dt*.05;F.bz+=Math.cos(S.time*.17+F.seed)*dt*.05;
+  const B=F.bite;if(!B){F.waitT-=dt;if(press){fsRetrieve();return}if(F.waitT<=0){const id=fsPick(F.water,fsCtx(F.bx,F.bz));F.bite={id,ph:'nib',t:R(1,2.6)*(Math.random()<.2?.35:1),tw:R(.1,.4)}}return}
+  B.t-=dt;
+  if(B.ph==='nib'){B.tw-=dt;if(B.tw<=0){B.tw=R(.35,.75);F.twitch=1;sfx('fnib',.45,{x:F.bx,z:F.bz});fsRing(F.bx,F.bz,.45,.6,.55)}
+    if(press){fsEarly();return}
+    if(B.t<=0){B.ph='bite';B.t=FS_SP[B.id].win*(F.spotHit?1.1:1);sfx('fbite',.85,{x:F.bx,z:F.bz});fsRing(F.bx,F.bz,1.3,.9,.9);fsSplash(F.bx,F.bz,14,1.8,2.6);P.camShake=Math.max(P.camShake||0,.06);
+      tip('fish_bite','Strike!','The bobber went under — <b>click now</b> to set the hook!')}}
+  else if(B.ph==='bite'){if(press){fsHook();return}if(B.t<=0)fsLate()}}
+function fsEarly(){F.bite=null;F.waitT=fsWait(fsCtx(F.bx,F.bz))*1.3;const lost=F.baited&&Math.random()<.3;if(lost)F.baited=false;feedMsg(lost?'Too early — it ran off with the bait':'Too early — you spooked it');sfx('fwhip',.4);
+  const t=fsTip(),dx=t.x-F.bx,dz=t.z-F.bz,d=Math.hypot(dx,dz)||1;F.bx+=dx/d*.8;F.bz+=dz/d*.8;fsRing(F.bx,F.bz,.6,.6,.6);F.pv+=3;
+  tip('fish_early','Too early','Small twitches are only nibbles. Wait until the bobber is <b>pulled under</b> and the <b>!</b> appears, then click.');if(groundH(F.bx,F.bz)>-.3)fsRetrieve()}
+function fsLate(){F.bite=null;const stole=F.baited;F.baited=false;F.waitT=fsWait(fsCtx(F.bx,F.bz));feedMsg(stole?'Too slow — it stole your bait':'Too slow — it got away');fsRing(F.bx,F.bz,.7,.8,.6)}
+function fsHook(){const id=F.bite.id,s=FS_SP[id],roll=Math.min(1,Math.random()*(F.spotHit?1.12:1)+(F.baited?.04:0)),w=s.w[0]+(s.w[1]-s.w[0])*Math.pow(roll,1.7);
+  F.fish={id,s,roll,w,str:s.str*(.78+.45*roll),len:clamp(.42*Math.cbrt(w),.18,1.1)};
+  Object.assign(F,{st:'fight',bite:null,tension:.42,prog:0,overT:0,slackT:0,stam:1,burst:0,burstT:R(.5,1.3),clk:0,strainT:0,jumpT:1,jumpSplash:true,tired:false,runEvt:0});
+  F.d0=Math.max(3,Math.hypot(F.bx-P.x,F.bz-P.z));F.want=F.d0;F.fx=F.bx;F.fz=F.bz;F.burstDir=Math.random()<.5?1:-1;
+  sfx('fwhip',.7);sfx('fsplash',.6,{x:F.bx,z:F.bz});fsSplash(F.bx,F.bz,16,2,2.8);fsRing(F.bx,F.bz,1.5,1,.9);startAnim('shoot',.35);P.camShake=Math.max(P.camShake||0,.12);F.pv+=4;
+  tip('fish_reel','Fish on!','<b>Hold left click</b> to reel, <b>release</b> to give line. Keep the white needle in the <b>green</b>: too long in the red snaps the line, too long in the grey slack lets the fish shake free. Let go when it runs — tired fish pull less.')}
+// one simulation step of the reel fight; returns 'snap' | 'slack' | 'catch' | null
+// tuned with a headless sim: attentive reeling lands everything (perch ~5 s … goldfin ~15 s); holding blindly snaps most big fish
+function fsFight(dt,reeling){const f=F.fish,s=f.s;F.burstT-=dt;
+  if(F.burst>0){if(F.burstT<=0){F.burst=0;F.burstT=R(.8,2.8)*(1.5-s.burst)*(1.5-F.stam*.5)}}
+  else if(F.burstT<=0){F.burst=R(.75,1.3)*(.45+.55*F.stam);F.burstT=R(.45,1.2);F.tension+=.1+.18*f.str;F.burstDir=Math.random()<.5?1:-1;F.runEvt=1}
+  const wob=(Math.sin(S.time*7.3+F.seed)+Math.sin(S.time*3.1+F.seed*2))*.5,pull=Math.max(0,f.str*(.4+.6*F.stam)*(1+F.burst*2.1)+wob*s.err*.1);
+  let rp=1;if(reeling&&typeof useStamina==='function'){const ok=fsTry(()=>useStamina(dt*4.5));if(ok===false)rp=.45}F.tired=rp<1;
+  const tgt=reeling?.3+pull*.85*(rp<1?.8:1):pull*.3,rate=tgt>F.tension?3:(reeling?1.8:2.6);F.tension+=(tgt-F.tension)*Math.min(1,rate*dt);
+  const dh=Math.hypot(F.fx-P.x,F.fz-P.z);if(dh>F.want+1.5)F.tension+=dt*.8*Math.min(2,dh-F.want-1.5);
+  F.tension=clamp(F.tension,0,1);
+  if(reeling&&F.tension>=FS_LO)F.prog+=dt*.42/(1+f.str*2.2)*rp*(F.tension>FS_HI?.75:1);else if(!reeling)F.prog-=dt*(.03+.12*F.burst)*f.str;
+  F.prog=clamp(F.prog,0,1);F.stam=Math.max(0,F.stam-dt*(.35+F.tension)/s.stam);
+  if(F.tension>FS_HI)F.overT+=dt;else F.overT=Math.max(0,F.overT-dt*.6);
+  if(F.tension<FS_LO)F.slackT+=dt;else F.slackT=Math.max(0,F.slackT-dt*1.5);
+  return F.overT>=FS_SNAP?'snap':F.slackT>=FS_SLACK?'slack':F.prog>=1?'catch':null}
+FSH.fight=fsFight;
+function fsFightTick(dt,reeling){const f=F.fish;if(!f){F.st='idle';return}F.runEvt=0;const res=fsFight(dt,reeling),s=f.s;
+  F.want=lerp(F.d0,1.7,F.prog);const ax=F.fx-P.x,az=F.fz-P.z,cur=Math.max(.5,Math.hypot(ax,az));
+  const lat=Math.sin(S.time*1.3+F.seed)*.7*s.err+F.burstDir*F.burst*2.4,ang=Math.atan2(ax,az)+lat*dt/Math.max(1.5,cur);
+  const nd=cur+clamp(F.want-cur,-3.2*dt,3.2*dt)+F.burst*dt*(reeling?.4:1.1);let nx=P.x+Math.sin(ang)*nd,nz=P.z+Math.cos(ang)*nd;
+  if(groundH(nx,nz)>-.22){if(F.prog>.82)F.prog=1;else{nx=F.fx;nz=F.fz}}F.fx=nx;F.fz=nz;
+  if(F.runEvt){fsSplash(F.fx,F.fz,10+Math.round(8*f.str),1.4,2.2);fsRing(F.fx,F.fz,1.1,.9,.75);sfx('fsplash',.35+.3*f.str,{x:F.fx,z:F.fz});P.camShake=Math.max(P.camShake||0,.05+.08*f.str);
+    if(s.burst>=.45&&F.jumpT>=1&&Math.random()<.38){F.jumpT=0;F.jumpSplash=false}}
+  F.clk+=dt*(reeling?(9+9*(1-F.tension))*(F.tired?.5:1):F.burst>0?22*F.burst:0);let k=0;while(F.clk>=1&&k<2){F.clk-=1;k++;sfx(reeling?'freel':'fdrag',reeling?.3:.22)}if(F.clk>2)F.clk=0;
+  F.crankV=reeling?(F.tired?7:15):F.burst>0?-20*F.burst:0;
+  if(F.tension>.82){F.strainT-=dt;if(F.strainT<=0){F.strainT=.24;sfx('fstrain',.22+.7*(F.tension-.8))}}
+  const r=F.prog>=1?'catch':res;if(r==='snap')fsSnap();else if(r==='slack')fsEscape();else if(r==='catch')fsStartLanding()}
+function fsSnap(){const x=F.fx,z=F.fz;F.st='idle';F.baited=false;F.fish=null;F.hangReset=true;fsEnd('SNAP! The line broke','hot');sfx('fsnap',.9);P.camShake=Math.max(P.camShake||0,.28);F.pv-=5;F.bv+=6;
+  feedMsg('The line snapped — bait lost');fsSplash(x,z,10,1.4,2);tip('fish_snap','Line snapped','The needle stayed in the red too long. When a fish runs, <b>release</b> left click to let line out, then reel again once it calms down.')}
+function fsEscape(){const lost=F.baited&&Math.random()<.5;if(lost)F.baited=false;F.fish=null;fsEnd('It shook the hook loose','slack');feedMsg(lost?'It got away with your bait':'It got away');sfx('fsplash',.5,{x:F.fx,z:F.fz});
+  fsSplash(F.fx,F.fz,8,1.2,1.8);F.bx=F.fx;F.bz=F.fz;F.by=fsWaterY(F.fx,F.fz);fsRetrieve();tip('fish_slack','Keep it tight','A slack line lets the fish throw the hook. Reel in short bursts so the needle stays in the green.')}
+function fsStartLanding(){F.st='land';F.landT=0;F.lx0=F.fx;F.ly0=fsWaterY(F.fx,F.fz);F.lz0=F.fz;sfx('fsplash',.9,{x:F.fx,z:F.fz});fsSplash(F.fx,F.fz,22,2.2,3.2);fsRing(F.fx,F.fz,1.6,1.1,.9);P.camShake=Math.max(P.camShake||0,.1)}
+function fsCatch(){const f=F.fish;F.st='idle';F.fish=null;F.baited=false;F.hangReset=true;if(!f||!P)return;
+  const trophy=f.roll>=.93,n=trophy?2:1,size=f.roll<.45?'Small':f.roll<.8?'Average':trophy?'Trophy':'Large';gain(f.id,n);F.caught++;S.fishCaught=(S.fishCaught||0)+n;
+  const rec=fsRecord(f.id,f.w),xp=[2,4,12][f.s.rar]+(trophy?4:0);if(typeof gainXP==='function')fsTry(()=>gainXP('survivor',xp,'Fishing'));
+  fsCard(f,size,n,rec);sfx(f.s.rar>=2||trophy?'frare':'fcatch',.8);burst(new V3(P.x-Math.sin(P.yaw)*.6,P.y+(P.eye||1.62)-.3,P.z-Math.cos(P.yaw)*.6),FS_SPL,16,1.3,1.4,9.8,.5);
+  if(f.s.rar>=2||trophy)killfeed(`★ ${f.s.rar>=2?'Rare catch':'Trophy'}: ${f.s.n}, ${f.w.toFixed(2)} kg`,true);
+  tip('fish_cook','Fresh fish','Cook fish at a <b>Campfire</b> (press E on it): 1 wood per fish → Cooked Fish, +55 calories. Raw fish doesn\'t go on your hotbar — eating it raw can make you sick. Different fish bite in the lake and the sea, at night and in the rain.')}
+function fsIcon(s){const [b,l,f]=s.col,flat=s.sh.w<.1;return `<svg width="78" height="${flat?44:36}" viewBox="0 0 78 ${flat?44:36}">`+(flat?
+  `<ellipse cx="34" cy="22" rx="28" ry="17" fill="${b}"/><path d="M60 22 L76 11 L73 22 L76 33Z" fill="${f}"/><circle cx="17" cy="17" r="2.2" fill="#111"/><circle cx="22" cy="13" r="2.2" fill="#111"/>`:
+  `<path d="M5 18 Q21 3 46 7 Q58 10 63 18 Q58 26 46 29 Q21 33 5 18Z" fill="${b}"/><path d="M8 19 Q22 30 46 28 Q57 26 62 19Z" fill="${l}"/><path d="M62 18 L76 7 L72 18 L76 29Z" fill="${f}"/><path d="M30 6 Q38 0 46 7Z" fill="${f}"/><circle cx="14" cy="15" r="2.2" fill="#111"/>`)+'</svg>'}
+function fsCard(f,size,n,rec){const s=f.s,rc=FS_RCOL[s.rar];
+  const badges=(rec==='best'?'<span class="rb">NEW PERSONAL BEST</span>':rec==='first'?'<span class="rb g">FIRST CATCH</span>':'')+(size==='Trophy'?'<span class="rb">TROPHY</span>':'');
+  FD.card.innerHTML=`${fsIcon(s)}<div class="k" style="color:${rc}">CAUGHT · ${FS_RAR[s.rar].toUpperCase()}</div><div class="t">${s.n}</div><div class="w">${f.w.toFixed(2)} kg · ${size}${n>1?' · ×'+n:''}</div><div class="d">${s.d}</div>${badges}`;
+  FD.card.style.borderTopColor=rc;FD.card.classList.add('hidden');void FD.card.offsetWidth;FD.card.classList.remove('hidden');FD.card._fv=true;F.cardT=performance.now()+(s.rar>=2||size==='Trophy'?6500:4800)}
+function fsTick(dt){const hold=fsHolding(),down=F.useFrame&&hold,press=down&&!F.prevDown;F.useFrame=false;F.prevDown=down;
+  if(!hold){if(F.st!=='idle')fsCancel();return}
+  const bl=fsBlocked();if(bl){if(F.st!=='idle'){fsCancel();if(bl==='swim')feedMsg('You can\'t fish while swimming')}return}
+  switch(F.st){
+   case 'idle':if(press&&!(P.cd>0)){F.st='charge';F.pow=0;sfx('creak',.22)}break;
+   case 'charge':F.pow=Math.min(1,F.pow+dt/1.05);if(!down)fsCast(F.pow);break;
+   case 'fly':fsFly(dt);break;
+   case 'float':fsFloat(dt,press);break;
+   case 'fight':fsFightTick(dt,down);break;
+   case 'reel':fsReelBack(dt);break;
+   case 'land':F.landT+=dt/.65;if(F.landT>=1)fsCatch();break}}
+
+// ---------- visuals (render hook) ----------
+const fsTW=new V3(),fsCD=new V3();
+function fsPendulum(dt,T){const h=F.hang,p=F.hprev;
+  if(F.hangReset||!F.hangOk||Math.hypot(h.x-T.x,h.y-T.y,h.z-T.z)>3){h.x=p.x=T.x;h.y=p.y=T.y-FS_HANG;h.z=p.z=T.z;F.hangReset=false;F.hangOk=true;return}
+  const dm=Math.max(0,1-1.6*dt),nx=h.x+(h.x-p.x)*dm,ny=h.y+(h.y-p.y)*dm-9.8*dt*dt,nz=h.z+(h.z-p.z)*dm;p.x=h.x;p.y=h.y;p.z=h.z;h.x=nx;h.y=ny;h.z=nz;
+  const dx=h.x-T.x,dy=h.y-T.y,dz=h.z-T.z,d=Math.hypot(dx,dy,dz);if(d>FS_HANG){const k=FS_HANG/d;h.x=T.x+dx*k;h.y=T.y+dy*k;h.z=T.z+dz*k}}
+function fsRender(dt){if(!S||!P)return;
+  for(const r of FS_RINGS){if(!r.on)continue;r.t+=dt/r.life;if(r.t>=1){r.on=false;r.m.visible=false;continue}const k=r.t,s=r.size*(.12+.88*(1-(1-k)*(1-k)));
+    r.m.scale.set(s,1,s);r.m.position.set(r.x,fsWaterY(r.x,r.z)+.025,r.z);r.m.material.opacity=r.a*(1-k)}
+  fsSpotsRender(dt);
+  const root=vmCache.fishing_rod,rodOn=fsHolding()&&!!root&&vmCur===root,Lt=S.light===undefined?1:S.light;
+  let tgt=0;if(F.st==='charge')tgt=F.pow;else if(F.st==='fight')tgt=.16+F.tension*.24;else if(F.st==='reel')tgt=.1;else if(F.st==='land')tgt=.4;else if(F.st==='float')tgt=.04;
+  F.pv+=((tgt-F.pose)*140-F.pv*12)*dt;F.pose+=F.pv*dt;
+  const biting=F.st==='float'&&F.bite&&F.bite.ph==='bite';
+  let bt=-F.pv*.035;if(F.st==='fight')bt-=.22+F.tension*1.1+Math.abs(Math.sin(S.time*29))*.03*F.tension;else if(biting)bt-=.3;else if(F.st==='land')bt-=.55;else if(F.st==='reel')bt-=.1;
+  F.bv+=((bt-F.bend)*230-F.bv*17)*dt;F.bend+=F.bv*dt;
+  let side=0;if(F.st==='fight'||F.st==='land'){let rel=Math.atan2(P.x-F.fx,P.z-F.fz)-P.yaw;rel=((rel%6.2832)+9.4248)%6.2832-3.1416;side=clamp(rel,-1,1)*.5*(F.st==='fight'?F.tension+.3:1)}
+  F.side=lerp(F.side,side,Math.min(1,dt*6));F.crankA+=dt*F.crankV;F.crankV*=Math.max(0,1-dt*5);
+  if(rodOn){const U=root.userData;if(U&&U.fsRod){U.pivot.rotation.x=.55+F.pose;for(let i=0;i<U.segs.length;i++){U.segs[i].rotation.x=F.bend*FS_W[i];U.segs[i].rotation.y=F.side*FS_W[i]}U.crank.rotation.x=F.crankA;
+    U.tip.getWorldPosition(fsTW);const T=F.tip||(F.tip={x:0,y:0,z:0});T.x=fsN(fsTW.x);T.y=fsN(fsTW.y);T.z=fsN(fsTW.z)}}
+  const vis=rodOn&&P.alive;fsBob.visible=vis;fsLine.visible=vis;
+  if(!vis){fsFish.visible=false;fsBang.visible=false;return}
+  const T=fsTip();let bx,by,bz,ex,ey,ez;
+  if(F.st==='idle'||F.st==='charge'){fsPendulum(dt,T);bx=F.hang.x;by=F.hang.y;bz=F.hang.z}
+  else if(F.st==='fight'){const ax=T.x-F.fx,az=T.z-F.fz,d=Math.hypot(ax,az)||1;bx=F.fx+ax/d*.7;bz=F.fz+az/d*.7;by=fsWaterY(bx,bz)-.04-F.burst*.08+Math.sin(S.time*23)*.012}
+  else if(F.st!=='land'){bx=F.bx;bz=F.bz;by=F.by;if(F.st==='float')by=fsWaterY(bx,bz)+Math.sin(S.time*2.3+F.seed)*.01-F.twitch*.05-(biting?.15+Math.sin(S.time*18)*.03:0)}
+  F.twitch=Math.max(0,F.twitch-dt*5);
+  // hooked / landing fish
+  if(F.st==='fight'&&F.fish){const f=F.fish;fsSetGeo(fsFish,f.id);const wy=fsWaterY(F.fx,F.fz);let y=wy-.32,pitch=0;
+    if(F.jumpT<1){F.jumpT+=dt/.7;const k=Math.min(1,F.jumpT);y=wy-.3+Math.sin(k*Math.PI)*(.55+.5*f.str);pitch=(.5-k)*2.2;
+      if(!F.jumpSplash&&k>.9){F.jumpSplash=true;fsSplash(F.fx,F.fz,14,1.6,2.4);fsRing(F.fx,F.fz,1.2,1,.8);sfx('fsplash',.6,{x:F.fx,z:F.fz})}}
+    fsFish.visible=true;fsFish.position.set(F.fx,y,F.fz);fsFish.rotation.set(pitch,Math.atan2(F.fx-P.x,F.fz-P.z)+Math.sin(S.time*(12+F.burst*10))*(.22+F.burst*.2),0,'YXZ');fsFish.scale.setScalar(f.len)}
+  else if(F.st==='land'&&F.fish){const f=F.fish,k=Math.min(1,F.landT),e=k<.5?2*k*k:1-Math.pow(-2*k+2,2)/2;camera.getWorldDirection(fsCD);
+    const cp=camera.position,cx=fsN(cp.x)+fsN(fsCD.x)*.8,cy=fsN(cp.y)+fsN(fsCD.y)*.8-.28,cz=fsN(cp.z)+fsN(fsCD.z)*.8;
+    const x=lerp(F.lx0,cx,e),z=lerp(F.lz0,cz,e),y=lerp(F.ly0,cy,e)+Math.sin(k*Math.PI)*1.3;fsSetGeo(fsFish,f.id);
+    fsFish.visible=true;fsFish.position.set(x,y,z);fsFish.rotation.set(Math.sin(k*20)*.5,Math.atan2(x-P.x,z-P.z)+k*4,Math.sin(k*13)*.6,'YXZ');fsFish.scale.setScalar(f.len*lerp(1,.55,e));
+    ex=x;ey=y+.04;ez=z;bx=lerp(x,T.x,.12);by=lerp(y,T.y,.12)+.05;bz=lerp(z,T.z,.12)}
+  else fsFish.visible=false;
+  fsBob.position.set(bx,by,bz);
+  if(F.st==='fly')fsBob.rotation.set(clamp(F.vz*.05,-.8,.8),0,clamp(-F.vx*.05,-.8,.8));else fsBob.rotation.set(Math.sin(S.time*2.1+F.seed)*.12,0,Math.cos(S.time*1.7)*.12+(F.st==='fight'?Math.sin(S.time*17)*.3:0));
+  fsBob.material.emissiveIntensity=1.8*(1-Lt);
+  // fishing line: rod tip → bobber (or fish while landing), sagging when slack and resting on the water / ground
+  if(ex===undefined){ex=bx;ey=by+.05;ez=bz}
+  const slack=F.st==='fly'?.1:F.st==='float'?(biting?.12:.5):F.st==='fight'?(1-F.tension)*.45:F.st==='reel'?.18:F.st==='land'?.03:0;
+  const Lx=ex-T.x,Ly=ey-T.y,Lz=ez-T.z,sag=slack*Math.min(Math.hypot(Lx,Ly,Lz)*.11,3.2);
+  for(let i=0;i<FS_LN;i++){const u=i/(FS_LN-1),x=T.x+Lx*u,z=T.z+Lz*u;let y=T.y+Ly*u-sag*4*u*(1-u);if(sag>.02&&i>0&&i<FS_LN-1){const fl=Math.max(groundH(x,z),-.05)+.015;if(y<fl)y=fl}
+    fsLinePos[i*3]=x;fsLinePos[i*3+1]=y;fsLinePos[i*3+2]=z}
+  fsLineGeo.attributes.position.needsUpdate=true;fsLineMat.color.setScalar(.3+.62*Lt);
+  fsBang.visible=!!biting;if(biting){const d=Math.hypot(bx-fsN(camera.position.x),bz-fsN(camera.position.z)),s=clamp(d*.055,.35,1.8)*(1+Math.sin(S.time*20)*.08);fsBang.scale.set(s,s,1);fsBang.position.set(bx,by+.25+s*.6,bz)}}
+
+// ---------- HUD (hud hook) ----------
+let fsWaterT=0,fsWaterHint=null;
+function fsFindWater(){let best=null;for(let i=0;i<16;i++){const a=i/16*6.2832;for(let r=4;r<=44;r+=4){if(best&&r>=best.r)break;if(groundH(P.x+Math.sin(a)*r,P.z+Math.cos(a)*r)<-.8){best={r,a};break}}}return best}
+function fsDirText(a){let rel=a-(P.yaw+Math.PI);rel=((rel%6.2832)+9.4248)%6.2832-3.1416;const r=Math.abs(rel);return r<.5?'ahead':r>2.5?'behind you':rel>0?'to your left':'to your right'}
+function fsHintName(f){if(!f)return'';if(f.s.rar===2)return'Something glints below…';return f.str<.38?'A light tug':f.str<.52?'A lively fish':f.str<.66?'A strong fish':'Something heavy!'}
+function fsHud(){if(!S||!P)return;const now=performance.now(),hold=fsHolding();fsVis(FD.panel,hold);
+  if(hold){let s='',b='',cls='';const bait=P.inv.bait||0;
+    switch(F.st){
+     case 'idle':if(now>fsWaterT){fsWaterT=now+900;fsWaterHint=fsFindWater()}
+       if(P.swim){s='Can\'t fish while swimming';b='Get back to the shore'}
+       else if(fsWaterHint&&fsWaterHint.r<=8){s='Hold LMB to cast';b='Aim higher to cast farther · '+(F.baited?'bait on the hook':bait?'bait goes on when you cast':'no bait')}
+       else if(fsWaterHint){s='Hold LMB to cast';b=`Deep water ~${fsWaterHint.r} m ${fsDirText(fsWaterHint.a)}`}
+       else{s='Find deep water';b='The lake or the sea — check the map (M)'}break;
+     case 'charge':s='Release to cast';b=`Power ${Math.round(F.pow*100)}%`;break;
+     case 'fly':s='Casting…';b='';break;
+     case 'float':{const B=F.bite;s=!B?'Waiting for a bite…':B.ph==='nib'?'Nibbling… wait for it':'! STRIKE — CLICK NOW';if(B&&B.ph==='bite')cls='bite';
+       b=`${F.water==='lake'?'Lake':'Sea'} · ${F.depth.toFixed(1)} m deep${F.spotHit?' · in the ripples':''} · ${F.baited?'baited':'no bait'} · click to reel in`;break}
+     case 'fight':s='Fish on!';cls='fight';b='Hold LMB to reel · release to give line';break;
+     case 'reel':s='Reeling in…';b='';break;
+     case 'land':s='Landing it…';cls='fight';b='';break}
+    fsSet(FQ.ps,'textContent',s);fsSet(FQ.pb,'textContent',b);fsSet(FQ.pi,'textContent',`Bait ${bait}${F.useBait?'':' · off'}${F.baited?' · 1 on hook':''}`);
+    FD.panel.classList.toggle('bite',cls==='bite');FD.panel.classList.toggle('fight',cls==='fight')}
+  const charging=hold&&F.st==='charge';fsVis(FD.pow,charging);if(charging)FQ.pow.style.width=(F.pow*100).toFixed(1)+'%';
+  fsVis(FD.bang,hold&&F.st==='float'&&F.bite&&F.bite.ph==='bite');
+  if(hold&&F.st==='fight'&&F.fish){fsVis(FD.fight,true);const hot=F.overT>.05,sl=F.slackT>.25&&!hot;
+    FD.fight.classList.toggle('hot',hot);FD.fight.classList.toggle('slack',sl);FD.fight.classList.remove('end');
+    FQ.nd.style.left=(F.tension*100).toFixed(1)+'%';FQ.pr.style.width=(F.prog*100).toFixed(1)+'%';
+    FQ.tm.style.width=(hot?F.overT/FS_SNAP:sl?F.slackT/FS_SLACK:0)*100+'%';FQ.tm.style.background=hot?'#ff6a4a':'#9fc6e8';
+    fsSet(FQ.fh,'textContent',fsHintName(F.fish));
+    const m=hot?'LINE STRAINING — LET GO!':sl?'SLACK — REEL IN!':F.tired?'Exhausted — reeling slowly':F.burst>.3?'It\'s running — careful!':'Hold LMB to reel · release to give line';
+    fsSet(FQ.m,'textContent',m);fsSet(FQ.m,'className','m'+(hot?' hot':sl?' slack':''))}
+  else if(now<F.endT){fsVis(FD.fight,true);FD.fight.classList.remove('hot','slack');FD.fight.classList.add('end');fsSet(FQ.m,'textContent',F.endMsg);fsSet(FQ.m,'className','m end');FQ.tm.style.width='0%'}
+  else fsVis(FD.fight,false);
+  fsVis(FD.card,now<F.cardT&&P.alive)}
+
+// ---------- hooks ----------
+function fsResetAll(){Object.assign(F,{st:'idle',bite:null,fish:null,baited:false,useBait:true,tension:0,prog:0,overT:0,slackT:0,pose:0,pv:0,bend:0,bv:0,side:0,crankV:0,
+  endT:0,cardT:0,hangReset:true,hangOk:false,jumpOn:false,jump:null,caught:0,tip:null,useFrame:false,prevDown:false});FS_SPOTS.length=0;
+  for(const r of FS_RINGS){r.on=false;r.m.visible=false}fsBob.visible=fsLine.visible=fsFish.visible=fsJump.visible=fsBang.visible=false}
+onHook('playerTick',dt=>{fsTick(dt);fsSpotsTick(dt)});
+onHook('render',dt=>fsRender(dt));
+onHook('hud',()=>fsHud());
+onHook('status',o=>{if(F.st!=='idle'&&F.st!=='charge'&&fsHolding())o.push('<span style="color:#8fd0ff">FISHING</span>')});
+onHook('equip',id=>{if(id!=='fishing_rod'){if(F.st!=='idle')fsCancel()}else{F.hangReset=true;
+  tip('fish_rod','Fishing','Stand at the shore of the <b>lake</b> or the <b>sea</b>. <b>Hold left click</b> to swing back (watch the power bar), <b>release</b> to cast. The bobber must land in water deeper than your knees. Aim higher to cast farther.')}});
+onHook('craft',id=>{if(id==='fishing_rod')tip('fish_craft','Fishing Rod crafted','Select it in your hotbar and walk to the shore of the <b>lake</b> or the <b>sea</b>. Craft some <b>Bait</b> too — from raw meat or mushrooms.')});
+onHook('death',()=>{if(F.st==='land'){F.st='idle';F.fish=null;F.bite=null;F.pow=0;F.hangReset=true}else fsCancel();F.baited=false;F.cardT=0});
+onHook('newGame',()=>fsResetAll());
+}
+
 /* ================= RENDER ================= */
 const tmpC=new THREE.Color(),tmpC2=new THREE.Color();
 const SKY={dayTop:new THREE.Color('#4a82c4'),dayBot:new THREE.Color('#bcd2de'),setTop:new THREE.Color('#3b4f7a'),setBot:new THREE.Color('#e8a26a'),nightTop:new THREE.Color('#03050b'),nightBot:new THREE.Color('#080b12'),
