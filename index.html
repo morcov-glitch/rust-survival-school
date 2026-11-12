@@ -7241,6 +7241,556 @@ onHook('death',()=>{if(F.st==='land'){F.st='idle';F.fish=null;F.bite=null;F.pow=
 onHook('newGame',()=>fsResetAll());
 }
 
+/* ================= WORLD EVENTS ================= */
+// Dynamic world events: Red Moon horde nights, thunderstorms (lightning, burning trees) and helicopter crash sites.
+// The host (or solo player) decides every event in 'worldTick' and broadcasts 'e_' messages; clients only reproduce
+// the visuals and sounds. The current event state also rides along in the snapshot so late joiners catch up.
+// Public API (cross-module contract): redMoon() -> bool · stormActive() -> bool · CRASH (current crash site or null)
+// Console helper for testing (host/solo): evDebug('red'|'storm'|'bolt'|'crash'|'dawn')
+var CRASH=null;
+var EV={red:false,redNi:-1,redK:0,redDirty:false,moonDirty:false,warned:-99,forceNi:-99,wave:0,waveAt:0,lureT:0,horde:[],fallen:{},kills:{},wolfCap:-1,wolfStart:0,govT:0,
+  storm:false,stormK:0,rainN:0,wasRain:false,stormRoll:-1,forceStorm:false,boltT:0,boltI:0,
+  crashDay:-1,crashAt:-1,crashN:0,cacheN:0,caches:[],gone:{},fires:[],fireN:0,boomT:0,hdmgT:0,
+  flash:0,fnear:0,fx:0,fy:0,fz:0,fdx:0,fdz:1,dmgT:0,snapN:0,toasts:[],toastT:0,toastOn:false,hudN:0,banOn:null,banTxt:'',banWv:'',banTop:-1,
+  crackT:0,omenT:30,loops:null,loopsFail:false,windX:.5,windZ:.2,lastFo:-1,lastVo:-1};
+function redMoon(){return !!(EV&&EV.red)}
+function stormActive(){return !!(EV&&EV.storm)}
+// EVERY: every 3rd night · RM0/RM1: red moon window as day fractions (dusk 21:50 → dawn 06:43) · WAVE: s between waves
+// CAP: max live horde · FLY: helicopter fall time · BURN: wreck fire · LIFE: site lifetime · CACHE: moon cache lifetime
+const EVC={EVERY:3,RM0:.66,RM1:.03,WARN:.59,WAVE:40,CAP:28,FLY:8,BURN:60,LIFE:480,CACHE:420,STORM:.55,TFIRE:.22,FIRE:25};
+const EVB_MAX=1800;
+const evRng=seed=>{let a=(seed>>>0)||1;return()=>{a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296}};
+const EV_DIRS=['N','NE','E','SE','S','SW','W','NW'],EV_DIRL={N:'north',NE:'north-east',E:'east',SE:'south-east',S:'south',SW:'south-west',W:'west',NW:'north-west'};
+const evDir=(dx,dz)=>EV_DIRS[Math.round((((Math.atan2(dx,-dz)*180/Math.PI)%360)+360)%360/45)%8];
+const evMyKey=()=>NET.role==='client'?NET.myId:'@host';
+const evSrc=(name,x,z)=>({t:'event',id:'ev_'+name,name,x,z,y:0,dead:true});
+function evPlayers(){const o=[];if(P&&P.alive)o.push({w:P,k:'@host'});for(const r of remoteList())if(r&&!r.dead)o.push({w:r,k:r.id});return o}
+function evCreatures(){const o=[];for(const n of npcs)if(!n.dead)o.push(n);for(const a of animals)if(!a.dead)o.push(a);if(typeof zombies!=='undefined'&&Array.isArray(zombies))for(const z of zombies)if(z&&!z.dead&&!z.rm&&!z.mirror)o.push(z);return o}
+function evHurtLocal(x,z,gy,r,max,min,cause,txt){if(!P||!P.alive)return 0;const d=dist2(P.x,P.z,x,z);if(d>=r||(gy!==undefined&&gy!==null&&Math.abs(P.y-gy)>6))return 0;
+  const dmg=min+(max-min)*(1-d/r);hurt(dmg,cause,x,z);if(!P.alive)$('#dCause').textContent=txt;return dmg}
+// host only: creatures are simulated there (clients would double-apply); every client hurts its own player separately
+function evHurtArea(x,z,r,max,min,src,cause,burn){if(NET.role==='client')return;for(const c of evCreatures()){const d=dist2(c.x,c.z,x,z);if(d>=r)continue;
+  try{damageAny(c,min+(max-min)*(1-d/r),src,burn?{cause,wname:src.name,dot:true}:{cause,wname:src.name,explosive:true});if(burn&&typeof applyStatus==='function')applyStatus(c,'burn',3,src)}catch(e){}}}
+
+// ---- shared visual resources: created once at load (lights are pooled — never added after the game starts) ----
+const evSmokeTex=canvasTex(64,(g,s)=>{g.clearRect(0,0,s,s);for(let i=0;i<9;i++){const x=s/2+R(-9,9),y=s/2+R(-9,9),r=R(12,24);const gr=g.createRadialGradient(x,y,0,x,y,r);gr.addColorStop(0,'rgba(255,255,255,.5)');gr.addColorStop(1,'rgba(255,255,255,0)');g.fillStyle=gr;g.fillRect(0,0,s,s)}});
+const evGlowTex=canvasTex(128,(g,s)=>{g.clearRect(0,0,s,s);const gr=g.createRadialGradient(s/2,s/2,0,s/2,s/2,s/2);gr.addColorStop(0,'rgba(255,255,255,1)');gr.addColorStop(.16,'rgba(255,255,255,.6)');gr.addColorStop(.42,'rgba(255,255,255,.16)');gr.addColorStop(1,'rgba(255,255,255,0)');g.fillStyle=gr;g.fillRect(0,0,s,s)});
+const evScorchTex=canvasTex(128,(g,s)=>{g.clearRect(0,0,s,s);const gr=g.createRadialGradient(s/2,s/2,0,s/2,s/2,s/2);gr.addColorStop(0,'rgba(10,8,6,.95)');gr.addColorStop(.5,'rgba(22,17,12,.72)');gr.addColorStop(1,'rgba(30,24,18,0)');g.fillStyle=gr;g.fillRect(0,0,s,s);
+  for(let i=0;i<46;i++){g.fillStyle='rgba(0,0,0,'+R(.1,.35).toFixed(2)+')';g.beginPath();g.arc(s/2+R(-42,42),s/2+R(-42,42),R(2,9),0,7);g.fill()}});
+const EVX={flames:[],puffs:[],bolts:[],fireL:[],heliFl:[]};
+{const mkL=(c,d,dec)=>{const L=new THREE.PointLight(c,0,d,dec);scene.add(L);return L};
+  EVX.boltL=mkL(0xd2e0ff,340,1.1);for(let i=0;i<2;i++)EVX.fireL.push({L:mkL(0xff8836,32,1.7),used:false});EVX.beacon=mkL(0xff4a30,12,1.6);
+  EVX.flameMat=new THREE.SpriteMaterial({map:fireTex,transparent:true,depthWrite:false,blending:THREE.AdditiveBlending,fog:false});
+  for(let i=0;i<30;i++){const sp=new THREE.Sprite(EVX.flameMat);sp.visible=false;scene.add(sp);EVX.flames.push({sp,used:false,x:0,y:0,z:0,sc:1,ph:R(0,6.3)})}
+  for(let i=0;i<2;i++){const sp=new THREE.Sprite(EVX.flameMat);sp.position.set(i?.35:-.3,3.2,-1.05+i*.5);sp.scale.set(1.3,1.9,1);EVX.heliFl.push(sp)}
+  for(let i=0;i<72;i++){const mat=new THREE.SpriteMaterial({map:evSmokeTex,transparent:true,depthWrite:false,opacity:0,fog:true,color:0x444444});const sp=new THREE.Sprite(mat);sp.visible=false;scene.add(sp);
+    EVX.puffs.push({sp,mat,on:false,x:0,y:0,z:0,vx:0,vy:0,vz:0,age:0,life:1,s0:1,s1:2,op:.5,c:.3,glow:0,rot:0})}
+  for(let i=0;i<2;i++){const g=new THREE.BufferGeometry();const pos=new Float32Array(EVB_MAX*3),cl=new Float32Array(EVB_MAX*3);g.setAttribute('position',new THREE.BufferAttribute(pos,3));g.setAttribute('color',new THREE.BufferAttribute(cl,3));g.setDrawRange(0,0);
+    const mat=new THREE.MeshBasicMaterial({vertexColors:true,transparent:true,opacity:1,blending:THREE.AdditiveBlending,depthWrite:false,fog:false,side:THREE.DoubleSide});
+    const m=new THREE.Mesh(g,mat);m.frustumCulled=false;m.visible=false;m.renderOrder=6;scene.add(m);
+    const fl=new THREE.Sprite(new THREE.SpriteMaterial({map:evGlowTex,color:0xcfe0ff,transparent:true,depthWrite:false,blending:THREE.AdditiveBlending,fog:false}));fl.visible=false;scene.add(fl);
+    EVX.bolts.push({m,g,pos,cl,mat,fl,t:-1,r:0,near:0})}
+  EVX.halo=new THREE.Sprite(new THREE.SpriteMaterial({map:evGlowTex,color:0xff2a10,transparent:true,depthWrite:false,blending:THREE.AdditiveBlending,fog:false,opacity:0}));EVX.halo.scale.set(340,340,1);EVX.halo.visible=false;scene.add(EVX.halo);
+  EVX.scorchMat=new THREE.MeshStandardMaterial({map:evScorchTex,transparent:true,depthWrite:false,polygonOffset:true,polygonOffsetFactor:-4,roughness:1});}
+// colours: sky shader takes raw values; fog, lights and lit/basic materials take linear values (col)
+// (the moon red is HDR so it blooms like the regular moon does under the post-processing pipeline)
+const EVK={rTop:new THREE.Color('#2c0402'),rBot:new THREE.Color('#5e1006'),rCloud:new THREE.Color('#5a140a'),rShade:new THREE.Color('#1e0504'),tmp:new THREE.Color(),
+  moonBase:moonMesh.material.color.clone(),moonRed:new THREE.Color(1.75,.3,.13),mlBase:moon.color.clone(),mlRed:col('#ff3a1e'),hemiRed:col('#ff5a40'),
+  fC:col('#dfe8ff'),fSky:new THREE.Color('#7f8fb6'),fSky2:new THREE.Color('#a7b4d6'),fCloud:new THREE.Color('#c8d2ee')};
+// fog follows the (tinted) horizon colour exactly like the core + gfx do, so distant terrain melts into the sky
+function evFogFromSky(){const fc=EVK.tmp.copy(skyU.bot.value).convertSRGBToLinear();if(typeof gfxInvTone==='function'){try{gfxInvTone(fc,scene.fog.color);return}catch(e){}}scene.fog.color.copy(fc)}
+
+// ---- procedural models (built lazily once; merged vertex-colour geometry, flat shaded like the rest of the island) ----
+let EVG=null;
+function evGeo(){if(EVG)return EVG;const Bx=(w,h,d)=>new THREE.BoxGeometry(w,h,d),Cy=(a,b,h,n)=>new THREE.CylinderGeometry(a,b,h,n||6),PI=Math.PI;
+  const OL='#56603f',OD='#424a33',ST='#b8642e',GL='#1d262d',DK='#2a2c27',BL='#262824';
+  EVG={
+   body:buildGeo([{g:Bx(2.1,1.9,4.2),c:OL,p:[0,1.75,.4]},{g:Cy(.62,1.02,1.5),c:OL,p:[0,1.62,3.25],r:[PI/2,0,0],s:[1.03,1,.93]},{g:Bx(2.13,.28,4.23),c:ST,p:[0,1.3,.4]},
+    {g:Bx(1.72,.85,.08),c:GL,p:[0,2.12,2.6],r:[-.55,0,0]},{g:Bx(.06,.72,1.5),c:GL,p:[1.07,2.05,1.25]},{g:Bx(.06,.72,1.5),c:GL,p:[-1.07,2.05,1.25]},
+    {g:Bx(.06,1.25,1.15),c:OD,p:[1.08,1.55,-.55]},{g:Bx(.06,1.25,1.15),c:OD,p:[-1.08,1.55,-.55]},{g:Bx(1.35,.72,2.5),c:OD,p:[0,3.0,-.2]},
+    {g:Cy(.2,.25,.55),c:DK,p:[0,3.02,-1.55],r:[PI/2,0,0]},{g:Cy(.1,.13,.55),c:DK,p:[0,3.6,0]},{g:Bx(.1,.1,3.9),c:DK,p:[.95,.08,.45]},{g:Bx(.1,.1,3.9),c:DK,p:[-.95,.08,.45]},
+    {g:Bx(.08,.78,.08),c:DK,p:[.82,.45,1.5],r:[0,0,.32]},{g:Bx(.08,.78,.08),c:DK,p:[-.82,.45,1.5],r:[0,0,-.32]},{g:Bx(.08,.78,.08),c:DK,p:[.82,.45,-.7],r:[0,0,.32]},{g:Bx(.08,.78,.08),c:DK,p:[-.82,.45,-.7],r:[0,0,-.32]}]),
+   // tail boom with its origin at the joint, so the wreck can lie snapped off
+   tail:buildGeo([{g:Cy(.2,.42,5.8),c:OL,p:[0,0,-2.9],r:[-PI/2,0,0]},{g:Bx(.12,1.45,1),c:OL,p:[0,.62,-5.6],r:[-.35,0,0]},{g:Bx(1.9,.08,.55),c:OD,p:[0,.05,-4.95]},{g:Bx(.14,.3,.5),c:ST,p:[0,1.1,-5.95],r:[-.35,0,0]}]),
+   rotor:buildGeo([0,1,2,3].map(k=>{const a=k*PI/2;return{g:Bx(.3,.05,5.4),c:BL,p:[Math.sin(a)*2.75,0,Math.cos(a)*2.75],r:[0,a,0]}}).concat([{g:Cy(.28,.28,.22,8),c:DK,p:[0,0,0]}])),
+   trotor:buildGeo([{g:Bx(.04,1.3,.15),c:BL},{g:Bx(.04,.15,1.3),c:BL}]),
+   wbits:buildGeo([{g:Bx(.3,.05,3.2),c:BL,p:[2.7,.06,2],r:[0,.9,.05]},{g:Bx(.3,.05,2.6),c:BL,p:[-3.3,.85,1.4],r:[.25,-.4,.95]},{g:Bx(.3,.05,1.3),c:BL,p:[-1.25,3.45,.5],r:[.1,.5,.05]},
+    {g:Bx(.3,.05,1),c:BL,p:[-1,3.3,-.6],r:[-.2,2.2,.35]},{g:Bx(.62,.05,.46),c:'#3a3f30',p:[3.8,.04,-1.6],r:[0,.3,.08]},{g:Bx(.5,.05,.4),c:'#4a5236',p:[-2.4,.04,-3],r:[0,1.2,0]},
+    {g:Bx(.42,.32,.3),c:DK,p:[1.9,.16,-3.3],r:[.3,.5,.2]},{g:Cy(.17,.17,.62),c:DK,p:[-1.7,.17,3.5],r:[0,0,PI/2]},{g:Bx(.72,.04,.5),c:GL,p:[.9,.03,4.1],r:[0,.5,0]},{g:Bx(.36,.04,.26),c:ST,p:[-.4,.03,-4.4],r:[0,.8,0]}]),
+   crate:buildGeo([{g:Bx(1,.58,.64),c:'#3e4a2e',p:[0,.29,0]},{g:Bx(1.04,.1,.68),c:'#4b5838',p:[0,.6,0]},{g:Bx(.07,.62,.7),c:'#24261f',p:[.36,.31,0]},{g:Bx(.07,.62,.7),c:'#24261f',p:[-.36,.31,0]},
+    {g:Bx(.42,.09,.01),c:'#c8a038',p:[0,.36,.326]},{g:Bx(.42,.09,.01),c:'#c8a038',p:[0,.36,-.326]},{g:Bx(.06,.07,.2),c:'#24261f',p:[.53,.4,0]},{g:Bx(.06,.07,.2),c:'#24261f',p:[-.53,.4,0]}]),
+   cache:buildGeo([{g:Bx(.82,.42,.52),c:'#2c2b30',p:[0,.21,0]},{g:Bx(.86,.08,.56),c:'#9c2a1c',p:[0,.3,0]},{g:Bx(.84,.06,.54),c:'#3a3940',p:[0,.45,0]},{g:Bx(.08,.12,.04),c:'#b8b0a0',p:[.25,.33,.29]},
+    {g:Bx(.08,.12,.04),c:'#b8b0a0',p:[-.25,.33,.29]},{g:Bx(.3,.05,.08),c:'#1a1a1c',p:[0,.5,0]},{g:Cy(.012,.012,.42,4),c:'#888880',p:[-.3,.68,-.15]}]),
+   lamp:new THREE.SphereGeometry(.06,8,6)};
+  EVG.wreckMat=new THREE.MeshStandardMaterial({vertexColors:true,flatShading:true,roughness:.96,metalness:.08,color:new THREE.Color(.46,.42,.38)});
+  EVG.lampMat=new THREE.MeshBasicMaterial({color:0xff3a22});return EVG}
+function evScorch(x,z,size){const g=new THREE.PlaneGeometry(size,size,8,8);g.rotateX(-Math.PI/2);const pa=g.attributes.position;
+  for(let i=0;i<pa.count;i++){const px=pa.getX(i)+x,pz=pa.getZ(i)+z;pa.setXYZ(i,px,Math.max(groundH(px,pz),0)+.06,pz)}pa.needsUpdate=true;g.computeVertexNormals();
+  const m=new THREE.Mesh(g,EVX.scorchMat);m.receiveShadow=true;m.renderOrder=1;return m}
+
+// ---- HUD: banner, announcements, flash and red vignette ----
+const EVD={};
+{const st=document.createElement('style');st.textContent=`
+#evBan{position:absolute;left:50%;top:62px;transform:translateX(-50%);display:flex;align-items:center;gap:11px;padding:6px 14px 6px 9px;min-width:310px;max-width:calc(100vw - 32px);background:linear-gradient(90deg,rgba(64,8,5,.9),rgba(26,6,5,.86));border:1px solid rgba(255,80,50,.42);box-shadow:0 0 26px rgba(190,20,10,.32),inset 0 0 12px rgba(255,60,30,.08);transition:top .25s}
+#evBan .mn{width:26px;height:26px;flex:none;border-radius:50%;background:radial-gradient(circle at 36% 34%,#ffb39a 0,#e0361c 42%,#6a0a04 100%);box-shadow:0 0 12px 3px rgba(255,46,20,.55);animation:evPulse 2.6s ease-in-out infinite}
+#evBan .tx{flex:1;line-height:1.2}#evBan .tx b{display:block;color:#ff6248;font-size:13.5px;letter-spacing:.24em}#evBan .tx span{font-size:12.5px;color:#e9cfc8}
+#evBan .tx i{font-style:normal;font-weight:700;color:#fff;font-variant-numeric:tabular-nums}
+#evBan .wv{font-size:11px;font-weight:700;letter-spacing:.12em;color:#ffb2a2;text-align:right;white-space:nowrap;text-transform:uppercase}
+@keyframes evPulse{50%{box-shadow:0 0 20px 6px rgba(255,46,20,.85)}}
+#evToast{position:absolute;left:50%;top:36%;transform:translate(-50%,-12px);text-align:center;opacity:0;transition:opacity .55s,transform .55s;white-space:nowrap;text-shadow:0 2px 14px rgba(0,0,0,.9),0 0 3px #000}
+#evToast.on{opacity:1;transform:translate(-50%,0)}#evToast .t{font-size:40px;font-weight:700;letter-spacing:.22em;line-height:1.05}#evToast .s{font-size:15px;color:#e8e0d2;margin-top:6px;letter-spacing:.05em}
+#evToast.red .t{color:#ff4a30}#evToast.storm .t{color:#c4d8ff}#evToast.crash .t{color:#ffa25a}#evToast.dawn .t{color:#ffdc9a}
+#evFlash{position:fixed;inset:0;pointer-events:none;z-index:4;background:radial-gradient(ellipse at center,#f4f8ff 0,#d8e4ff 60%,#b8c8f0 100%);opacity:0}
+#evVig{position:fixed;inset:0;pointer-events:none;z-index:3;opacity:0;background:radial-gradient(ellipse at center,rgba(90,0,0,0) 42%,rgba(120,6,0,.5) 82%,rgba(70,0,0,.78) 100%)}
+@media(max-width:760px){#evToast .t{font-size:26px}#evToast{white-space:normal;width:92vw}#evBan{min-width:0}}`;document.head.appendChild(st);
+  const hud=$('#hud');const mk=(id,html,parent)=>{const e=document.createElement('div');e.id=id;if(html)e.innerHTML=html;(parent||hud).appendChild(e);return e};
+  EVD.ban=mk('evBan','<div class="mn"></div><div class="tx"><b>RED MOON</b><span>Survive until dawn · <i class="evT">--:--</i></span></div><div class="wv"></div>');EVD.ban.classList.add('hidden');
+  EVD.banT=EVD.ban.querySelector('.evT');EVD.banW=EVD.ban.querySelector('.wv');EVD.toast=mk('evToast','');EVD.flash=mk('evFlash','',document.body);EVD.vig=mk('evVig','',document.body)}
+function evToast(t,s,c){EV.toasts.push({t,s,c});if(EV.toasts.length>4)EV.toasts.shift()}
+function evToastTick(dt){if(!S.active)return;const el=EVD.toast;
+  if(EV.toastT>0){EV.toastT-=dt;if(EV.toastT<.7&&EV.toastOn){EV.toastOn=false;el.classList.remove('on')}if(EV.toastT>0)return}
+  if(!EV.toasts.length)return;
+  // never stack on top of the infected module's NIGHTFALL / DAWN banner
+  if(typeof ZMS!=='undefined'&&ZMS&&ZMS.el&&ZMS.el.ban&&ZMS.el.ban.classList&&ZMS.el.ban.classList.contains('on')===true)return;
+  const q=EV.toasts.shift();el.className=q.c||'red';el.innerHTML=`<div class="t">${q.t}</div><div class="s">${q.s||''}</div>`;void el.offsetWidth;el.classList.add('on');EV.toastOn=true;EV.toastT=5.4;
+  el.style.top=Math.round(Math.max(innerHeight*.36,EV.banOn?EV.banTop+64:0))+'px'}
+
+// ---- tips, info cards, prompts, death lessons ----
+function evTipRed(){tip('ev_red','Red Moon','Every third night the moon turns red. Waves of infected close in on every survivor — and on their bases — until dawn. Fortify, keep a fire going, carry bandages. Survive until first light and a <b>Moon Cache</b> drops next to you.')}
+Object.assign(INFO,{
+ crashcrate:{k:'World event',t:'Crash Crate',d:'A sealed supply crate thrown clear of the helicopter wreck.',rows:[['Loot','High-tier weapons, ammo, medicine and components'],['Warning','The crash is loud — the infected and hostile players come to check it out']],g:'events'},
+ crashhot:{k:'World event',t:'Crash Crate (hot)',d:'Still too hot to touch. It opens once the wreck stops burning.',rows:[['Tip','Clear out whatever the noise drew in while you wait']],g:'events'},
+ heliwreck:{k:'World event',t:'Helicopter Wreck',d:'A downed helicopter. It burns for about a minute, then smoulders for several more.',rows:[['Loot','Two crash crates lie nearby'],['Danger','The fire hurts anything that stands too close']],g:'events'},
+ mooncache:{k:'Red Moon',t:'Moon Cache',d:'Drops next to every survivor when a Red Moon ends. Anyone can open it, so grab yours fast.',rows:[['Loot','Supplies, ammo and medicine']],g:'events'}});
+Object.assign(PROMPTS,{crashcrate:'Loot crash crate',crashhot:'Too hot to open',mooncache:'Open Moon Cache'});
+for(const [k,v] of Object.entries({lightning:'Lightning struck you. In a thunderstorm, keep away from lone tall trees, towers and hilltops — and watch for the flash.',fire:'You burned to death. Burning wrecks and trees hurt anything close by — wait for the fire to die down.',crash:'You were caught under a crashing helicopter. When one comes down, watch where it is heading and get clear.'}))if(!LESSONS[k])LESSONS[k]=v;
+INTERACT_EXT.push(a=>{if(a.kind!=='ent'||!a.e)return null;const e=a.e;if(e.t==='crashcrate')return{kind:CRASH&&S.time<CRASH.t0+EVC.FLY+EVC.BURN?'crashhot':'crashcrate',e};if(e.t==='mooncache')return{kind:'mooncache',e};return null});
+INTERACT_DO.crashhot=t=>{const c=CRASH;const s=c?Math.max(1,Math.ceil(c.t0+EVC.FLY+EVC.BURN-S.time)):0;feedMsg('Too hot to open — the fire dies down in '+s+' s');sfx('ev_crackle',.8,t.e);
+  tip('ev_hot','Still burning','Crash crates open once the wreck stops burning. Deal with whatever the noise drew in while you wait.')};
+INTERACT_DO.crashcrate=t=>{const c=CRASH,e=t.e;if(!c||e.taken||!c.crates.includes(e))return;if(S.time<c.t0+EVC.FLY+EVC.BURN){INTERACT_DO.crashhot(t);return}
+  if(NET.role==='client'){const now=performance.now();if(e.req&&now-e.req<2500)return;e.req=now;hostSend({k:'e_ccReq',c:c.id,i:e.ci,nm:NET.name});feedMsg('Prying the crate open...');return}
+  if(!evTakeCrate(c.id,e.ci,false,null))return;evCrashLoot(e);const m={k:'e_cc',c:c.id,i:e.ci,nm:NET.name};if(NET.role==='host')netBroadcast(m)};
+function evCrashLoot(e){evGive(evRoll('airdrop',1,'crash'));sfx('ev_cache',.6,e||undefined);feedMsg('Looted a crash crate');if(typeof gainXP==='function')try{gainXP('survivor',60,'Crash crate')}catch(er){}
+  tip('ev_loot','Crash loot','Crash crates hold high-tier gear. Research anything new at a Research Table so you can craft it yourself.')};
+INTERACT_DO.mooncache=t=>{const c=EV.caches.find(o=>o.ent===t.e);if(!c)return;
+  if(NET.role==='client'){const now=performance.now();if(c.req&&now-c.req<2500)return;c.req=now;hostSend({k:'e_cacheReq',id:c.id});feedMsg('Opening the Moon Cache...');return}
+  const pos=t.e;evRemoveCache(c.id);if(NET.role==='host')netBroadcast({k:'e_cacheGone',id:c.id});evCacheLoot(pos)};
+function evCacheLoot(pos){evGive(evRoll('airdrop',1,'cache'));sfx('ev_cache',.8,pos||undefined);feedMsg('Opened a Moon Cache');if(typeof gainXP==='function')try{gainXP('survivor',40,'Moon Cache')}catch(er){}}
+ENT_HIT.heliwreck=(e,dmg,src,pt)=>{sfx('metalhit',.7,pt);if(pt)burst(pt,['#3a3f30','#2a2826','#ffd27a'],6,2,1.5)};
+// loot = one infected-mode supply roll (weapons, throwables, UV gear, blueprints — when the items module is present)
+// plus a Rust supply bundle (scrap, frags, ammo, medicine); without rollLoot the bundle is richer
+function evRoll(kind,mult,fb){const L={},add=o=>{for(const [k,v] of Object.entries(o||{}))if(ITEMS[k]&&v>0)L[k]=(L[k]||0)+v};let rolled=false;
+  if(typeof rollLoot==='function'){try{const r=rollLoot(kind,mult);if(r&&typeof r==='object'&&Object.keys(r).length){add(r);rolled=true}}catch(e){}}
+  if(fb==='cache')add({bandage:RI(2,3),cooked_meat:RI(2,3),scrap:RI(10,20),pistol_ammo:RI(6,12)});
+  else add({scrap:RI(12,24),metal_frag:RI(40,90),pistol_ammo:RI(8,18)});
+  if(Math.random()<.5)add({medical_syringe:1});else add({bandage:RI(1,2)});
+  if(!rolled){if(fb==='cache')add({metal_frag:RI(40,80)});else{add({gears:RI(1,2),metal_pipe:1});if(Math.random()<.35)add({[Math.random()<.5?'revolver':'crossbow']:1})}
+    for(const id of['duct_tape','nails','battery','chemicals'])if(Math.random()<.4)add({[id]:RI(1,3)})}
+  return L}
+function evGive(L){for(const [k,v] of Object.entries(L||{}))if(ITEMS[k]&&v>0)gain(k,Math.max(1,Math.round(v)))}
+
+// ================= RED MOON =================
+function evNightIdx(t){const L=S.dayLen,d=Math.floor(t/L),p=t/L-d;return p>=EVC.RM0?d:p<EVC.RM1?d-1:-1}
+const evIsRed=ni=>ni>=0&&(ni%EVC.EVERY===EVC.EVERY-1||ni===EV.forceNi);
+const evDawn=ni=>(ni+1+EVC.RM1)*S.dayLen;
+function evWarn(){evToast('THE MOON IS RISING RED','A horde night is coming. Get to shelter before dark.','red');sfx('ev_omen',.55);evTipRed()}
+function evSetRed(on,ni,info){on=!!on;if(on===EV.red)return;EV.red=on;
+  if(on){EV.redNi=ni;EV.wave=0;EV.waveAt=S.time+12;EV.fallen={};EV.kills={};EV.lureT=3;EV.omenT=R(25,40);const late=info&&info.late;
+    evToast('RED MOON',late?'A horde night is underway. Survive until dawn.':'The infected are swarming. Survive until dawn.','red');if(!late)sfx('ev_omen',1);evTipRed();
+    if(NET.role!=='client'){EV.wolfStart=animals.filter(a=>a.t==='wolf'&&!a.dead).length;killfeed('<b style="color:#ff6a50">RED MOON</b> — the infected swarm until dawn')}}
+  else{EV.waveAt=0;const me=evMyKey(),sv=info&&info.sv,kills=info&&info.kills?(info.kills[me]|0):0;
+    if(!info)evToast('DAWN','The Red Moon has set.','dawn');
+    else if(sv&&sv.includes(me)){evToast('DAWN — YOU SURVIVED','A Moon Cache dropped next to you'+(kills?' · '+kills+' kill'+(kills>1?'s':'')+' tonight':''),'dawn');sfx('ev_dawn',.9);
+      if(typeof gainXP==='function')try{gainXP('survivor',250,'Survived the Red Moon');if(kills)gainXP('power',Math.min(300,kills*12),'Red Moon kills')}catch(e){}}
+    else evToast('DAWN','The Red Moon has set. You fell during the night — no cache this time.','dawn');
+    if(NET.role!=='client')killfeed('<b style="color:#ffd27a">DAWN</b> — the Red Moon has set')}}
+function evHostRed(dt){const L=S.dayLen,d=Math.floor(S.time/L),p=S.time/L-d;
+  if(!EV.red&&evIsRed(d)&&p>=EVC.WARN&&p<EVC.RM0&&EV.warned!==d){EV.warned=d;evWarn();netBroadcast({k:'e_warn',ni:d})}
+  const ni=evNightIdx(S.time),want=evIsRed(ni);
+  if(want&&!EV.red){evSetRed(true,ni);netBroadcast({k:'e_red',on:1,ni})}else if(!want&&EV.red){evEndRed();return}
+  if(!EV.red)return;
+  if(!P.alive)EV.fallen['@host']=1;for(const r of remoteList())if(r.dead)EV.fallen[r.id]=1;
+  if(S.time>=EV.waveAt){EV.wave++;EV.waveAt=S.time+EVC.WAVE+R(-5,6);evWave(EV.wave)}
+  EV.lureT-=dt;if(EV.lureT<=0){EV.lureT=2.6;evLure()}}
+function evEndRed(){const sv=[];if(P.alive&&!EV.fallen['@host'])sv.push('@host');for(const r of remoteList())if(!r.dead&&!EV.fallen[r.id])sv.push(r.id);
+  const ni=EV.redNi,kills=EV.kills;evSetRed(false,ni,{sv,kills});netBroadcast({k:'e_red',on:0,ni,sv,kills});
+  for(const k of sv){const w=k==='@host'?P:remotes[k];if(!w)continue;const p=evCacheSpot(w);
+    const c={id:'mc'+(++EV.cacheN)+'_'+RI(100,999),x:+p.x.toFixed(2),z:+p.z.toFixed(2),y:+p.y.toFixed(2),nm:k==='@host'?(NET.role?NET.name:'You'):(w.name||'Friend'),own:k,t:+S.time.toFixed(1)};
+    evAddCache(c);netBroadcast(Object.assign({k:'e_cache'},c))}
+  evRetire()}
+function evHordeFilter(){const zl=typeof zombies!=='undefined'&&Array.isArray(zombies)?zombies:null;
+  EV.horde=EV.horde.filter(c=>c&&!c.dead&&!c.rm&&!(c.hp<=0)&&(c.t==='wolf'?animals.includes(c):(!zl||zl.includes(c))))}
+function evZAlive(){let n=0;if(typeof zombies!=='undefined'&&Array.isArray(zombies))for(const z of zombies)if(z&&!z.dead&&!z.rm)n++;return n}
+function evBaseOf(k){if(k==='@host'){let n=0,x=0,z=0;for(const p of pieces)if(p.kind==='foundation'){x+=p.gx*3+1.5;z+=p.gz*3+1.5;n++}return n?{x:x/n,z:z/n}:null}
+  const b=remoteBases[k];if(!b||!b.bx||!b.bx.length)return null;let x=0,z=0;for(const q of b.bx){x+=(q.minx+q.maxx)/2;z+=(q.minz+q.maxz)/2}return{x:x/b.bx.length,z:z/b.bx.length}}
+// spot r0..r1 from (cx,cz) around bearing b; if that side is sea / blocked, any bearing will do
+function evRing(cx,cz,r0,r1,b,spread,ps){for(let i=0;i<30;i++){const a=i<14?b+R(-spread,spread):R(0,6.283),r=R(r0,r1),x=cx+Math.sin(a)*r,z=cz+Math.cos(a)*r;
+    if(x<20||z<20||x>WS-20||z>WS-20||groundH(x,z)<.8||inLake(x,z,6)||inMon(x,z,8))continue;if(typeof safeZone==='function'&&safeZone(x,z))continue;
+    if(ps&&ps.some(o=>dist2(x,z,o.w.x,o.w.z)<r0*.75))continue;return{x,z}}return null}
+function evKindOK(k){if(typeof ZKINDS==='undefined'||!ZKINDS)return k;const has=x=>Array.isArray(ZKINDS)?ZKINDS.some(z=>z===x||(z&&(z.id===x||z.kind===x))):!!ZKINDS[x];
+  if(has(k))return k;for(const f of['runner','shambler'])if(has(f))return f;const ks=Array.isArray(ZKINDS)?ZKINDS.map(z=>z&&(z.id||z.kind||z)):Object.keys(ZKINDS);return ks[0]||k}
+function evKind(w,i){const r=Math.random();let k=w<2?(r<.7?'shambler':'runner'):w<3?(r<.48?'shambler':r<.93?'runner':'brute'):(r<.36?'shambler':r<.72?'runner':r<.86?'brute':'stalker');if(w>=3&&i===0)k='brute';return evKindOK(k)}
+// infected module contract: state 'hunt' + hunt=<player> walks the zombie toward that survivor (re-aiming every few s);
+// night:true lets its own dawn cleanup remove leftovers nobody can see; home = where it lingers if it loses the trail
+const EV_HWALK={shambler:2.3,runner:3.6,burster:2,brute:2.5,stalker:4.2};
+function evZombie(kind,x,z,home,foe,state,frenzy){let c=null;try{c=spawnZombie(kind,x,z,{state,hunt:foe||null,night:!!frenzy,home:{x:home.x,z:home.z}})}catch(e){c=null}
+  if(!c||typeof c!=='object')return null;if(frenzy){c.horde=true;if(typeof c.walk==='number')c.walk=Math.max(c.walk,EV_HWALK[c.kind]||2.3)}return c}
+function evWave(w){const ps=evPlayers();if(!ps.length)return;evHordeFilter();const haveZ=typeof spawnZombie==='function';
+  const room=Math.min(EVC.CAP-EV.horde.length,haveZ?(typeof ZMS!=='undefined'&&ZMS&&ZMS.low?46:64)-evZAlive():99);
+  const want=haveZ?2+w*2:1+Math.ceil(w/2),base=room<=0?0:Math.min(want,Math.floor(room/ps.length));let extra=room<=0?0:Math.min(room-base*ps.length,ps.length),left=Math.max(0,room);const b=R(0,6.283);
+  if(!haveZ&&EV.wolfCap<0)EV.wolfCap=EV.wolfStart;
+  for(const o of ps){const bs=evBaseOf(o.k),home=bs&&dist2(bs.x,bs.z,o.w.x,o.w.z)<70?bs:{x:o.w.x,z:o.w.z};let per=base;if(per<want&&extra>0){per++;extra--}
+    for(let i=0;i<per&&left>0;i++){const p=evRing(o.w.x,o.w.z,haveZ?80:44,haveZ?120:56,b,.75,ps);if(!p)continue;let c=null;
+      if(haveZ)c=evZombie(evKind(w,i),p.x,p.z,home,o.w,'hunt',true);else{c=spawnAnimal('wolf',p.x,p.z);c.state='attack';c.foe=o.w;c.horde=1}
+      if(c){c.evK=o.k;EV.horde.push(c);left--}}}
+  evWaveMsg(w,b);netBroadcast({k:'e_wave',w,b:+b.toFixed(2)})}
+function evWaveMsg(w,b){EV.wave=w;const dir=typeof b==='number'?EV_DIRL[evDir(Math.sin(b),Math.cos(b))]:'';evToast('WAVE '+w,dir?'The horde is coming from the '+dir:'More of them are coming','red');sfx('ev_wave',.9);
+  if(w===1)tip('ev_wave','Horde waves','A new wave closes in about every 40 seconds, bigger each time and from one direction. Get onto a roof or behind walls, and keep an escape route open.')}
+// the red moon keeps calling its horde: members that lost the trail (idle / wandering / checking a noise) are sent
+// hunting their survivor again; an AI without a hunt state gets a noise lure a few metres closer to its survivor instead.
+// Survivors near their base also make the base itself a magnet.
+function evLure(){const tg={};for(const o of evPlayers())tg[o.k]=o.w;evHordeFilter();let n=0;
+  for(const c of EV.horde){if(c.t==='wolf')continue;const w=tg[c.evK]||tg['@host'];if(!w)continue;const dx=w.x-c.x,dz=w.z-c.z,d=Math.hypot(dx,dz);
+    if(typeof c.state==='string'&&'hunt' in c){if(!c.foe&&d>14&&(c.state==='idle'||c.state==='wander'||c.state==='investigate')){c.state='hunt';c.hunt=w;c.huntT=0}continue}
+    if(d<18||d>260||n++>=40)continue;const s=Math.min(10,d-6);noise(c.x+dx/d*s,c.z+dz/d*s,18)}
+  for(const o of evPlayers()){const bs=evBaseOf(o.k);if(bs&&dist2(bs.x,bs.z,o.w.x,o.w.z)<60)noise(bs.x,bs.z,22)}}
+// dawn: far horde wolves leave; infected stop hunting (the infected module's own dawn sweep removes unseen night spawns)
+function evRetire(){const ps=evPlayers();for(const c of EV.horde){if(!c||c.dead)continue;const near=ps.some(o=>dist2(c.x,c.z,o.w.x,o.w.z)<75);
+    if(c.t==='wolf'){if(!near){world.remove(c.obj);animals=animals.filter(a=>a!==c)}continue}
+    if(c.state==='hunt'){c.state='idle';c.idleT=R(1,3);c.hunt=null}}EV.horde=[]}
+function evCacheSpot(w){const yc=w===P?P.yaw+Math.PI:(w.yaw||0),feet=(w.y!==undefined?w.y:groundH(w.x,w.z))+.6;
+  for(let i=0;i<16;i++){const a=yc+(i%2?1:-1)*Math.floor((i+1)/2)*.5,d=i>8?6:4,x=w.x+Math.sin(a)*d,z=w.z+Math.cos(a)*d,h=groundH(x,z);
+    if(h<.3||x<10||z<10||x>WS-10||z>WS-10)continue;if(nearEnts(x,z,3).some(e=>e.solid&&dist2(x,z,e.x,e.z)<e.r+.9))continue;
+    if(nearBoxes(x,z,1).some(b=>b.maxy>feet-.4&&b.miny<feet+1.5&&x>b.minx-.6&&x<b.maxx+.6&&z>b.minz-.6&&z<b.maxz+.6))continue;return{x,z,y:supportH(x,z,feet)}}
+  return{x:w.x+.8,z:w.z+.8,y:supportH(w.x+.8,w.z+.8,feet)}}
+function evCacheMesh(){const G=evGeo();const g=new THREE.Group();const b=new THREE.Mesh(G.cache,MAT.vc);b.castShadow=b.receiveShadow=true;g.add(b);const l=new THREE.Mesh(G.lamp,G.lampMat);l.position.set(.22,.52,0);g.add(l);return g}
+function evAddCache(c,quiet){if(!c||EV.caches.some(o=>o.id===c.id))return;const y=typeof c.y==='number'&&isFinite(c.y)?c.y:groundH(c.x,c.z),mine=c.own===evMyKey();
+  const g=evCacheMesh();g.position.set(c.x,y,c.z);g.rotation.y=R(0,6.28);world.add(g);
+  const lab=labelSprite(mine?'MOON CACHE':String(c.nm||'Friend').slice(0,14)+'\'s cache',mine?'#ff9a7a':'#d8b0a6');lab.position.set(0,1.6,0);lab.scale.set(3.2,3.2,1);g.add(lab);
+  const e={id:'ev_'+c.id,t:'mooncache',x:c.x,z:c.z,y,r:.5,solid:1,ph:.8,obj:g};regEnt(e);
+  EV.caches.push({id:c.id,x:c.x,z:c.z,y,nm:c.nm,own:c.own,t0:typeof c.t==='number'?c.t:S.time,mine,ent:e,obj:g});
+  if(mine&&!quiet){burst(new V3(c.x,y+.6,c.z),['#ff9a7a','#ffd27a','#ffffff'],24,3,3,6,.8);sfx('ev_cache',.8,{x:c.x,z:c.z});
+    tip('ev_cache','Moon Cache','You survived the Red Moon — a <b>Moon Cache</b> dropped next to you. Press <b>E</b> to open it before someone else does.')}}
+function evRemoveCache(id){EV.gone[id]=1;const c=EV.caches.find(o=>o.id===id);if(!c)return;EV.caches=EV.caches.filter(o=>o!==c);ents=ents.filter(e=>e!==c.ent);world.remove(c.obj);
+  if(dist2(c.x,c.z,P.x,P.z)<60)burst(new V3(c.x,c.y+.5,c.z),['#9c2a1c','#3a3940','#ffd27a'],10,2,2)}
+
+// ================= THUNDERSTORMS =================
+function evWindDir(){const a=(Math.floor(S.time/S.dayLen)*2.399+(EV.rainN|0)*1.3)%6.283;return a}
+function evSetStorm(on,late){on=!!on;if(on===EV.storm)return;EV.storm=on;const a=evWindDir();
+  if(on){EV.boltT=R(3,7);EV.windX=Math.sin(a)*1.6;EV.windZ=Math.cos(a)*1.6;if(!late)evToast('THUNDERSTORM','Lightning strikes trees and high ground — keep low','storm');
+    tip('ev_storm','Thunderstorm','Lightning hits the tallest thing around — lone trees, towers, hilltops — and can set trees on fire. The gap between flash and thunder tells you how far away it struck: sound travels about 340 m per second.');
+    if(NET.role!=='client')killfeed('<b style="color:#bcd4ff">Thunderstorm</b> rolling in')}
+  else{EV.windX=Math.sin(a)*.5;EV.windZ=Math.cos(a)*.5;if(!late)feedMsg('The thunderstorm is passing')}}
+function evHostStorm(dt){const rn=!!S.raining;if(rn&&!EV.wasRain)EV.rainN++;EV.wasRain=rn;
+  if(!EV.storm){if(rn&&(S.rain||0)>.6&&EV.stormRoll!==EV.rainN){EV.stormRoll=EV.rainN;if(EV.forceStorm||Math.random()<EVC.STORM){EV.forceStorm=false;evSetStorm(true);netBroadcast({k:'e_storm',on:1})}}return}
+  if(!rn&&(S.rain||0)<.45){evSetStorm(false);netBroadcast({k:'e_storm',on:0});return}
+  EV.boltT-=dt;if(EV.boltT<=0){EV.boltT=R(8,25);evStrike()}}
+function evTreeTop(e){return e.y+(e.kind==='pine'?8.8:e.kind==='oak'?7.2:6.9)*(e.s||1)*(e.sy||1)}
+function evStrike(){const ps=evPlayers(),A=ps.length?pick(ps).w:P;let x,z,y,gy,tr=null,fire=0,fh=0,fs=1;
+  // the radio mast (world module POI 'tower' / 'radio', ~34 m) is the tallest thing around: it takes a share of the strikes
+  const mast=typeof POIS!=='undefined'&&Array.isArray(POIS)?POIS.find(p=>p&&(p.id==='tower'||p.id==='radio')&&dist2(p.x,p.z,A.x,A.z)<330):null;
+  let ms=0;if(mast&&Math.random()<.3){x=mast.x;z=mast.z;gy=Math.max(groundH(x,z),0);y=gy+(+mast.top||33.5);ms=1}
+  else{let p=null;for(let i=0;i<24&&!p;i++){const a=R(0,6.283),d=Math.random()<.12?R(14,32):R(35,300),tx=A.x+Math.sin(a)*d,tz=A.z+Math.cos(a)*d;
+      if(tx<8||tz<8||tx>WS-8||tz>WS-8||ps.some(o=>dist2(tx,tz,o.w.x,o.w.z)<12))continue;p={x:tx,z:tz}}
+    if(!p)return;x=p.x;z=p.z;gy=Math.max(groundH(x,z),0);y=gy;let best=null;
+    for(const e of nearEnts(x,z,24))if(e.t==='tree'&&(!best||(e.s||1)*(e.sy||1)>(best.s||1)*(best.sy||1)))best=e;
+    if(best&&Math.random()<.78){x=best.x;z=best.z;gy=best.y;y=evTreeTop(best);tr=best.id;fh=y-gy;fs=best.s||1;if(Math.random()<EVC.TFIRE&&!EV.fires.some(f=>f.tree===tr))fire=1}}
+  const m={k:'e_bolt',x:+x.toFixed(2),y:+y.toFixed(2),z:+z.toFixed(2),g:+gy.toFixed(2),s:RI(1,2e9),tr,ms,f:fire,fk:fire?'tf'+(++EV.fireN)+'_'+RI(10,99):0,fh:+fh.toFixed(2),fs:+fs.toFixed(2)};
+  evBolt(m);netBroadcast(m)}
+function evPath(rng,a,b,depth,disp){let pts=[a,b];for(let d=0;d<depth;d++){const np=[pts[0]];for(let i=0;i<pts.length-1;i++){const p=pts[i],q=pts[i+1];
+      np.push({x:(p.x+q.x)/2+(rng()-.5)*disp,y:(p.y+q.y)/2+(rng()-.5)*disp*.35,z:(p.z+q.z)/2+(rng()-.5)*disp},q)}pts=np;disp*=.56}return pts}
+// jagged additive ribbon: a wide faint glow layer under a narrow white core, camera-facing at strike time
+function evBoltBuild(b,seed,x,y,z){const rng=evRng(seed);const top={x:x+(rng()-.5)*80,y:Math.max(y,0)+150+rng()*50,z:z+(rng()-.5)*80};
+  const main=evPath(rng,top,{x,y,z},6,46),segs=[];for(let i=0;i<main.length-1;i++)segs.push(main[i],main[i+1],1);
+  const nb=3+Math.floor(rng()*3);for(let k=0;k<nb;k++){const p=main[Math.floor(rng()*main.length*.7)],len=22+rng()*42,a=rng()*6.283;
+    const br=evPath(rng,p,{x:p.x+Math.sin(a)*len*.75,y:p.y-len*(.45+rng()*.5),z:p.z+Math.cos(a)*len*.75},4,13);for(let i=0;i<br.length-1;i++)segs.push(br[i],br[i+1],.42)}
+  const cx=camera.position.x,cy=camera.position.y,cz=camera.position.z,PP=b.pos,CC=b.cl;let v=0;
+  const quad=(a,c,w,r,g,bb)=>{if(v+6>EVB_MAX)return;const dx=c.x-a.x,dy=c.y-a.y,dz=c.z-a.z,mx=(a.x+c.x)/2-cx,my=(a.y+c.y)/2-cy,mz=(a.z+c.z)/2-cz;
+    let sx=dy*mz-dz*my,sy=dz*mx-dx*mz,sz=dx*my-dy*mx;const l=(Math.hypot(sx,sy,sz)||1)*2/w;sx/=l;sy/=l;sz/=l;
+    const V=[a.x-sx,a.y-sy,a.z-sz,a.x+sx,a.y+sy,a.z+sz,c.x+sx,c.y+sy,c.z+sz,a.x-sx,a.y-sy,a.z-sz,c.x+sx,c.y+sy,c.z+sz,c.x-sx,c.y-sy,c.z-sz];
+    for(let i=0;i<18;i++)PP[v*3+i]=V[i];for(let i=0;i<6;i++){CC[(v+i)*3]=r;CC[(v+i)*3+1]=g;CC[(v+i)*3+2]=bb}v+=6};
+  for(let i=0;i<segs.length;i+=3){const s=segs[i+2];quad(segs[i],segs[i+1],s*6.5,.15*s,.2*s,.5*s)}
+  for(let i=0;i<segs.length;i+=3){const s=segs[i+2];quad(segs[i],segs[i+1],s*1.15,2.1*s+.3,2.2*s+.3,2.6*s+.2)}
+  b.g.setDrawRange(0,v);b.g.attributes.position.needsUpdate=true;b.g.attributes.color.needsUpdate=true}
+function evFlick(t,r){if(t<.06)return 1;if(t<.1)return .12;if(t<.17)return .85;if(t<.22)return .25+r*.3;if(t<.3)return 1;return Math.max(0,1-(t-.3)/.42)}
+function evBolt(m){if(!m||!isFinite(m.x)||!isFinite(m.z))return;const b=EVX.bolts[EV.boltI++%EVX.bolts.length],gy=isFinite(m.g)?m.g:Math.max(groundH(m.x,m.z),0);
+  evBoltBuild(b,m.s|0,m.x,m.y,m.z);b.t=0;b.r=((m.s|0)%100)/100;b.m.visible=true;b.fl.visible=true;b.fl.position.set(m.x,m.y+1,m.z);
+  const d=dist2(P.x,P.z,m.x,m.z);b.near=clamp(1.15-d/420,.3,1);EV.fnear=b.near;EV.fx=m.x;EV.fy=m.y;EV.fz=m.z;EV.fdx=(m.x-P.x)/Math.max(1,d);EV.fdz=(m.z-P.z)/Math.max(1,d);
+  const hp=new V3(m.x,m.y,m.z),kind=m.ms?'mast':m.tr!=null?'tree':'ground';
+  if(d<220){burst(hp,['#ffffff','#d8e4ff','#9ab8ff'],kind==='ground'?26:18,7,4,6,.35);
+    if(kind==='ground'){const gp=new V3(m.x,gy+.2,m.z);burst(gp,CHIP.dirt,18,5,4);debris(gp,'#4a3c2a',5,.18,'rock')}else if(kind==='tree')burst(hp,['#ffd27a','#7a5a35','#a8844f'],12,4,2,9,.8);else burst(hp,['#ffe8a0','#ffffff','#ffb050'],16,5,1,9,.7)}
+  if(kind==='ground'&&gy>.1&&typeof decal==='function')try{decal(new V3(m.x,gy+.05,m.z),'scorch',3.2)}catch(e){}
+  for(let i=0;i<3;i++)evPuff(m.x+R(-1,1),kind==='ground'?gy+.8:m.y-2,m.z+R(-1,1),1.2,5,R(2,3.5),.4,.35,.6);
+  setTimeout(()=>{if(S&&P)sfx('ev_thunder',1,{x:m.x,z:m.z})},Math.min(4000,d/340*1000));
+  if(d<100)P.camShake=Math.max(P.camShake||0,.45*(1-d/100));
+  // who gets hurt: anyone close on the ground, under the struck tree, or up near the top of the struck mast
+  const hr=kind==='ground'?7:kind==='tree'?5:6,hy=kind==='mast'?m.y-3:gy;
+  evHurtLocal(m.x,m.z,hy,hr,kind==='tree'?34:62,kind==='tree'?8:12,'lightning','Struck by lightning');
+  if(kind!=='mast')evHurtArea(m.x,m.z,hr,70,15,evSrc('Lightning',m.x,m.z),'lightning');if(NET.role!=='client')noise(m.x,m.z,55);
+  if(m.f&&m.fk)evTreeFire(m.fk,m.x,gy,m.z,m.fh||8,m.fs||1,S.time,S.time+EVC.FIRE,m.tr);
+  if(d<35&&P.alive)tip('ev_close','Close call','Lightning goes for tall, exposed things. Stay low and away from lone trees while the storm lasts.')}
+function evBoltsTick(dt){let f=0;for(const b of EVX.bolts){if(b.t<0)continue;b.t+=dt;if(b.t>.75){b.t=-1;b.m.visible=false;b.fl.visible=false;continue}
+  const v=evFlick(b.t,b.r);b.mat.opacity=v;b.fl.material.opacity=v;const s=10+v*16;b.fl.scale.set(s,s,1);f=Math.max(f,v*b.near)}EV.flash=f}
+
+// ================= FIRE & SMOKE (pooled sprites) =================
+const EV_CRFL=[[-.8,2.95,-.3,2.6],[.1,2.3,1.3,2],[-.6,1.9,-1.3,2.1],[1.9,.35,.5,1.8],[-2.2,.35,-.6,1.9],[.6,.35,3.4,1.5],[-2.6,.45,-3.8,1.6],[2.4,.3,-1.8,1.4],[-1,.5,2.3,1.5]];
+function evAddFire(o){if(EV.fires.some(f=>f.key===o.key))return null;const f=Object.assign({fl:[],light:null,smT:0},o);
+  if(S.time<f.t1){const n=f.kind==='crash'?EV_CRFL.length:6,cy=Math.cos(f.yaw||0),sy=Math.sin(f.yaw||0);
+    for(let i=0;i<n;i++){let s=null;for(const q of EVX.flames)if(!q.used){s=q;break}if(!s)break;s.used=true;
+      if(f.kind==='crash'){const [lx,ly,lz,sc]=EV_CRFL[i];s.x=f.x+lx*cy+lz*sy;s.y=f.y+ly;s.z=f.z-lx*sy+lz*cy;s.sc=sc}
+      else{const a=R(0,6.283),r=R(.2,1.5)*(f.s||1);s.x=f.x+Math.sin(a)*r;s.y=f.y+(f.h||8)*R(.38,.92);s.z=f.z+Math.cos(a)*r;s.sc=R(1.5,2.5)*(f.s||1)}f.fl.push(s)}
+    let L=EVX.fireL.find(q=>!q.used);if(!L&&f.kind==='crash'){const v=EV.fires.find(q=>q.light);if(v){L=v.light;v.light=null}}if(L){L.used=true;f.light=L}}
+  EV.fires.push(f);return f}
+function evKillFire(f){for(const s of f.fl){s.used=false;s.sp.visible=false}f.fl=[];if(f.light){f.light.used=false;f.light.L.intensity=0;f.light=null}const i=EV.fires.indexOf(f);if(i>=0)EV.fires.splice(i,1)}
+function evTreeFire(key,x,gy,z,h,s,t0,t1,tree){if(EV.fires.some(f=>f.key===key))return;
+  evAddFire({key,kind:'tree',x,y:gy,z,h,s,t0,t1,t2:t1+12,li:2.6,lh:h*.62,smoke:3.2,smoke2:1.2,hurtR:3.3,dps:7,tree});
+  if(t1-S.time>EVC.FIRE-3)tip('ev_tree','Burning tree','Lightning set a tree on fire. It burns for a while and hurts anything standing underneath — keep your distance.')}
+function evFiresTick(dt){const t=S.time,tm=performance.now()/1000;EV.treeChkT=(EV.treeChkT||0)-dt;const chk=EV.treeChkT<=0;if(chk)EV.treeChkT=1;
+  for(let i=EV.fires.length-1;i>=0;i--){const f=EV.fires[i];if(t>f.t2){evKillFire(f);continue}
+    if(chk&&f.kind==='tree'&&f.tree!=null&&t<f.t1&&!ents.some(e=>e.id===f.tree)){f.t1=Math.min(f.t1,t);f.t2=Math.min(f.t2,t+4)}
+    const fade=clamp((t-f.t0)/1.5,0,1)*clamp((f.t1-t)/5,0,1);
+    if(fade<=0&&t>f.t1&&(f.fl.length||f.light)){for(const s of f.fl){s.used=false;s.sp.visible=false}f.fl=[];if(f.light){f.light.used=false;f.light.L.intensity=0;f.light=null}}
+    for(const s of f.fl){const k=.72+.28*Math.sin(tm*11+s.ph)*Math.sin(tm*6.7+s.ph*1.7),sc=s.sc*(.3+.7*fade)*k;s.sp.visible=fade>.01;s.sp.position.set(s.x,s.y+.15*Math.sin(tm*5+s.ph),s.z);s.sp.scale.set(sc,sc*1.5,1)}
+    if(f.light){f.light.L.position.set(f.x,f.y+f.lh,f.z);f.light.L.intensity=fade*f.li*(.82+.12*Math.sin(tm*17+f.x)+.08*Math.sin(tm*29))+(f.kind==='crash'&&EV.boomT>0?EV.boomT*30:0)}
+    f.smT-=dt;const rate=fade>0?f.smoke:(t<f.t2?f.smoke2||0:0);
+    if(rate>0&&f.smT<=0&&dist2(f.x,f.z,P.x,P.z)<700){f.smT=1/rate;const a=R(0,6.283),r=R(0,f.kind==='crash'?1.6:1.2*(f.s||1));
+      evPuff(f.x+Math.sin(a)*r,f.y+(f.kind==='tree'?(f.h||8)*.8:2.2),f.z+Math.cos(a)*r,fade>0?2:1.5,R(9,13),R(5.5,7.5),fade>0?.55:.32,fade>0?.2:.42,fade)}
+    if(fade>.2&&Math.random()<dt*8&&dist2(f.x,f.z,P.x,P.z)<120)parts.push({x:f.x+R(-1,1),y:f.y+(f.kind==='tree'?(f.h||8)*R(.4,.9):R(.5,3)),z:f.z+R(-1,1),vx:R(-.5,.5),vy:R(1.5,3.2),vz:R(-.5,.5),g:-.3,life:R(.8,1.6),c:col(pick(['#ffb040','#ff7a20','#ffe080'])),gh:-99})}
+  if(EV.boomT>0)EV.boomT-=dt}
+function evPuff(x,y,z,s0,s1,life,op,c,glow){let p=null;for(const q of EVX.puffs)if(!q.on){p=q;break}if(!p)return;
+  p.on=true;p.x=x;p.y=y;p.z=z;p.vx=R(-.3,.3);p.vy=R(2.2,3.4);p.vz=R(-.3,.3);p.age=0;p.life=life;p.s0=s0;p.s1=s1;p.op=op;p.c=c;p.glow=glow||0;p.rot=R(-.4,.4);
+  p.mat.rotation=R(0,6.28);p.mat.opacity=0;p.sp.visible=true;p.sp.position.set(x,y,z);p.sp.scale.set(s0,s0,1)}
+function evPuffsTick(dt){const L=clamp(S.light===undefined?1:S.light,.12,1);
+  for(const p of EVX.puffs){if(!p.on)continue;p.age+=dt;if(p.age>=p.life){p.on=false;p.sp.visible=false;continue}const k=p.age/p.life;
+    p.x+=(p.vx+EV.windX*(.4+k))*dt;p.y+=p.vy*dt*(1-k*.5);p.z+=(p.vz+EV.windZ*(.4+k))*dt;p.sp.position.set(p.x,p.y,p.z);const s=lerp(p.s0,p.s1,Math.sqrt(k));p.sp.scale.set(s,s,1);
+    p.mat.opacity=p.op*Math.min(1,p.age/.5)*(1-k);p.mat.rotation+=p.rot*dt;const g=p.glow*Math.max(0,1-k*3),v=p.c*(.25+.75*L);p.mat.color.setRGB(v+g*.55,v+g*.22,v+g*.05)}}
+
+// ================= HELICOPTER CRASH =================
+function evCrashSpot(){const ps=evPlayers();const anchors=ps.length?ps.map(o=>o.w):[P];const bases=Object.values(remoteBases).map(b=>b&&b.bx&&b.bx[0]).filter(Boolean);
+  for(let i=0;i<90;i++){const A=pick(anchors),ang=R(0,6.283),r=R(150,400),x=A.x+Math.sin(ang)*r,z=A.z+Math.cos(ang)*r;
+    if(x<40||z<40||x>WS-40||z>WS-40||!landOK(x,z,2.6)||slopeAt(x,z)>.35)continue;
+    if(typeof inTown==='function'&&inTown(x,z,40))continue;if(typeof POIS!=='undefined'&&Array.isArray(POIS)&&POIS.some(p=>p&&dist2(x,z,p.x,p.z)<(p.r||30)+35))continue;
+    if(typeof safeZone==='function'&&safeZone(x,z))continue;if(anchors.some(p=>dist2(x,z,p.x,p.z)<140))continue;
+    if(pieces.some(p=>dist2(x,z,p.gx*3,p.gz*3)<70)||bases.some(b=>dist2(x,z,b.minx,b.minz)<70))continue;
+    if(nearEnts(x,z,8).some(e=>e.solid&&dist2(x,z,e.x,e.z)<6.5))continue;return{x,z}}return null}
+// flight path (shared by everyone): straight approach along bearing ang, losing height ever faster, spinning onto the wreck yaw
+function evFlightPos(c,age){const u=clamp(age/EVC.FLY,0,1),back=(EVC.FLY-age)*34;return{u,x:c.x-Math.sin(c.ang)*back,z:c.z-Math.cos(c.ang)*back,y:c.gy+1.4+62*(1-u*u)}}
+// host: of a few candidate bearings, come in over the lowest ground so the falling helicopter does not clip a hill
+function evApproach(x,z){const c={x,z,gy:Math.max(groundH(x,z),0),ang:0};let best=R(0,6.283),bs=-1e9;
+  for(let k=0;k<10;k++){c.ang=R(0,6.283);let clr=1e9;for(let t=0;t<EVC.FLY-.3;t+=.6){const p=evFlightPos(c,t);clr=Math.min(clr,p.y-Math.max(groundH(p.x,p.z),0))}if(clr>bs){bs=clr;best=c.ang}if(bs>8)break}return best}
+function evStartCrash(){const tg=evCrashSpot();if(!tg)return false;
+  const m={k:'e_crash',id:'h'+(++EV.crashN)+'_'+RI(100,999),x:+tg.x.toFixed(1),z:+tg.z.toFixed(1),yaw:+R(0,6.283).toFixed(3),ang:+evApproach(tg.x,tg.z).toFixed(3),t0:+S.time.toFixed(2)};
+  evBuildCrash(m);netBroadcast(m);killfeed('<b style="color:#ffb070">A helicopter is going down</b> — crash site marked on the map');return true}
+function evBuildCrash(m){if(!m||!isFinite(m.x)||!isFinite(m.z))return;if(CRASH&&CRASH.id===m.id)return;if(CRASH)evRemoveCrash();
+  const c={id:m.id,x:+m.x,z:+m.z,gy:Math.max(groundH(+m.x,+m.z),0),yaw:+m.yaw||0,ang:+m.ang||0,t0:+m.t0||S.time,impact:false,heli:null,wreck:null,decal:null,fire:null,ents:[],crates:[],lootT:0,spawned:false,nzT:0,late:false};
+  CRASH=c;if(S.time-c.t0>=EVC.FLY){c.late=true;evImpact(c,true);return}
+  const d=Math.round(dist2(P.x,P.z,c.x,c.z));evToast('HELICOPTER GOING DOWN',EV_DIRL[evDir(c.x-P.x,c.z-P.z)].replace(/^./,s=>s.toUpperCase())+' · '+d+' m — two crates on board','crash');
+  tip('ev_crash','Helicopter crash','A helicopter is going down. The wreck burns for about a minute, then its two <b>crash crates</b> can be opened. The crash is loud: the infected and hostile players will come for it. It is marked on your map (<b>M</b>).')}
+function evMakeHeli(c){const G=evGeo();const g=new THREE.Group();g.add(new THREE.Mesh(G.body,MAT.vc));const t=new THREE.Mesh(G.tail,MAT.vc);t.position.set(0,2.15,-1.6);g.add(t);
+  const r=new THREE.Mesh(G.rotor,MAT.vc);r.position.set(0,3.86,0);g.add(r);const tr=new THREE.Mesh(G.trotor,MAT.vc);tr.position.set(.26,2.9,-7.35);g.add(tr);
+  shadowAll(g,true,false);for(const s of EVX.heliFl){g.add(s);s.visible=true}world.add(g);c.heli=g;c.rotor=r;c.trotor=tr}
+function evFly(c,age,dt){if(!c.heli)evMakeHeli(c);const fp=evFlightPos(c,age),u=fp.u,hx=fp.x,hz=fp.z,hy=fp.y;
+  // tail rotor gone: the spin builds up and ends exactly on the wreck's heading
+  const spin=9+((((c.yaw-c.ang-9)%6.2832)+6.2832)%6.2832),yaw=c.ang+spin*u*u*u;c.hx=hx;c.hy=hy;c.hz=hz;
+  c.heli.position.set(hx,hy,hz);c.heli.rotation.set(.22*u,yaw,.3*Math.sin(age*2.3)*u,'YXZ');c.rotor.rotation.y+=dt*(30-14*u);c.trotor.rotation.x+=dt*44*(1-u);
+  c.smT=(c.smT||0)-dt;if(c.smT<=0){c.smT=.06;evPuff(hx-Math.sin(yaw)*1.3,hy+3,hz-Math.cos(yaw)*1.3,1.6,6+u*4,R(2.6,3.6),.62,.2,.6)}
+  for(const s of EVX.heliFl)s.scale.set(1.2+R(-.15,.25),1.8+R(-.2,.4),1)}
+function evWreckMesh(c){const G=evGeo();const g=new THREE.Group();const b=new THREE.Mesh(G.body,G.wreckMat);b.position.set(0,-.15,0);b.rotation.set(.05,0,.3);g.add(b);
+  const t=new THREE.Mesh(G.tail,G.wreckMat);t.position.set(-.9,.4,-2.3);t.rotation.set(-.06,.6,-.22,'YXZ');g.add(t);g.add(new THREE.Mesh(G.wbits,G.wreckMat));
+  shadowAll(g);g.position.set(c.x,c.gy,c.z);g.rotation.y=c.yaw;return g}
+function evImpact(c,late){c.impact=true;if(c.heli){world.remove(c.heli);c.heli=null}for(const s of EVX.heliFl)s.visible=false;
+  const G=evGeo(),cy=Math.cos(c.yaw),sy=Math.sin(c.yaw),W=(lx,lz)=>({x:c.x+lx*cy+lz*sy,z:c.z-lx*sy+lz*cy});
+  c.wreck=evWreckMesh(c);world.add(c.wreck);c.decal=evScorch(c.x,c.z,13);world.add(c.decal);
+  // colliders: cabin, nose and the snapped-off tail boom
+  const tp=W(-2.5,-4.7),np=W(-.3,2.7),be={id:'ev_wb'+c.id,t:'heliwreck',x:c.x,z:c.z,y:c.gy,r:1.6,solid:1,ph:3},ne={id:'ev_wn'+c.id,t:'heliwreck',x:np.x,z:np.z,y:groundH(np.x,np.z),r:.95,solid:1,ph:2.3},
+    te={id:'ev_wt'+c.id,t:'heliwreck',x:tp.x,z:tp.z,y:groundH(tp.x,tp.z),r:.65,solid:1,ph:1.3};
+  regEnt(be);regEnt(ne);regEnt(te);c.ents.push(be,ne,te);
+  [[3.4,.8,.4],[-3,-1.9,-.9]].forEach(([lx,lz,ry],i)=>{const p=W(lx,lz),y=Math.max(groundH(p.x,p.z),0),m=new THREE.Mesh(G.crate,MAT.vc);m.position.set(p.x,y,p.z);m.rotation.y=c.yaw+ry;m.castShadow=m.receiveShadow=true;world.add(m);
+    const e={id:'ev_cc'+c.id+'_'+i,t:'crashcrate',x:p.x,z:p.z,y,r:.62,solid:1,ph:.95,obj:m,ci:i,taken:false};regEnt(e);c.ents.push(e);c.crates.push(e)});
+  const tb=c.t0+EVC.FLY;c.fire=evAddFire({key:'cr'+c.id,kind:'crash',x:c.x,y:c.gy,z:c.z,yaw:c.yaw,t0:tb,t1:tb+EVC.BURN,t2:tb+EVC.LIFE+5,li:3.4,lh:3.2,smoke:6,smoke2:1.6,hurtR:3.7,dps:10});
+  if(late)return;
+  const p=new V3(c.x,c.gy+1.5,c.z),d=dist2(P.x,P.z,c.x,c.z);sfx('ev_crash',1.2,p);EV.boomT=.45;
+  burst(p,['#ffd27a','#ff8a3a','#ffb050','#fff2c0'],46,9,6,7,.9);burst(p,['#2a2826','#3a3632','#4a4440'],26,6,5,3,1.4);debris(p,'#3a3f30',9,.38,'box');debris(p,'#2a2826',6,.3,'rock');
+  for(let i=0;i<5;i++)evPuff(c.x+R(-2,2),c.gy+1+R(0,2),c.z+R(-2,2),3,12,R(4,6),.75,.12,1);
+  if(d<220)P.camShake=Math.max(P.camShake||0,1.1*(1-d/220));
+  evHurtLocal(c.x,c.z,undefined,14,75,8,'crash','Killed by a crashing helicopter');evHurtArea(c.x,c.z,14,90,10,evSrc('Helicopter crash',c.x,c.z),'crash');
+  if(NET.role!=='client')noise(c.x,c.z,260)}
+function evTakeCrate(cid,i,quiet,by){const c=CRASH;if(!c||c.id!==cid)return false;const e=c.crates[i];if(!e||e.taken)return false;e.taken=true;ents=ents.filter(x=>x!==e);if(e.obj)world.remove(e.obj);
+  if(dist2(e.x,e.z,P.x,P.z)<80)burst(new V3(e.x,e.y+.6,e.z),['#c8a038','#3e4a2e','#8a8a80'],10,2,2);if(by)feedMsg(String(by).replace(/</g,'&lt;')+' looted a crash crate');
+  if(c.crates.every(q=>q.taken))c.lootT=S.time;return true}
+function evRemoveCrash(){const c=CRASH;if(!c)return;CRASH=null;for(const o of[c.heli,c.wreck,c.decal])if(o)world.remove(o);for(const s of EVX.heliFl)s.visible=false;
+  if(c.ents.length){const set=new Set(c.ents);ents=ents.filter(e=>!set.has(e));for(const e of c.crates)if(e.obj)world.remove(e.obj)}if(c.fire)evKillFire(c.fire);
+  if(c.decal&&c.decal.geometry)c.decal.geometry.dispose()}
+// a few infected stagger in from the surroundings to check out the crash (and then loiter around the wreck)
+function evCrashInfected(c){if(typeof spawnZombie!=='function'||evZAlive()>(typeof ZMS!=='undefined'&&ZMS&&ZMS.low?40:56))return;const ps=evPlayers(),n=RI(3,5);
+  for(let i=0;i<n;i++){const p=evRing(c.x,c.z,26,52,R(0,6.283),3.2,ps);if(!p)continue;const z=evZombie(evKindOK(Math.random()<.6?'shambler':'runner'),p.x,p.z,{x:c.x,z:c.z},null,'investigate',false);
+    if(z){z.gx=c.x+R(-6,6);z.gz=c.z+R(-6,6);z.wT=30;z.evCrash=c.id}}}
+function evHostCrash(dt){const L=S.dayLen,d=Math.floor(S.time/L);
+  if(EV.crashDay!==d){EV.crashDay=d;EV.crashAt=(d+R(.06,.94))*L;if(EV.crashAt<S.time+30)EV.crashAt=S.time+R(60,200);if(EV.crashAt<300)EV.crashAt=R(300,420)}
+  if(!CRASH&&EV.crashAt>0&&S.time>=EV.crashAt){EV.crashAt=-1;evStartCrash()}
+  const c=CRASH;if(!c)return;const tb=c.t0+EVC.FLY;
+  if(c.impact){c.nzT-=dt;if(c.nzT<=0){if(S.time<tb+EVC.BURN){c.nzT=4;noise(c.x,c.z,150)}else if(c.crates.some(e=>!e.taken)){c.nzT=10;noise(c.x,c.z,75)}else c.nzT=1e9}
+    if(!c.spawned&&S.time>tb+3){c.spawned=true;if(!c.late)evCrashInfected(c)}}
+  if(S.time>tb+EVC.LIFE||(c.lootT&&S.time>c.lootT+90)){const id=c.id;evRemoveCrash();netBroadcast({k:'e_crashEnd',id})}}
+function evCrashTick(dt){const c=CRASH;if(!c)return;const age=S.time-c.t0;if(!c.impact){if(age<EVC.FLY)evFly(c,age,dt);return}
+  if(S.time>=c.t0+EVC.FLY+EVC.BURN){c.spT=(c.spT||0)-dt;if(c.spT<=0){c.spT=.3;
+    for(const e of c.crates)if(!e.taken&&dist2(e.x,e.z,P.x,P.z)<90)parts.push({x:e.x+R(-.4,.4),y:e.y+.9,z:e.z+R(-.3,.3),vx:R(-.2,.2),vy:R(.6,1.2),vz:R(-.2,.2),g:-.2,life:R(.8,1.4),c:col(pick(['#ffe08a','#ffd050','#fff2c0'])).multiplyScalar(S.light||1),gh:-99})}}}
+
+// ================= HOST MISC (fire damage, cache expiry, wolf population) =================
+function evHostMisc(dt){for(const c of[...EV.caches])if(S.time-c.t0>EVC.CACHE){evRemoveCache(c.id);netBroadcast({k:'e_cacheGone',id:c.id})}
+  EV.hdmgT-=dt;if(EV.hdmgT<=0){EV.hdmgT=.5;for(const f of EV.fires){if(!f.hurtR||S.time<f.t0+.5||S.time>f.t1)continue;evHurtArea(f.x,f.z,f.hurtR,f.dps*.5,f.dps*.25,f.src||(f.src=evSrc('Fire',f.x,f.z)),'fire',true)}}
+  // horde wolves that get killed respawn as ordinary wolves later: keep the island's wolf count where it was
+  if(EV.wolfCap>=0&&!EV.red){EV.govT-=dt;if(EV.govT<=0){EV.govT=15;const ws=animals.filter(a=>a.t==='wolf'&&!a.dead);if(ws.length<=EV.wolfCap||!ws.some(a=>a.horde)){EV.wolfCap=-1}else{const ps=evPlayers();
+    const far=ws.find(a=>a.horde&&!a.foe&&!ps.some(o=>dist2(a.x,a.z,o.w.x,o.w.z)<110));if(far){world.remove(far.obj);animals=animals.filter(x=>x!==far)}}}}}
+
+// ================= SOUND (synth, via the sfx wrapper) =================
+function evNz(t,type,f,q,peak,att,dec,dest,sweep){const s=AC.createBufferSource();s.buffer=NBUF;s.loop=true;const fl=AC.createBiquadFilter();fl.type=type;fl.frequency.setValueAtTime(f,t);if(sweep)fl.frequency.exponentialRampToValueAtTime(sweep,t+att+dec);fl.Q.value=q||.7;
+  const g=AC.createGain();g.gain.setValueAtTime(.0001,t);g.gain.exponentialRampToValueAtTime(Math.max(.0002,peak),t+att);g.gain.exponentialRampToValueAtTime(.0001,t+att+dec);s.connect(fl);fl.connect(g);g.connect(dest);s.start(t,Math.random()*1.8);s.stop(t+att+dec+.1)}
+// loud far-carrying sounds: own distance curve, direction-only panning, distance lowpass
+function evFar(pos,vol,rev,range){if(!pos||!P)return bus(null,vol,rev);const d=dist2(pos.x,pos.z,P.x,P.z),k=Math.pow(clamp(1-d/range,0,1),1.3),ux=d>1?(pos.x-P.x)/d:0,uz=d>1?(pos.z-P.z)/d:0;
+  return bp(bus({x:P.x+ux*4,z:P.z+uz*4},Math.max(.0001,vol*k),rev),clamp(16000/(1+d/60),280,16000),.7,'lowpass')}
+function evSound(type,vol,pos){const t=AC.currentTime+.01;
+  switch(type){
+   case 'ev_thunder':{const d=pos?dist2(pos.x,pos.z,P.x,P.z):220,near=clamp(1-d/650,0,1),out=evFar(pos,vol*(.45+.75*near),.95,1600);
+     if(d<150){const c=1-d/150;evNz(t,'highpass',1400,.7,1.2*c+.15,.002,.14,out);evNz(t+.01,'bandpass',520,.9,.9*c+.1,.004,.5,out,140);tn(t,'sawtooth',90,30,.5*c+.05,.003,.55,bp(out,320,.8,'lowpass'))}
+     let tt=t+(d<150?.06:0);const n=3+Math.floor(Math.random()*3);for(let i=0;i<n;i++){const du=R(.7,1.5)*(1+d/500);evNz(tt,'lowpass',lerp(130,420,near)*R(.85,1.2),.8,R(.45,.85)*(.35+.65*near),R(.06,.3),du,out,55);tt+=R(.3,.8)}
+     tn(t+.04,'sine',52,26,.55*near+.25,.12,2.6+d/200,out);break}
+   case 'ev_omen':{const out=bus(null,vol*.42,.85),du=6.5,lp=AC.createBiquadFilter();lp.type='lowpass';lp.frequency.setValueAtTime(380,t);lp.frequency.linearRampToValueAtTime(1300,t+2.4);lp.frequency.linearRampToValueAtTime(450,t+du);lp.Q.value=2;
+     const g=AC.createGain();g.gain.setValueAtTime(.0001,t);g.gain.exponentialRampToValueAtTime(.55,t+1.6);g.gain.setValueAtTime(.55,t+3.8);g.gain.exponentialRampToValueAtTime(.0001,t+du);lp.connect(g);g.connect(out);
+     for(const m of[1,1.006,.5]){const o=AC.createOscillator();o.type=m===.5?'triangle':'sawtooth';const f0=165*m;o.frequency.setValueAtTime(f0,t);o.frequency.linearRampToValueAtTime(f0*1.5,t+2.2);o.frequency.linearRampToValueAtTime(f0*1.42,t+3.6);o.frequency.linearRampToValueAtTime(f0*.92,t+du);o.connect(lp);o.start(t);o.stop(t+du+.1)}
+     tn(t,'sine',43,38,.5,1.2,du-1.2,out);break}
+   case 'ev_drone':{const out=bus(null,vol*.3,.9);tn(t,'sine',41,37,.6,1.8,3.2,out);tn(t,'sawtooth',82,74,.12,1.8,3,bp(out,180,.7,'lowpass'));evNz(t,'bandpass',260,3,.12,1.5,2.5,out,180);evNz(t+1.2,'bandpass',700,9,.07,.25,.9,out,1500);break}
+   case 'ev_wave':{const out=bus(null,vol*.5,.7);tn(t,'sawtooth',55,49,.5,.02,1.4,bp(out,360,.9,'lowpass'));tn(t,'sine',41,36,.6,.01,1.6,out);
+     for(let i=0;i<3;i++)evNz(t+.35+i*R(.25,.5),'bandpass',R(650,900),8,.1,.12,R(.5,.9),out,R(1300,1800));break}
+   case 'ev_crash':{const out=evFar(pos,vol*1.3,.9,1100);tn(t,'sine',85,22,1,.004,1.8,out);evNz(t,'lowpass',1000,.7,1,.004,2.4,out,90);evNz(t,'highpass',1600,.7,.7,.002,.3,out);
+     tn(t+.05,'triangle',380,210,.3,.004,.9,bp(out,520,3));tn(t+.3,'triangle',260,180,.2,.01,1.2,bp(out,400,4));for(let i=0;i<8;i++)nz(t+R(.15,1.8),.04,'highpass',R(2200,4200),.7,R(.08,.25),.002,.04,out);break}
+   case 'ev_crackle':{const out=bus(pos,vol*.6,0);nz(t,.03,'highpass',R(1800,3600),.7,R(.3,.7),.001,R(.015,.035),out);if(Math.random()<.3)tn(t,'sine',R(120,240),70,.2,.001,.06,out);break}
+   case 'ev_cache':{const out=bus(pos,vol*.6,.35);[523,659,784,1047].forEach((f,i)=>tn(t+i*.085,'sine',f,f,.28,.004,.45,out));tn(t,'triangle',196,196,.18,.01,.5,out);break}
+   case 'ev_dawn':{const out=bus(null,vol*.3,.8);[262,330,392,494,523].forEach((f,i)=>tn(t+i*.16,'sine',f,f*1.003,.22,.5,2.6,out));break}
+  }}
+const _evSfx=sfx;
+sfx=function(type,...a){if(typeof type==='string'&&type.startsWith('ev_')){if(muted||!ac())return;if(AC.state==='suspended')AC.resume();try{evSound(type,a[0]===undefined?1:a[0],a[1])}catch(e){}return}return _evSfx(type,...a)};
+// persistent loops (fire roar, rotor thump + turbine whine, storm wind), built lazily once audio exists
+function evLoopsStop(){const L=EV.loops;EV.loops=null;EV.lastA={};if(!L)return;try{for(const n of L.nodes)try{n.stop()}catch(e){}for(const g of[L.roar.g,L.wind.g,L.rotor.g,L.rotor.wg])try{g.disconnect()}catch(e){}}catch(e){}}
+function evSetA(k,p,v,t,tc){const o=EV.lastA||(EV.lastA={});if(o[k]!==undefined&&Math.abs(o[k]-v)<.004*(Math.abs(v)>2?Math.abs(v):1))return;o[k]=v;p.setTargetAtTime(v,t,tc)}
+function evLoops(){if(EV.loops||EV.loopsFail)return EV.loops;try{
+  const nodes=[];const mk=(type,f,q)=>{const s=AC.createBufferSource();s.buffer=NBUF;s.loop=true;const fl=AC.createBiquadFilter();fl.type=type;fl.frequency.value=f;fl.Q.value=q||.7;const g=AC.createGain();g.gain.value=0;s.connect(fl);fl.connect(g);g.connect(MASTER);s.start();nodes.push(s);return{g,fl}};
+  const roar=mk('lowpass',300),wind=mk('bandpass',480,.5);
+  const rs=AC.createBufferSource();rs.buffer=NBUF;rs.loop=true;const rf=AC.createBiquadFilter();rf.type='lowpass';rf.frequency.value=240;const am=AC.createGain();am.gain.value=.5;
+  const lfo=AC.createOscillator();lfo.frequency.value=15;const lg=AC.createGain();lg.gain.value=.5;lfo.connect(lg);lg.connect(am.gain);const rg=AC.createGain();rg.gain.value=0;rs.connect(rf);rf.connect(am);am.connect(rg);rg.connect(MASTER);rs.start();lfo.start();
+  const wh=AC.createOscillator();wh.type='sawtooth';wh.frequency.value=1150;const wf=AC.createBiquadFilter();wf.type='bandpass';wf.frequency.value=1200;wf.Q.value=5;const wg=AC.createGain();wg.gain.value=0;wh.connect(wf);wf.connect(wg);wg.connect(MASTER);wh.start();
+  nodes.push(rs,lfo,wh);EV.lastA={};EV.loops={roar,wind,rotor:{g:rg,lfo,wh,wg},nodes}}catch(e){EV.loops=null;EV.loopsFail=true}return EV.loops}
+function evAudioTick(dt){if(!AC||!MASTER||!NBUF)return;const on=muted||!inGame()?0:1;
+  let fd=1e9,fb=0,fp=null;for(const f of EV.fires){if(S.time<f.t0||S.time>f.t1)continue;const d=dist2(P.x,P.z,f.x,f.z);if(d<fd){fd=d;fb=f.kind==='crash'?1:.7;fp=f}}
+  const c=CRASH,fly=!!(c&&!c.impact&&c.hx!==undefined),need=on&&(fd<60||fly||EV.storm||EV.stormK>.01);
+  if(need)EV.quietT=0;else{EV.quietT=(EV.quietT||0)+dt;if(EV.loops&&EV.quietT>5)evLoopsStop()}
+  if(!need&&!EV.loops)return;const L=evLoops();if(!L)return;const t=AC.currentTime;
+  evSetA('roar',L.roar.g.gain,on*clamp(1-fd/48,0,1)*.17*fb,t,.3);EV.crackT-=dt;if(on&&fp&&fd<18&&EV.crackT<=0){EV.crackT=R(.05,.22);sfx('ev_crackle',.9*(1-fd/18),fp)}
+  let hg=0;if(fly){const d=Math.hypot(c.hx-P.x,c.hz-P.z,c.hy-P.y);hg=Math.pow(clamp(1-d/520,0,1),1.5)*.6;const u=clamp((S.time-c.t0)/EVC.FLY,0,1);
+    evSetA('lfo',L.rotor.lfo.frequency,15-6*u+Math.sin(S.time*7)*1.5*u,t,.1);evSetA('wh',L.rotor.wh.frequency,1150-500*u,t,.2)}
+  evSetA('rg',L.rotor.g.gain,on*hg,t,.12);evSetA('wg',L.rotor.wg.gain,on*hg*.05,t,.12);evSetA('wind',L.wind.g.gain,on*EV.stormK*(.05+.03*Math.sin(t*.4)),t,.6)}
+
+// ================= RENDER: sky / fog / moon tint, lightning flash, storm darkening, event FX =================
+onHook('render',dt=>{if(!S||!P)return;
+  EV.redK=lerp(EV.redK,EV.red?1:0,Math.min(1,dt*.4));if(!EV.red&&EV.redK<.002)EV.redK=0;EV.stormK=lerp(EV.stormK,EV.storm?1:0,Math.min(1,dt*.25));if(!EV.storm&&EV.stormK<.002)EV.stormK=0;
+  evBoltsTick(dt);evCrashTick(dt);evFiresTick(dt);evPuffsTick(dt);
+  {const mine=EV.caches.find(o=>o.mine),B=EVX.beacon;if(mine){B.position.set(mine.x,mine.y+1.3,mine.z);B.intensity=1.1+.6*Math.sin(S.time*3.2)}else B.intensity=0;if(EVG&&EV.caches.length)EVG.lampMat.color.setRGB(.6+.4*Math.sin(S.time*4),.12,.06)}
+  const uw=camera.position.y<-.02,D=S.dayF||0,k=EV.redK,nk=k*clamp(1-D*1.5,0,1),sk=EV.stormK,fl=EV.flash;
+  if(k>0){EV.redDirty=true;skyU.top.value.lerp(EVK.rTop,nk*.85);skyU.bot.value.lerp(EVK.rBot,nk*.8);skyU.cloudCol.value.lerp(EVK.rCloud,nk*.75);skyU.cloudShade.value.lerp(EVK.rShade,nk*.75);
+    moonMesh.material.color.copy(EVK.moonBase).lerp(EVK.moonRed,k);moonMesh.scale.setScalar(1+.5*k);
+    moon.intensity+=.12*nk;hemi.color.lerp(EVK.hemiRed,.45*nk);hemi.intensity+=.04*nk;stars.material.opacity*=1-.55*nk;
+    if(typeof GFX!=='undefined'&&GFX&&GFX.starU&&GFX.starU.uOp)GFX.starU.uOp.value*=1-.55*nk;
+    const h=EVX.halo;h.visible=moonMesh.visible&&nk>.01;if(h.visible){h.position.copy(moonMesh.position);h.material.opacity=nk*(.62+.12*Math.sin(S.time*.6))}}
+  else if(EV.redDirty){EV.redDirty=false;moonMesh.material.color.copy(EVK.moonBase);moonMesh.scale.setScalar(1);EVX.halo.visible=false}
+  if(sk>0){const dk=Math.max(D,.25);skyU.top.value.multiplyScalar(1-.38*sk*dk);skyU.bot.value.multiplyScalar(1-.3*sk*dk);skyU.uCover.value=Math.max(skyU.uCover.value,sk);
+    sun.intensity*=1-.5*sk;hemi.intensity*=1-.22*sk;if(!uw)scene.fog.far*=1-.2*sk;
+    if(rainMesh.visible){rainMat.opacity=Math.min(.85,rainMat.opacity*(1+1.2*sk));const wx=EV.windX*.2*sk,wz=EV.windZ*.2*sk,ly=.5*sk;for(let j=3;j<rainPos.length;j+=6){rainPos[j]+=wx;rainPos[j+1]-=ly;rainPos[j+2]+=wz}}}
+  if(fl>.002){hemi.intensity+=fl*1.7;hemi.color.lerp(EVK.fC,Math.min(1,fl));skyU.top.value.lerp(EVK.fSky,fl*.6);skyU.bot.value.lerp(EVK.fSky2,fl*.65);skyU.cloudCol.value.lerp(EVK.fCloud,fl*.85);skyU.cloudShade.value.lerp(EVK.fSky,fl*.6);
+    moon.position.set(P.x+EV.fdx*120,P.y+110,P.z+EV.fdz*120);moon.intensity+=fl*2.6;EVX.boltL.position.set(EV.fx,EV.fy+30,EV.fz);EVX.boltL.intensity=fl*16*EV.fnear}
+  else EVX.boltL.intensity=0;
+  if(!uw&&(k>0||sk>0||fl>.002))evFogFromSky();
+  if(k>0||fl>.002){moon.color.copy(EVK.mlBase).lerp(EVK.mlRed,k);if(fl>.002)moon.color.lerp(EVK.fC,Math.min(1,fl*1.5));EV.moonDirty=true}else if(EV.moonDirty){moon.color.copy(EVK.mlBase);EV.moonDirty=false}
+  const fo=fl>.002?Math.min(.75,fl*.55*EV.fnear):0;if(Math.abs(fo-EV.lastFo)>.01||(fo===0&&EV.lastFo!==0)){EV.lastFo=fo;EVD.flash.style.opacity=fo.toFixed(3)}
+  const vo=nk>.01?nk*(.62+.1*Math.sin(S.time*1.3)):0;if(Math.abs(vo-EV.lastVo)>.01||(vo===0&&EV.lastVo!==0)){EV.lastVo=vo;EVD.vig.style.opacity=vo.toFixed(3)}});
+
+// ================= HOOKS =================
+onHook('worldTick',dt=>{if(!S||!P||NET.role==='client')return;evHostRed(dt);evHostStorm(dt);evHostCrash(dt);evHostMisc(dt)});
+onHook('anyTick',dt=>{if(!S||!P)return;
+  if(CRASH&&!CRASH.impact&&S.time-CRASH.t0>=EVC.FLY)evImpact(CRASH,S.time-CRASH.t0>EVC.FLY+3); // runs in hidden frames too
+  evToastTick(dt);evAudioTick(dt);if(EV.red&&S.active){EV.omenT-=dt;if(EV.omenT<=0){EV.omenT=R(24,40);sfx('ev_drone',.7)}}});
+onHook('playerTick',dt=>{EV.dmgT-=dt;if(EV.dmgT>0)return;EV.dmgT=.5;
+  for(const f of EV.fires){if(!f.hurtR||S.time<f.t0+.5||S.time>f.t1)continue;const d=dist2(P.x,P.z,f.x,f.z);if(d>=f.hurtR||Math.abs(P.y-f.y)>(f.kind==='tree'?f.h:4))continue;
+    hurt(f.dps*.5*(1-.5*d/f.hurtR),'fire',f.x,f.z);if(typeof applyStatus==='function')try{applyStatus(P,'burn',2.5,f.src||null)}catch(e){}
+    if(!P.alive){$('#dCause').textContent='Burned to death';return}tip('ev_burn','Fire!','Burning wrecks and trees hurt anything that stands too close. Step back.')}});
+onHook('death',()=>{if(EV.red&&NET.role!=='client')EV.fallen['@host']=1});
+onHook('kill',(t,src)=>{if(!EV.red||NET.role==='client'||!t)return;const k=src==='player'?'@host':src&&src.t==='rplayer'?src.id:null;if(k)EV.kills[k]=(EV.kills[k]|0)+1});
+onHook('newGame',()=>{evReset()});
+function evReset(){if(CRASH)evRemoveCrash();CRASH=null;for(const f of[...EV.fires])evKillFire(f);EV.fires=[];for(const s of EVX.flames){s.used=false;s.sp.visible=false}for(const L of EVX.fireL){L.used=false;L.L.intensity=0}
+  for(const p of EVX.puffs){p.on=false;p.sp.visible=false}for(const b of EVX.bolts){b.t=-1;b.m.visible=false;b.fl.visible=false}for(const s of EVX.heliFl)s.visible=false;EVX.boltL.intensity=0;EVX.beacon.intensity=0;EVX.halo.visible=false;
+  moonMesh.material.color.copy(EVK.moonBase);moonMesh.scale.setScalar(1);moon.color.copy(EVK.mlBase);
+  Object.assign(EV,{red:false,redNi:-1,redK:0,redDirty:false,moonDirty:false,warned:-99,forceNi:-99,wave:0,waveAt:0,horde:[],fallen:{},kills:{},wolfCap:-1,govT:0,storm:false,stormK:0,rainN:0,wasRain:false,stormRoll:-1,forceStorm:false,
+    crashDay:-1,crashAt:-1,caches:[],gone:{},boomT:0,flash:0,toasts:[],toastT:0,toastOn:false,banOn:null,banTop:-1,lastFo:-1,lastVo:-1});
+  EVD.toast.className='';EVD.toast.innerHTML='';EVD.flash.style.opacity=0;EVD.vig.style.opacity=0}
+onHook('hud',()=>{if(!S||!P)return;if((EV.hudN++)%6)return;const on=!!EV.red;if(on!==EV.banOn){EV.banOn=on;EVD.ban.classList.toggle('hidden',!on)}
+  if(on){const left=Math.max(0,evDawn(EV.redNi)-S.time),tx=String(Math.floor(left/60)).padStart(2,'0')+':'+String(Math.floor(left%60)).padStart(2,'0');if(tx!==EV.banTxt){EV.banTxt=tx;EVD.banT.textContent=tx}
+    const nx=Math.ceil(EV.waveAt-S.time),wv=EV.wave?'Wave '+EV.wave+(nx>0&&nx<90?' · next '+nx+'s':''):(nx>0&&nx<90?'First wave '+nx+'s':'');if(wv!==EV.banWv){EV.banWv=wv;EVD.banW.textContent=wv}
+    const te=$('#tip'),top=te&&!te.classList.contains('hidden')?Math.round(62+(+te.offsetHeight||0)+10):62;if(top!==EV.banTop){EV.banTop=top;EVD.ban.style.top=top+'px'}}
+  if(CRASH)PROMPTS.crashhot='Too hot to open · '+Math.max(0,Math.ceil(CRASH.t0+EVC.FLY+EVC.BURN-S.time))+'s'});
+onHook('status',o=>{if(!S||!P)return;if(EV.storm)o.push('<span style="color:#bcd4ff">THUNDERSTORM</span>');
+  if(CRASH&&(!CRASH.impact||CRASH.crates.some(e=>!e.taken)))o.push(`<span style="color:#ffb070">CRASH ${Math.round(dist2(P.x,P.z,CRASH.x,CRASH.z))}m ${evDir(CRASH.x-P.x,CRASH.z-P.z)}</span>`);
+  const mc=EV.caches.find(c=>c.mine);if(mc)o.push(`<span style="color:#ffcf5a">MOON CACHE ${Math.round(dist2(P.x,P.z,mc.x,mc.z))}m</span>`)});
+onHook('minimap',(m,s)=>{if(!S)return;const t=performance.now()/1000;
+  if(CRASH){const x=CRASH.x*s,z=CRASH.z*s,u=(t%1.4)/1.4;m.fillStyle='#ff7a2a';m.beginPath();m.arc(x,z,3.2,0,7);m.fill();
+    if(!CRASH.impact||CRASH.crates.some(e=>!e.taken)){m.strokeStyle='rgba(255,140,60,'+(.9-u*.9).toFixed(2)+')';m.lineWidth=1.5;m.beginPath();m.arc(x,z,3+u*9,0,7);m.stroke()}}
+  for(const o of EV.caches){m.save();m.translate(o.x*s,o.z*s);m.rotate(.785);m.fillStyle=o.mine?'#ffcf5a':'#c8a070';m.fillRect(-2.5,-2.5,5,5);m.restore()}
+  for(const f of EV.fires)if(f.kind==='tree'&&S.time<f.t1){m.fillStyle='#ff9a3a';m.fillRect(f.x*s-1.5,f.z*s-1.5,3,3)}
+  if(EV.redK>.05){const W=(m.canvas&&+m.canvas.width)||170,H=(m.canvas&&+m.canvas.height)||170;m.strokeStyle='rgba(215,30,20,'+((.45+.3*Math.sin(t*2.2))*EV.redK).toFixed(2)+')';m.lineWidth=3;m.strokeRect(1.5,1.5,W-3,H-3)}});
+onHook('bigmap',(g,s)=>{if(!S)return;const lab=(x,z,t,c)=>{g.font='bold 14px Roboto Condensed,Arial';g.fillStyle='rgba(0,0,0,.6)';g.fillText(t,x*s+1,z*s+1);g.fillStyle=c;g.fillText(t,x*s,z*s)};
+  if(CRASH){g.fillStyle='#ff7a2a';g.strokeStyle='#000';g.lineWidth=1.5;g.beginPath();g.arc(CRASH.x*s,CRASH.z*s,7,0,7);g.fill();g.stroke();lab(CRASH.x+6,CRASH.z-4,CRASH.impact?'Helicopter crash':'Helicopter going down','#ffb070')}
+  for(const o of EV.caches){g.fillStyle=o.mine?'#ffcf5a':'#c8a070';g.fillRect(o.x*s-4,o.z*s-4,8,8);lab(o.x+5,o.z-3,o.mine?'Moon cache':String(o.nm||'Friend').slice(0,14)+'\'s cache','#ffcf8a')}
+  for(const f of EV.fires)if(f.kind==='tree'&&S.time<f.t1){g.fillStyle='#ff9a3a';g.beginPath();g.arc(f.x*s,f.z*s,4,0,7);g.fill();lab(f.x+4,f.z-3,'Fire','#ffb070')}
+  if(EV.red){const H=(g.canvas&&+g.canvas.height)||640;g.font='bold 15px Roboto Condensed,Arial';g.fillStyle='rgba(0,0,0,.6)';g.fillText('RED MOON — HORDE NIGHT',13,H-13);g.fillStyle='#ff5a40';g.fillText('RED MOON — HORDE NIGHT',12,H-14)}});
+
+// ================= MULTIPLAYER =================
+onHook('snapshot',m=>{if(!S)return;m.ev=[EV.red?1:0,EV.storm?1:0,EV.wave|0,Math.round(EV.waveAt||0),EV.redNi|0];
+  if((EV.snapN++)%10===0){const c=CRASH;m.evc=c?[c.id,c.x,c.z,c.yaw,c.ang,c.t0,c.crates.length?c.crates.map(e=>e.taken?0:1):[1,1]]:0;
+    m.evk=EV.caches.map(o=>[o.id,o.x,o.z,+o.y.toFixed(2),o.nm,o.own,o.t0]);m.evf=EV.fires.filter(f=>f.kind==='tree').map(f=>[f.key,+f.x.toFixed(2),+f.y.toFixed(2),+f.z.toFixed(2),f.h,f.s,f.t0,f.t1,f.tree==null?null:f.tree])}});
+onHook('applySnap',m=>{if(!S||!P||!m||!Array.isArray(m.ev))return;const e=m.ev;
+  if(!!e[0]!==EV.red)evSetRed(!!e[0],e[4]|0,e[0]?{late:true}:null);if(EV.red){EV.redNi=e[4]|0;EV.wave=e[2]|0;EV.waveAt=+e[3]||0}
+  if(!!e[1]!==EV.storm)evSetStorm(!!e[1],true);
+  if(m.evc!==undefined){const c=m.evc;if(!c){if(CRASH)evRemoveCrash()}else if(Array.isArray(c)){if(!CRASH||CRASH.id!==c[0])evBuildCrash({id:c[0],x:c[1],z:c[2],yaw:c[3],ang:c[4],t0:c[5]});
+    if(CRASH&&CRASH.impact&&Array.isArray(c[6]))c[6].forEach((v,i)=>{if(!v)evTakeCrate(c[0],i,true,null)})}}
+  if(Array.isArray(m.evk)){const ids=new Set(m.evk.map(k=>k[0]));for(const o of[...EV.caches])if(!ids.has(o.id))evRemoveCache(o.id);
+    for(const k of m.evk)if(!EV.gone[k[0]]&&!EV.caches.some(o=>o.id===k[0]))evAddCache({id:k[0],x:k[1],z:k[2],y:k[3],nm:k[4],own:k[5],t:k[6]},true)}
+  if(Array.isArray(m.evf))for(const f of m.evf)if(f[7]>S.time&&!EV.fires.some(q=>q.key===f[0]))evTreeFire(f[0],f[1],f[2],f[3],f[4],f[5],f[6],f[7],f[8]==null?null:f[8])});
+onHook('netMsg',m=>{if(!m||typeof m.k!=='string'||m.k.slice(0,2)!=='e_'||!S||!P)return;const cl=NET.role==='client';
+  switch(m.k){
+   case 'e_warn':if(cl)evWarn();break;
+   case 'e_red':if(cl)evSetRed(!!m.on,m.ni|0,m.on?null:{sv:Array.isArray(m.sv)?m.sv:[],kills:m.kills||{}});break;
+   case 'e_wave':if(cl)evWaveMsg(m.w|0,typeof m.b==='number'?m.b:null);break;
+   case 'e_storm':if(cl)evSetStorm(!!m.on);break;
+   case 'e_bolt':if(cl)evBolt(m);break;
+   case 'e_crash':if(cl)evBuildCrash(m);break;
+   case 'e_crashEnd':if(cl&&CRASH&&(!m.id||CRASH.id===m.id))evRemoveCrash();break;
+   case 'e_cc':if(cl)evTakeCrate(m.c,m.i|0,true,String(m.nm||'A player').slice(0,16));break;
+   case 'e_cache':if(cl)evAddCache(m);break;
+   case 'e_cacheGone':if(cl)evRemoveCache(m.id);break;
+   case 'e_ccReq':if(NET.role==='host'&&m.from){const nm=String(m.nm||NET.names[m.from]||'A player').slice(0,16);if(evTakeCrate(m.c,m.i|0,true,nm)){netBroadcast({k:'e_cc',c:m.c,i:m.i|0,nm});sendTo(m.from,{k:'e_ccOk',c:m.c,i:m.i|0})}else sendTo(m.from,{k:'e_lootNo'})}break;
+   case 'e_cacheReq':if(NET.role==='host'&&m.from){const o=EV.caches.find(q=>q.id===m.id);if(o){evRemoveCache(o.id);netBroadcast({k:'e_cacheGone',id:o.id});sendTo(m.from,{k:'e_cacheOk',id:o.id})}else sendTo(m.from,{k:'e_lootNo'})}break;
+   case 'e_ccOk':if(cl){evTakeCrate(m.c,m.i|0,true,null);evCrashLoot(null)}break;
+   case 'e_cacheOk':if(cl){evRemoveCache(m.id);evCacheLoot(null)}break;
+   case 'e_lootNo':if(cl)feedMsg('Someone else got there first');break;
+  }});
+
+// ---- console helper for testing events (host / solo only) ----
+function evDebug(what){if(!S||NET.role==='client')return'host/solo only';const L=S.dayLen,d=Math.floor(S.time/L),p=S.time/L-d;
+  if(what==='red'){if(p<EVC.RM0&&p>=EVC.RM1){S.time=(d+EVC.RM0)*L+.5;EV.forceNi=d}else EV.forceNi=evNightIdx(S.time);return'Red Moon forced for night '+EV.forceNi}
+  if(what==='storm'){S.raining=true;S.rainT=150;S.rain=Math.max(S.rain||0,.7);EV.forceStorm=true;EV.stormRoll=-1;return'storm forced'}
+  if(what==='bolt'){if(!EV.storm){evSetStorm(true);netBroadcast({k:'e_storm',on:1})}evStrike();return'strike'}
+  if(what==='crash'){if(CRASH){const id=CRASH.id;evRemoveCrash();netBroadcast({k:'e_crashEnd',id})}EV.crashDay=d;EV.crashAt=-1;return evStartCrash()?'crash at '+Math.round(CRASH.x)+','+Math.round(CRASH.z):'no site found'}
+  if(what==='dawn'){if(!EV.red)return'no Red Moon';S.time=evDawn(EV.redNi)+.5;return'skipped to dawn'}
+  return'usage: evDebug("red"|"storm"|"bolt"|"crash"|"dawn")'}
+
 /* ================= RENDER ================= */
 const tmpC=new THREE.Color(),tmpC2=new THREE.Color();
 const SKY={dayTop:new THREE.Color('#4a82c4'),dayBot:new THREE.Color('#bcd2de'),setTop:new THREE.Color('#3b4f7a'),setBot:new THREE.Color('#e8a26a'),nightTop:new THREE.Color('#03050b'),nightBot:new THREE.Color('#080b12'),
