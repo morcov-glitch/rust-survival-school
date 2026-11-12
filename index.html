@@ -1386,21 +1386,7 @@ function update(dt){S.time+=dt;
   const turn=(keys.arrowleft?1:0)-(keys.arrowright?1:0);P.yaw+=turn*2.2*dt;P.pitch=clamp(P.pitch+((keys.arrowup?1:0)-(keys.arrowdown?1:0))*1.6*dt,-1.5,1.5);
   if(freeCursor()&&mouseIn&&mouseX>=0&&!mouseR){const ex=mouseX/innerWidth,ey=mouseY/innerHeight,Z=.18,ZT=.12,ZB=.07;const t=ex<Z?(Z-ex)/Z:ex>1-Z?-(ex-1+Z)/Z:0;const v=ey<ZT?(ZT-ey)/ZT:ey>1-ZB?-(ey-1+ZB)/ZB:0;const yv=Math.sign(t)*Math.pow(Math.abs(t),1.5)*2.8,pv=Math.sign(v)*Math.pow(Math.abs(v),1.5)*1.5;P.yaw+=yv*dt;P.pitch=clamp(P.pitch+pv*dt,-1.5,1.5);P.lookDX=(P.lookDX||0)-yv*dt/SENS*.5}
   /*MOVE_BEGIN*/
-  const gh0=groundH(P.x,P.z),deep=gh0<-1.45;P.swim=deep&&P.y<-.9;const inWater=P.y<-.4;
-  P.crouch=!!keys.c&&!P.swim&&P.onGround;P.eye=lerp(P.eye||1.62,P.crouch?1.05:1.62,Math.min(1,dt*12));
-  const fw=(keys.w?1:0)-(keys.s?1:0),st=(keys.d?1:0)-(keys.a?1:0);let sp=P.swim?(keys.shift?4:3):P.crouch?2.3:(keys.shift&&fw>0?8:5)*(inWater?.6:1);if(P.temp<0)sp*=.9;
-  const sx=Math.sin(P.yaw),cz=Math.cos(P.yaw);let mx=-sx*fw+cz*st,mz=-cz*fw-sx*st;const l=Math.hypot(mx,mz);
-  const tvx=l?mx/l*sp:0,tvz=l?mz/l*sp:0;const acc=P.swim?4:P.onGround?12:3;P.vx=lerp(P.vx,tvx,Math.min(1,acc*dt));P.vz=lerp(P.vz,tvz,Math.min(1,acc*dt));P.strafeV=lerp(P.strafeV||0,st*sp,Math.min(1,dt*8));
-  const ox=P.x,oz=P.z;P.x+=P.vx*dt;P.z+=P.vz*dt;const o={x:P.x,z:P.z};collide(o,.32,P.y);P.x=clamp(o.x,6,WS-6);P.z=clamp(o.z,6,WS-6);
-  const gh=groundH(P.x,P.z);
-  if(P.swim){const want=keys.c?-2.2:keys[' ']?2.2:(P.y<-1.35?1.6:-.4);P.vy=lerp(P.vy,want,Math.min(1,dt*3));P.y+=P.vy*dt;if(!keys.c&&!keys[' ']&&P.y>-1.42)P.y=lerp(P.y,-1.35+Math.sin(S.time*1.7)*.05,Math.min(1,dt*3));P.y=Math.max(P.y,gh+.05);P.onGround=false;P.airPeak=P.y;
-    if(l&&Math.random()<dt*2.2)sfx('splash',.18);if(P.y<-1.6)tip('dive','Underwater','Hold <b>C</b> to dive and <b>Space</b> to swim up. You can hold your breath for about 30 seconds before you start drowning.')}
-  else{const sup=Math.max(supportH(P.x,P.z,P.y),deep?-99:-1.3);P.vy-=22*dt;if(keys[' ']&&P.onGround&&!inWater&&!P.crouch){P.vy=7;P.onGround=false}
-    if(!P.onGround)P.airPeak=Math.max(P.airPeak===undefined?P.y:P.airPeak,P.y);P.y+=P.vy*dt;
-    if(P.y<=sup){if(!P.onGround){const h=(P.airPeak===undefined?P.y:P.airPeak)-sup;if(P.vy<-4)P.landT=Math.min(1,-P.vy/12);if(h>5&&!deep)fallDamage(h)}P.y=sup;P.vy=0;P.onGround=true;P.airPeak=P.y}else{P.onGround=P.y-sup<.05;if(P.onGround)P.airPeak=P.y}}
-  if(inWater&&!P.wasWater){sfx('splash',.8);burst(new V3(P.x,.05,P.z),['#cfe6f0','#9fc6d8'],16,2,3,9,.6)}P.wasWater=inWater;
-  if(P.y+(P.eye||1.62)<-.05){P.oxy=Math.max(0,(P.oxy===undefined?30:P.oxy)-dt);if(P.oxy<=0){P.hp-=5*dt;flashDmg(.3);if(P.hp<=0)return die('drown')}}else P.oxy=Math.min(30,(P.oxy===undefined?30:P.oxy)+dt*6);
-  const mv=Math.hypot(P.x-ox,P.z-oz);S.moved+=mv;if(keys.shift&&!P.crouch&&mv>0&&Math.random()<dt*4)noise(P.x,P.z,16);
+  const l=pkMove(dt);if(!P||!P.alive)return; // parkour module: stamina, climb, vault, slide, roll, grapnel (see pkMoveInner)
   /*MOVE_END*/
   // vitals
   const run=keys.shift&&l?1.6:1;updateTemp(dt);updateComfort(dt);updateAlarms(dt);const cold=P.temp<5;
@@ -1846,6 +1832,448 @@ const _sunV=new V3();
 function updateScreenFX(){const D=S.dayF||0;const el=$('#glare');const sd=skyU.sunDir.value;_sunV.copy(camera.position).addScaledVector(sd,500).project(camera);const fwd=new V3();camera.getWorldDirection(fwd);const dp=fwd.dot(sd);
   if(dp>0&&_sunV.z<1&&D>.05){const x=(_sunV.x*.5+.5)*innerWidth,y=(-_sunV.y*.5+.5)*innerHeight;el.style.left=x+'px';el.style.top=y+'px';el.style.opacity=(Math.pow(Math.max(0,dp),6)*D*(1-(S.rain||0))*.8).toFixed(3)}else el.style.opacity=0;
   const uw=camera.position.y<-.02;$('#uw').style.opacity=uw?.6:0;if(uw){scene.fog.color.set(0x0a3440);scene.fog.near=0;scene.fog.far=18}}
+
+/* ================= STAMINA PARKOUR KICK AND GRAPPLE ================= */
+// Stamina, ledge climbing, vaulting, sliding, kicking, landing rolls and the Grapnel Line.
+// pkMove(dt) owns the player movement block of update() (called between the MOVE markers).
+// Provides: useStamina(n), stamina(), P.stam, P.exhausted, item 'grapple'. Network kind: p_knock.
+const PKC={drain:9,jump:8,climb:12,vault:5,kick:15,slide:6,grapple:10,regen:20,delay:.8,recover:30,grRange:35,grSpeed:22};
+const PK={act:null,gr:null,airT:0,jumped:false,jbuf:9,spaceLock:false,boost:false,spentT:9,fullT:0,sprintD:0,sprintT:0,
+  kickCd:0,kickT:-1,kickDur:.42,kickDone:true,kickAir:false,kickSlide:false,kickFree:0,grCd:0,climbLock:0,slideCd:0,breathT:0,breathN:0,fallMul:1,
+  hintT:0,threatT:0,hookT:0,hookShown:false,ne:[],nb:[],skip:[],pushed:[],errT:-99,lootWrapped:false,
+  cs:{y:0,p:0,r:0,f:0},vmo:{x:0,y:0,z:0,rx:0,ry:0,rz:0},vmLow:0};
+const pkPerk=id=>typeof hasPerk==='function'&&!!hasPerk(id);
+function pkXP(tree,n,why){if(typeof gainXP==='function')try{gainXP(tree,n,why)}catch(err){console.error('gainXP',err)}}
+function pkTip(key,title,html,urgent){if(!S||!S.shown||S.shown[key])return;if(!urgent){const el=$('#tip');if(el&&el.classList&&!el.classList.contains('hidden'))return}tip(key,title,html)}
+function pkKF(u,k){if(u<=k[0][0])return k[0][1];for(let i=1;i<k.length;i++)if(u<=k[i][0]){const a=k[i-1],b=k[i],t=(u-a[0])/(b[0]-a[0]);return a[1]+(b[1]-a[1])*t*t*(3-2*t)}return k[k.length-1][1]}
+function pkDustCols(){const s=typeof surface==='function'?surface():'grass';return s==='sand'?['#d8c79a','#c9b483','#e6d9b2']:s==='wood'?['#a39d90','#8d877b','#bdb6a8']:s==='gravel'?['#9a958c','#7f7a72','#b3aea4']:['#6e5a3e','#7d6a4a','#8f7c5a']}
+
+/* ---- stamina ---- */
+function pkReset(){PK.act=null;PK.gr=null;PK.airT=0;PK.jumped=false;PK.jbuf=9;PK.spaceLock=false;PK.boost=false;PK.spentT=9;PK.fullT=0;PK.sprintT=0;
+  PK.kickT=-1;PK.kickCd=0;PK.kickDone=true;PK.grCd=0;PK.climbLock=0;PK.slideCd=0;PK.breathN=0;PK.fallMul=1;PK.pushed.length=0;
+  const c=PK.cs;c.y=c.p=c.r=c.f=0;PK.vmLow=0;const v=PK.vmo;v.x=v.y=v.z=v.rx=v.ry=v.rz=0;
+  if(P){P.stam=100;P.exhausted=false;P.camYOff=0;P.camPitchOff=0;P.camRoll=0;P.fovAdd=0;P.vmOff=v}}
+function pkInit(){if(!(P.stam>=0))P.stam=100;if(P.exhausted===undefined)P.exhausted=false}
+function stamina(){return P&&P.stam>=0?P.stam:100}
+function pkCostMul(){return pkPerk('pw_stamina')?.85:1}
+function pkSpend(n){if(!P)return;pkInit();P.stam=Math.max(0,P.stam-n*pkCostMul());PK.spentT=0;PK.fullT=0;if(P.stam<=0&&!P.exhausted)pkExhaust()}
+function useStamina(n){if(!P||!P.alive)return false;pkInit();if(!(n>0))return true;if(P.stam<1)return false;pkSpend(n);return true}
+function pkExhaust(){P.exhausted=true;PK.breathT=.3;
+  pkTip('pk_stam','Out of breath','Your <b>stamina</b> (yellow bar) ran out: no sprinting until it refills to 30%. Sprinting, jumping, climbing, kicking and heavy swings all cost stamina, and it recovers quickly once you ease off for a moment.',true)}
+function pkStamTick(dt,sprinting){
+  if(sprinting){P.stam=Math.max(0,P.stam-PKC.drain*(pkPerk('ag_sprint')?.8:1)*pkCostMul()*dt);PK.spentT=0;if(P.stam<=0&&!P.exhausted)pkExhaust()}
+  else{PK.spentT+=dt;if(PK.spentT>PKC.delay&&P.stam<100)P.stam=Math.min(100,P.stam+PKC.regen*(pkPerk('pw_stamina')?1.3:1)*dt)}
+  if(P.exhausted&&P.stam>=PKC.recover){P.exhausted=false;PK.breathN=2}
+  PK.fullT=P.stam>=100?PK.fullT+dt:0;
+  if(P.exhausted||PK.breathN>0){PK.breathT-=dt;if(PK.breathT<=0){PK.breathT=1.1;sfx('pk_breath',P.exhausted?.6:.35);if(!P.exhausted)PK.breathN--}}}
+
+/* ---- world queries (boxes, solid ents incl. boulder/node tops, terrain) ---- */
+const PK_DOME={boulder:1,stone:1,metal:1,sulfur:1};
+function pkEntH(e){return e.t==='tree'?(e.ph||8):PK_DOME[e.t]&&e.t!=='boulder'?Math.min(e.ph||1.2,1.2):(e.ph||0)}
+function pkEntTop(e,x,z){if(!e.solid||e.t==='tree')return -1e9;const H=pkEntH(e);if(!(H>0))return -1e9;const dx=x-e.x,dz=z-e.z,d2=dx*dx+dz*dz;
+  if(PK_DOME[e.t]){const R2=e.r*e.r*1.2544;if(d2>=R2)return -1e9;return e.y+H*Math.sqrt(1-d2/R2)}
+  const rr=e.r+.08;return d2<rr*rr?e.y+H:-1e9}
+function pkTopBelow(x,z,yMax,rs){let t=groundH(x,z);if(t>yMax)return t;
+  for(const b of PK.nb)if(b.maxy<=yMax&&b.maxy>t&&x>b.minx-rs&&x<b.maxx+rs&&z>b.minz-rs&&z<b.maxz+rs)t=b.maxy;
+  for(const e of PK.ne){const et=pkEntTop(e,x,z);if(et>t&&et<=yMax)t=et}return t}
+function pkBlocked(x,z,y0,y1,rs){if(groundH(x,z)>y0)return true;
+  for(const b of PK.nb)if(b.maxy>y0&&b.miny<y1&&x>b.minx-rs&&x<b.maxx+rs&&z>b.minz-rs&&z<b.maxz+rs)return true;
+  for(const e of PK.ne){if(e.t==='tree'){const rr=e.r+.05+rs,dx=x-e.x,dz=z-e.z;if(dx*dx+dz*dz<rr*rr&&e.y+pkEntH(e)>y0&&e.y<y1)return true;continue}
+    const et=pkEntTop(e,x,z);if(et>y0&&e.y-.2<y1)return true}
+  return false}
+function pkSupport(x,z,feet){let s=supportH(x,z,feet);for(const e of PK.ne){const t=pkEntTop(e,x,z);if(t>s&&t<=feet+.6)s=t}return s}
+function pkHeadroom(x,z,feet){for(const b of nearBoxes(x,z,.6))if(b.miny<feet+1.78&&b.maxy>feet+1.02&&x>b.minx-.28&&x<b.maxx+.28&&z>b.minz-.28&&z<b.maxz+.28)return false;return true}
+// player collision: like collide() but lets you stand on low solid ents (crates, barrels, boulders, rock nodes)
+function pkCollideP(o,feet,hgt){const sk=PK.skip;sk.length=0;
+  for(const e of PK.ne)if(e.solid&&e.t!=='tree'&&e.y+pkEntH(e)<=feet+.55){sk.push(e,e.solid);e.solid=0}
+  try{collide(o,.32,feet,hgt)}finally{for(let i=0;i<sk.length;i+=2)sk[i].solid=sk[i+1]}}
+// ledge 'lo..hi' m above the feet, ahead along (fx,fz), with head room on top and a clear path up
+function pkFindLedge(fx,fz,air,lo,hi){const feet=P.y;if(lo===undefined)lo=air?.45:.9;hi=hi||3;PK.nb=nearBoxes(P.x,P.z,2.9);
+  let prev=.18;
+  for(let d=.32;d<=1.31;d+=.14){const x=P.x+fx*d,z=P.z+fz*d;const top=pkTopBelow(x,z,feet+hi,.06),rel=top-feet;
+    if(rel>=lo&&rel<=hi){
+      if(pkBlocked(x,z,top+.04,top+1.75,.12))return null;
+      if(pkBlocked(P.x,P.z,feet+1.6,top+1.8,.2))return null;
+      for(let d2=.32;d2<d-.01;d2+=.14)if(pkBlocked(P.x+fx*d2,P.z+fz*d2,feet+.55,top+1.75,.06))return null;
+      let a=prev,b=d;for(let i=0;i<4;i++){const m=(a+b)*.5;if(pkTopBelow(P.x+fx*m,P.z+fz*m,feet+hi,.02)>=top-.15)b=m;else a=m}
+      for(const ex of [.42,.3,.2,.12]){const ld=b+ex,lx=P.x+fx*ld,lz=P.z+fz*ld;if(lx<6||lx>WS-6||lz<6||lz>WS-6)continue;
+        const lt=pkTopBelow(lx,lz,top+.35,.16);if(Math.abs(lt-top)>.3)continue;
+        if(pkBlocked(lx,lz,lt+.05,lt+1.75,.25))continue;
+        return{top:lt,ex:P.x+fx*b,ez:P.z+fz*b,ey:top,lx,lz,h:lt-feet,fx,fz}}
+      return null}
+    if(rel>hi||pkBlocked(x,z,feet+.55,feet+1.7,.06))return null;
+    prev=d}
+  return null}
+// low obstacle (0.45-1.3 m) with free ground right behind it
+function pkFindVault(fx,fz,maxD){const feet=P.y;PK.nb=nearBoxes(P.x,P.z,3.4);
+  let front=-1,top=0;
+  for(let d=.3;d<=maxD;d+=.1){const x=P.x+fx*d,z=P.z+fz*d;if(pkBlocked(x,z,feet+.28,feet+.95,.05)){front=d;top=pkTopBelow(x,z,feet+1.9,.05);break}}
+  if(front<0)return null;const h=top-feet;if(h<.45||h>1.32)return null;
+  const x0=P.x+fx*front,z0=P.z+fz*front;
+  if(pkBlocked(x0,z0,top+.04,top+1.3,.08))return null;
+  if(pkBlocked(P.x,P.z,feet+1.6,top+1.6,.2))return null;
+  for(let d=front+.1;d<=front+1.46;d+=.1){const x=P.x+fx*d,z=P.z+fz*d,t=pkTopBelow(x,z,top+.08,.05);
+    if(t>=top-.22){if(pkBlocked(x,z,t+.04,t+1.2,.06))return null;continue}
+    if(t<feet-2.2)return null;
+    const ld=d+.34,lx=P.x+fx*ld,lz=P.z+fz*ld;if(lx<6||lx>WS-6||lz<6||lz>WS-6)return null;
+    const lt=pkTopBelow(lx,lz,feet+.5,.22);if(lt<feet-2.2||lt>feet+.5)return null;
+    if(pkBlocked(lx,lz,lt+.05,lt+1.75,.27))return null;
+    return{x0:P.x,z0:P.z,y0:feet,lx,lz,ly:lt,top,front,back:d,total:ld,fx,fz}}
+  return null}
+
+/* ---- moves ---- */
+function pkStartClimb(L,quick){const dur=(pkPerk('ag_climb')?.35:.55)*(quick?.8:1)*(P.exhausted?1.3:1)*(L.h<1.25?.82:1);
+  PK.act={type:'climb',t:0,dur,x0:P.x,y0:P.y,z0:P.z,top:L.top,lx:L.lx,lz:L.lz,ex:L.ex,ez:L.ez,ey:L.ey,fx:L.fx,fz:L.fz,rx:-L.fz,rz:L.fx,h:L.h};
+  P.vx=P.vz=P.vy=0;P.onGround=false;P.airPeak=P.y;PK.boost=false;
+  pkSpend(PKC.climb);sfx('pk_grunt',.55);pkXP('agility',8,'Climb');noise(P.x,P.z,10);
+  pkTip('pk_climb','Climbing','Press <b>Space</b> facing a ledge up to about 3 m high to grab it and pull yourself up. Jump first to reach higher, and keep holding Space to chain climbs up stacked ledges.')}
+function pkStartVault(V,sprint){const sp=Math.max(Math.hypot(P.vx,P.vz),sprint?6:4.6),dur=clamp(V.total/sp,.3,.46);
+  let H=.25;for(const f of [V.front/V.total,V.back/V.total]){const b=lerp(V.y0,V.ly,f),need=(V.top+.14-b)/Math.max(.2,4*f*(1-f));if(need>H)H=need}
+  PK.act={type:'vault',t:0,dur,V,H:Math.min(H,1.9),sp,hx:V.x0+V.fx*V.front+V.fz*.16,hz:V.z0+V.fz*V.front-V.fx*.16,hy:V.top};
+  P.vy=0;P.onGround=false;PK.boost=false;pkSpend(PKC.vault);sfx('pk_vault',.6);pkXP('agility',4,'Vault');noise(P.x,P.z,10)}
+function pkStartSlide(hs){PK.act={type:'slide',t:0,dur:.8,dx:P.vx/hs,dz:P.vz/hs,v0:Math.max(hs,7.6)*1.22,air:0,dustT:0};
+  pkSpend(PKC.slide);PK.slideCd=.45;sfx('pk_slide',.5);pkXP('agility',3,'Slide');noise(P.x,P.z,12)}
+function pkStartRoll(sup){let dx=P.vx,dz=P.vz;const s=Math.hypot(dx,dz);if(s<.6){dx=-Math.sin(P.yaw);dz=-Math.cos(P.yaw)}else{dx/=s;dz/=s}
+  PK.act={type:'roll',t:0,dur:.62,dx,dz,v0:clamp(s*.85,4.2,9)};
+  sfx('pk_roll',.7);P.camShake=Math.max(P.camShake||0,.16);noise(P.x,P.z,12);burst(new V3(P.x,sup+.08,P.z),pkDustCols(),14,2.2,1.1,6,.7)}
+function pkLand(h,deep,inWater,sup){if(deep)return;
+  if(h>4&&!inWater&&(keys.c||pkPerk('ag_roll'))){pkStartRoll(sup);if(h>12){PK.fallMul=.5;try{fallDamage(h)}finally{PK.fallMul=1}}else if(h>5)feedMsg('Rolled: no fall damage');return}
+  if(h>5)fallDamage(h);
+  if(h>4)pkTip('pk_roll','Landing roll','Hold <b>C</b> as you land from a big drop to <b>roll</b> out of it: no fall damage up to about 12 m, and half damage above that.',h>5);
+  if(h>2.4){P.camShake=Math.max(P.camShake||0,Math.min(.35,h*.035));sfx('pk_land',Math.min(.7,.2+h*.05));if(h>3.5)burst(new V3(P.x,sup+.05,P.z),pkDustCols(),8,1.6,.8,6,.5)}}
+function pkScripted(A,dt,ox,oz){A.t+=dt;const u=Math.min(1,A.t/A.dur);
+  if(A.type==='climb'){const q=Math.min(1,u/.62);P.y=lerp(A.y0,A.top,1-Math.pow(1-q,2.2));const uh=smooth(.34,1,u);P.x=lerp(A.x0,A.lx,uh);P.z=lerp(A.z0,A.lz,uh);if(!A.s2&&u>.5){A.s2=1;sfx('pk_pull',.45)}}
+  else{const V=A.V,uh=u*.8+smooth(0,1,u)*.2;P.x=lerp(V.x0,V.lx,uh);P.z=lerp(V.z0,V.lz,uh);P.y=lerp(V.y0,V.ly,uh)+A.H*4*uh*(1-uh)}
+  const idt=1/Math.max(dt,1e-4);P.vx=(P.x-ox)*idt;P.vz=(P.z-oz)*idt;P.vy=0;P.onGround=false;P.airPeak=P.y;
+  if(u>=1)pkEndScripted(A)}
+function pkEndScripted(A){PK.act=null;PK.airT=0;PK.jumped=false;PK.climbLock=.14;PK.spaceLock=!!keys[' '];PK.jbuf=9;
+  if(A.type==='climb'){P.x=A.lx;P.z=A.lz;P.y=A.top;P.vx=A.fx*1.4;P.vz=A.fz*1.4;sfx('step',.4)}
+  else{const V=A.V;P.x=V.lx;P.z=V.lz;P.y=V.ly;P.vx=V.fx*A.sp*.95;P.vz=V.fz*A.sp*.95;sfx('step',.5);
+    pkTip('pk_vault','Vaulting','Sprint into a low fence, crate or barrel to vault it without breaking stride, or tap <b>Space</b> in front of it.')}
+  P.vy=0;P.onGround=true;P.airPeak=P.y}
+
+/* ---- kick ---- */
+function pkKick(){if(PK.kickCd>0||PK.kickT>=0||P.swim)return;const A=PK.act;if(A&&A.type!=='slide')return;
+  const grab=P.grabbed;
+  if(!grab&&P.stam<1){feedMsg('Too winded to kick');sfx('pk_breath',.5);PK.kickCd=.35;return}
+  pkSpend(PKC.kick);PK.kickT=0;PK.kickDone=false;PK.kickCd=.55;
+  const G=PK.gr;PK.kickAir=!P.onGround||!!(G&&G.phase==='pull');PK.kickSlide=!!(A&&A.type==='slide');PK.kickDur=PK.kickAir?.5:.42;PK.kickFree=0;
+  if(grab){if(typeof breakGrab==='function')try{breakGrab()}catch(err){console.error('breakGrab',err)}P.grabbed=null;PK.kickFree=1}
+  sfx('pk_kick',.5);if(PK.kickAir){P.vx-=Math.sin(P.yaw)*2.2;P.vz-=Math.cos(P.yaw)*2.2}}
+function pkKickTick(dt){if(PK.kickT<0)return;PK.kickT+=dt;if(!PK.kickDone&&PK.kickT>=PK.kickDur*.3){PK.kickDone=true;pkKickHit()}if(PK.kickT>=PK.kickDur)PK.kickT=-1}
+function pkKickHit(){const fx=-Math.sin(P.yaw),fz=-Math.cos(P.yaw),air=PK.kickAir,perk=pkPerk('pw_kick'),range=air?2.8:2.3,c=[];
+  const test=t=>{if(!t||t.dead||t===P||t.t==='rplayer'||typeof t.x!=='number')return;const dx=t.x-P.x,dz=t.z-P.z,d=Math.hypot(dx,dz);if(d>range+(t.r>.6?t.r-.4:0)||d<.02)return;
+    const dot=(dx*fx+dz*fz)/d;if(dot<(d<.9?.1:.55))return;const dy=(t.y||0)-P.y;if(dy>1.3||dy<-1.7)return;c.push({t,d,dx:dx/d,dz:dz/d})};
+  for(const n of npcs)test(n);for(const a of animals)test(a);
+  if(typeof zombies!=='undefined'&&zombies&&zombies.length)for(const z of zombies)test(z);
+  c.sort((a,b)=>a.d-b.d);const n=Math.min(c.length,air?3:2);
+  const dmg=12*(air?2:1)*(PK.kickSlide?1.35:1)*(perk?2:1),pow=(air?11:7)*(PK.kickSlide?1.25:1)*(perk?1.8:1)*(PK.kickFree?1.3:1);
+  for(let i=0;i<n;i++){const h=c[i],t=h.t;pkKnock(t,h.dx,h.dz,pow*(i?.75:1));damageAny(t,dmg*(i?.7:1),'player',{wname:air?'Dropkick':'Kick'});
+    burst(new V3(t.x,(t.y||P.y)+(t.t==='npc'||t.t==='z'?1.1:.6),t.z),CHIP.flesh,7,2.2,1.4)}
+  if(n){sfx('pk_kickhit',air?.95:.8);hitmark();P.camShake=Math.max(P.camShake||0,air?.38:.22);noise(P.x,P.z,18);pkXP('power',2,'Kick');
+    if(air){P.vx-=fx*4;P.vz-=fz*4;P.vy=Math.max(P.vy,3);PK.boost=true;if(PK.gr&&PK.gr.phase==='pull')pkGrappleRelease(false)}return}
+  const a=aim(2.2);
+  if(a.kind==='ent'&&a.e){const e=a.e;
+    if(ENT_HIT[e.t]){ENT_HIT[e.t](e,dmg,'player',a.point,{melee:true,id:'kick'});sfx('pk_kickhit',.6,a.point);P.camShake=Math.max(P.camShake||0,.15);return}
+    if(e.t==='barrel'){pkKickBarrel(e,a.point);return}
+    sfx('thud',.45,a.point);burst(a.point,CHIP.build,4,1.4,1);P.camShake=Math.max(P.camShake||0,.1);return}
+  if(a.kind==='piece'||a.kind==='door'||a.kind==='dep'){sfx('thud',.5,a.point);P.camShake=Math.max(P.camShake||0,.1)}}
+function pkKickBarrel(e,pt){e.hp--;e.shake=.3;netEnt(e);sfx('pk_kickhit',.6,pt);burst(pt,CHIP.barrel,6,2,1.5);P.camShake=Math.max(P.camShake||0,.15);noise(P.x,P.z,18);
+  if(e.hp<=0){debris(new V3(e.x,e.y+.5,e.z),e.obj.material===MAT.barrelB?'#2d5d8c':'#9b3a2a',8,.2,'box');netGone(e,'barrel');lootBarrel(e);burst(new V3(e.x,e.y+.5,e.z),CHIP.barrel,24,4,3);sfx('crack',.7);world.remove(e.obj);ents=ents.filter(x=>x!==e);respawnLater('barrel',70)}}
+// knockback: extension types (infected) use knockback(); npcs/animals get a short smooth shove on the host
+function pkKnock(t,dx,dz,pow){if(KNOCK_EXT[t.t]){knockback(t,dx,dz,pow);return}if(t.t!=='npc'&&!ANIM[t.t])return;
+  if(NET.role==='client'){hostSend({k:'p_knock',id:t.id,a:t.t==='npc'?0:1,dx:+dx.toFixed(3),dz:+dz.toFixed(3),p:+pow.toFixed(2)});return}
+  pkPush(t,dx,dz,pow)}
+function pkPush(t,dx,dz,pow){t._pkKb={vx:dx*pow*.95,vz:dz*pow*.95,t:.3};if(!PK.pushed.includes(t))PK.pushed.push(t)}
+function pkPushTick(dt){if(!PK.pushed.length)return;
+  for(const t of PK.pushed){const k=t._pkKb;if(!k||k.t<=0||t.dead)continue;const f=k.t/.3,o={x:t.x+k.vx*f*dt,z:t.z+k.vz*f*dt,blocked:0};
+    collide(o,.45,t.y,1.6);t.x=clamp(o.x,8,WS-8);t.z=clamp(o.z,8,WS-8);t.y=supportH(t.x,t.z,t.y+.5,.45);k.t-=dt}
+  PK.pushed=PK.pushed.filter(t=>t._pkKb&&t._pkKb.t>0&&!t.dead)}
+
+/* ---- grapnel line ---- */
+function pkRay(o,d,maxT){const ox=o.x,oy=o.y,oz=o.z,ex=ox+d.x*maxT,ey=oy+d.y*maxT,ez=oz+d.z*maxT;
+  const x0=Math.min(ox,ex)-.5,x1=Math.max(ox,ex)+.5,y0=Math.min(oy,ey)-.5,y1=Math.max(oy,ey)+.5,z0=Math.min(oz,ez)-.5,z1=Math.max(oz,ez)+.5;
+  let best=maxT+1,res=null;
+  for(const b of boxes){if(b.maxx<x0||b.minx>x1||b.maxy<y0||b.miny>y1||b.maxz<z0||b.minz>z1)continue;const t=rayBox(o,d,b,best);if(t!==null&&t>.05&&t<best){best=t;res={kind:'box',box:b}}}
+  for(const e of ents){if(!e.solid||e.x<x0-4||e.x>x1+4||e.z<z0-4||e.z>z1+4)continue;const tree=e.t==='tree',top=e.y+pkEntH(e);
+    const t=rayCyl(o,d,e.x,e.z,tree?e.r+.12:e.r,e.y-.2,top,best);if(t!==null&&t>.05&&t<best){best=t;res={kind:tree?'tree':'ent',ent:e,top}}}
+  const tt=rayTerrain(o,d,Math.min(best,maxT));if(tt!==null&&tt<best){best=tt;res={kind:'terrain'}}
+  if(!res||!(best<=maxT))return null;
+  res.t=best;res.x=ox+d.x*best;res.y=oy+d.y*best;res.z=oz+d.z*best;
+  if(res.kind==='terrain'){if(res.y<.08&&groundH(res.x,res.z)<0)return null;res.face='top'}
+  else if(res.kind==='box'){const b=res.box;res.face=Math.abs(res.y-b.maxy)<.03?'top':Math.abs(res.y-b.miny)<.03?'bottom':'side'}
+  else res.face=Math.abs(res.y-res.top)<.03?'top':'side';
+  return res}
+function pkGrappleUse(){if(PK.gr||PK.grCd>0||!P.alive)return;mouseL=false;
+  if(P.swim){feedMsg('Can\'t fire the line while swimming');PK.grCd=.5;return}
+  if(P.grabbed){PK.grCd=.3;return}
+  const A=PK.act;if(A&&A.type!=='slide')return;
+  if(P.stam<5){feedMsg('Too winded to fire the line');sfx('pk_breath',.5);PK.grCd=.6;return}
+  const r=aimRay(),o=r.o,d=r.d,hit=pkRay(o,d,PKC.grRange);
+  PK.grCd=1.2;startAnim('shoot',.4);sfx('pk_fire',.65);noise(P.x,P.z,12);if(A)PK.act=null;
+  const G={phase:'fly',t:0,trav:0,ox:o.x,oy:o.y,oz:o.z,dx:d.x,dy:d.y,dz:d.z,len:PKC.grRange,hit:false};
+  if(hit){G.len=hit.t;if(hit.t>=2.2&&hit.face!=='bottom'){G.hit=true;G.ax=hit.x;G.ay=hit.y;G.az=hit.z;G.kind=hit.kind;G.face=hit.face;G.box=hit.box||null}}
+  PK.gr=G;
+  pkTip('pk_grapple','Grapnel Line','Aim at a roof edge, rock or tree within 35 m and <b>left click</b>: the line hauls you in and pulls you over the edge when it can. <b>Space</b> lets go and keeps your momentum, <b>R</b> just lets go.',true)}
+function pkGrappleAttach(G){G.phase='pull';G.pt=0;G.stuck=0;G.lastD=-1;G.spd=Math.max(7,Math.hypot(P.vx,P.vy,P.vz));
+  G.px=G.ax;G.py=G.ay;G.pz=G.az;
+  if(G.kind==='box'&&G.face==='side'&&G.box){const gap=G.box.maxy-G.ay;if(gap>0&&gap<3.4){const hx=P.x-G.ax,hz=P.z-G.az,hl=Math.hypot(hx,hz)||1;G.py=G.box.maxy+.35;G.px=G.ax+hx/hl*.25;G.pz=G.az+hz/hl*.25}}
+  else if(G.face==='top')G.py+=.9;
+  pkSpend(PKC.grapple);P.onGround=false;P.airPeak=P.y;PK.boost=false;
+  sfx('pk_clank',.85,{x:G.ax,z:G.az});P.camShake=Math.max(P.camShake||0,.12);noise(G.ax,G.az,20);
+  const cols=G.kind==='tree'?CHIP.tree:G.kind==='terrain'?CHIP.dirt:['#fff3c0','#ffd27a','#b0aca4'];burst(new V3(G.ax,G.ay,G.az),cols,8,2.2,1.6,9,.4);
+  pkXP('agility',5,'Grapple')}
+function pkGrappleRetract(G,hx,hy,hz){G.phase='retract';G.rt=0;G.hx=hx;G.hy=hy;G.hz=hz}
+function pkGrappleArrive(G){const hx=G.px-P.x,hz=G.pz-P.z,hl=Math.hypot(hx,hz);let fx=-Math.sin(P.yaw),fz=-Math.cos(P.yaw);if(hl>.15){fx=hx/hl;fz=hz/hl}
+  pkGrappleRetract(G,G.ax,G.ay,G.az);PK.ne=nearEnts(P.x,P.z,7).filter(e=>e.solid);
+  const L=pkFindLedge(fx,fz,true,.15,3);
+  if(L)pkStartClimb(L,true);else{P.vy=Math.max(P.vy*.35,3.8);P.vx*=.75;P.vz*=.75;PK.boost=true;P.airPeak=P.y}}
+function pkGrappleRelease(jump){const G=PK.gr;if(!G||G.phase==='retract')return;
+  if(G.phase==='pull'){if(jump){P.vy=Math.max(P.vy,0)+5.2;PK.spaceLock=true;PK.jbuf=9}PK.boost=true;P.airPeak=P.y;pkGrappleRetract(G,G.ax,G.ay,G.az)}
+  else pkGrappleRetract(G,G.ox+G.dx*G.trav,G.oy+G.dy*G.trav,G.oz+G.dz*G.trav)}
+function pkGrappleTick(dt){const G=PK.gr;if(!G)return;G.t+=dt;
+  if(G.phase==='fly'){G.trav=Math.min(G.len,G.trav+95*dt);
+    if(G.trav>=G.len){if(G.hit)pkGrappleAttach(G);else{const hx=G.ox+G.dx*G.len,hy=G.oy+G.dy*G.len,hz=G.oz+G.dz*G.len;pkGrappleRetract(G,hx,hy,hz);sfx('pk_miss',.4,{x:hx,z:hz})}}}
+  else if(G.phase==='retract'){G.rt+=dt*2.6;if(G.rt>=1)PK.gr=null}
+  else{G.pt+=dt;if(P.swim){pkGrappleRelease(false);return}
+    const D=Math.hypot(G.px-P.x,G.py-(P.y+1),G.pz-P.z);
+    if(G.lastD>=0){if(G.lastD-D<(G.spd||7)*dt*.3)G.stuck+=dt;else G.stuck=0}G.lastD=D;
+    if(D<1.55||G.stuck>.32||G.pt>3.2)pkGrappleArrive(G);
+    else if(keyPressed(' '))pkGrappleRelease(true);
+    else if(G.pt>.25&&Math.floor(G.pt*4)!==Math.floor((G.pt-dt)*4))sfx('pk_reel',.2)}}
+
+/* ---- movement (replaces the core movement block) ---- */
+function pkMove(dt){try{return pkMoveInner(dt)}catch(err){if(S.time-PK.errT>5){PK.errT=S.time;console.error('parkour move',err)}
+  PK.act=null;PK.gr=null;const s=supportH(P.x,P.z,P.y);P.vy=(P.vy||0)-22*dt;P.y+=P.vy*dt;if(P.y<=s){P.y=s;P.vy=0;P.onGround=true}return 0}}
+function pkMoveInner(dt){pkInit();
+  const gh0=groundH(P.x,P.z),deep=gh0<-1.45;P.swim=deep&&P.y<-.9;const inWater=P.y<-.4;
+  PK.ne=nearEnts(P.x,P.z,7).filter(e=>e.solid);
+  PK.kickCd=Math.max(0,PK.kickCd-dt);PK.slideCd=Math.max(0,PK.slideCd-dt);PK.climbLock=Math.max(0,PK.climbLock-dt);PK.grCd=Math.max(0,PK.grCd-dt);
+  P.landT=Math.max(0,(P.landT||0)-dt*2.4);
+  if(keyPressed(' '))PK.jbuf=0;else PK.jbuf+=dt;if(!keys[' '])PK.spaceLock=false;
+  const held=!!P.grabbed;
+  const fw=held?0:(keys.w?1:0)-(keys.s?1:0),st=held?0:(keys.d?1:0)-(keys.a?1:0);
+  const sx=Math.sin(P.yaw),cz=Math.cos(P.yaw),fx=-sx,fz=-cz;
+  const mx=-sx*fw+cz*st,mz=-cz*fw-sx*st;const l=Math.hypot(mx,mz);
+  const ox=P.x,oz=P.z;
+  if(keyPressed('f'))pkKick();
+  pkKickTick(dt);pkGrappleTick(dt);
+  let A=PK.act,sprinting=false;
+  if(A&&(A.type==='climb'||A.type==='vault')){pkScripted(A,dt,ox,oz);P.crouch=false;P.eye=lerp(P.eye||1.62,1.62,Math.min(1,dt*12));P.strafeV=lerp(P.strafeV||0,0,Math.min(1,dt*8))}
+  else{
+    const G=PK.gr,pulling=!!(G&&G.phase==='pull'),hs=Math.hypot(P.vx,P.vz);
+    const sprintKey=keys.shift&&fw>0&&!P.swim&&!held;
+    if(!A&&!pulling&&P.onGround&&!inWater&&sprintKey&&!P.exhausted&&keyPressed('c')&&hs>5.6&&PK.slideCd<=0&&P.stam>=1){pkStartSlide(hs);A=PK.act}
+    const sl=!!(A&&A.type==='slide'),rl=!!(A&&A.type==='roll');
+    let cr=!!keys.c&&!P.swim&&P.onGround;
+    if(!cr&&P.crouch&&P.onGround&&!P.swim&&!pkHeadroom(P.x,P.z,P.y))cr=true;
+    P.crouch=(cr||sl||rl)&&!P.swim;
+    P.eye=lerp(P.eye||1.62,sl?.82:P.crouch?1.05:1.62,Math.min(1,dt*(sl?15:12)));
+    const canSprint=sprintKey&&!P.crouch&&!P.exhausted;
+    let sp=P.swim?(keys.shift?4:3):P.crouch?2.3:(canSprint?8*(pkPerk('ag_sprint')?1.12:1):5)*(inWater?.6:1);if(P.temp<0)sp*=.9;
+    let tvx=l?mx/l*sp:0,tvz=l?mz/l*sp:0,acc=P.swim?4:P.onGround?12:(keys.shift?4.5:3);
+    if(sl){A.t+=dt;const u=Math.min(1,A.t/A.dur),ang=Math.atan2(A.dx,A.dz),da=clamp(((Math.atan2(fx,fz)-ang+Math.PI*3)%(Math.PI*2))-Math.PI,-1.1*dt,1.1*dt);
+      A.dx=Math.sin(ang+da);A.dz=Math.cos(ang+da);const s=A.v0*(1-.66*u*u);tvx=A.dx*s;tvz=A.dz*s;acc=24;
+      A.dustT-=dt;if(A.dustT<=0&&P.onGround){A.dustT=.05;burst(new V3(P.x+R(-.25,.25),P.y+.04,P.z+R(-.25,.25)),pkDustCols(),2,1.2,.7,4,.45)}
+      A.air=P.onGround?0:A.air+dt;if(u>=1||A.air>.2)PK.act=null}
+    else if(rl){A.t+=dt;const u=Math.min(1,A.t/A.dur),s=A.v0*(1-.5*u);tvx=A.dx*s;tvz=A.dz*s;acc=22;if(u>=1)PK.act=null}
+    else if(pulling){let dx=G.px-P.x,dy=G.py-(P.y+1),dz=G.pz-P.z;const D=Math.hypot(dx,dy,dz)||1;dx/=D;dy/=D;dz/=D;
+      G.spd=Math.min(PKC.grSpeed,(G.spd||7)+60*dt);const up=3.4*clamp(1-G.pt/.45,0,1)*(dy<.6?1:.25);
+      tvx=dx*G.spd;tvz=dz*G.spd;acc=9;P.vy=lerp(P.vy,dy*G.spd+up,Math.min(1,dt*9))}
+    else if(!P.onGround&&!P.swim&&PK.boost){const cs=Math.hypot(P.vx,P.vz);if(cs>sp+.4&&tvx*P.vx+tvz*P.vz>=0)acc=1.1}
+    P.vx=lerp(P.vx,tvx,Math.min(1,acc*dt));P.vz=lerp(P.vz,tvz,Math.min(1,acc*dt));P.strafeV=lerp(P.strafeV||0,st*sp,Math.min(1,dt*8));
+    P.x+=P.vx*dt;P.z+=P.vz*dt;const o={x:P.x,z:P.z,blocked:0};pkCollideP(o,P.y,sl?1:P.crouch?1.25:1.75);P.x=clamp(o.x,6,WS-6);P.z=clamp(o.z,6,WS-6);
+    if(sl&&PK.act===A&&o.blocked&&Math.hypot(P.x-ox,P.z-oz)<2.2*dt){PK.act=null;P.camShake=Math.max(P.camShake||0,.12);sfx('thud',.3)}
+    const gh=groundH(P.x,P.z);
+    if(P.swim){if(PK.act&&(sl||rl))PK.act=null;if(pulling)pkGrappleRelease(false);
+      const want=keys.c?-2.2:keys[' ']?2.2:(P.y<-1.35?1.6:-.4);P.vy=lerp(P.vy,want,Math.min(1,dt*3));P.y+=P.vy*dt;if(!keys.c&&!keys[' ']&&P.y>-1.42)P.y=lerp(P.y,-1.35+Math.sin(S.time*1.7)*.05,Math.min(1,dt*3));P.y=Math.max(P.y,gh+.05);P.onGround=false;P.airPeak=P.y;
+      if(l&&Math.random()<dt*2.2)sfx('splash',.18);if(P.y<-1.6)tip('dive','Underwater','Hold <b>C</b> to dive and <b>Space</b> to swim up. You can hold your breath for about 30 seconds before you start drowning.')}
+    else{const sup=Math.max(pkSupport(P.x,P.z,P.y),deep?-99:-1.3);if(!pulling)P.vy-=22*dt;
+      let started=false;const wantSpace=!held&&!rl&&!pulling&&(keys[' ']||PK.jbuf<.12);
+      if(wantSpace&&PK.climbLock<=0&&!inWater){
+        if(P.onGround&&!sl){const V=pkFindVault(fx,fz,1);if(V){pkStartVault(V,false);started=true}}
+        if(!started&&(P.onGround||fw>0||P.vx*fx+P.vz*fz>1.5)){const L=pkFindLedge(fx,fz,!P.onGround);if(L){pkStartClimb(L,false);started=true}}}
+      if(!started&&canSprint&&P.onGround&&!sl&&!rl&&!pulling&&!inWater&&hs>6&&PK.climbLock<=0){const V=pkFindVault(fx,fz,.82);if(V){pkStartVault(V,true);started=true}}
+      if(!started){
+        const canJump=(P.onGround||(PK.airT<.12&&!PK.jumped&&P.vy<=.5))&&!inWater&&(!P.crouch||sl)&&!rl;
+        if(wantSpace&&!PK.spaceLock&&canJump){P.vy=sl?6.6:7;P.onGround=false;PK.jumped=true;PK.jbuf=9;pkSpend(PKC.jump);if(sl){PK.act=null;PK.boost=true}}
+        if(!P.onGround)P.airPeak=Math.max(P.airPeak===undefined?P.y:P.airPeak,P.y);P.y+=P.vy*dt;
+        if(pulling){P.airPeak=P.y;if(P.y<=sup){P.y=sup;if(P.vy<0)P.vy=0}P.onGround=false}
+        else if(P.y<=sup){if(!P.onGround){const h=(P.airPeak===undefined?P.y:P.airPeak)-sup;if(P.vy<-4)P.landT=Math.min(1,-P.vy/12);pkLand(h,deep,inWater,sup)}P.y=sup;P.vy=0;P.onGround=true;P.airPeak=P.y;PK.boost=false}
+        else{P.onGround=P.y-sup<.05;if(P.onGround)P.airPeak=P.y}
+        if(P.onGround){PK.airT=0;PK.jumped=false}else PK.airT+=dt}}
+    sprinting=canSprint&&l>0&&!sl&&!rl&&!pulling&&Math.hypot(P.vx,P.vz)>5.2;
+    if(!S.shown.pk_climb&&P.onGround&&fw>0&&o.blocked&&!PK.act){PK.hintT-=dt;if(PK.hintT<=0){PK.hintT=.5;if(pkFindLedge(fx,fz,false))pkTip('pk_climb','Climbing','Press <b>Space</b> facing a ledge up to about 3 m high to grab it and pull yourself up. Jump first to reach higher, and keep holding Space to chain climbs up stacked ledges.')}}
+  }
+  if(inWater&&!P.wasWater){sfx('splash',.8);burst(new V3(P.x,.05,P.z),['#cfe6f0','#9fc6d8'],16,2,3,9,.6)}P.wasWater=inWater;
+  if(P.y+(P.eye||1.62)<-.05){P.oxy=Math.max(0,(P.oxy===undefined?30:P.oxy)-dt);if(P.oxy<=0){P.hp-=5*dt;flashDmg(.3);if(P.hp<=0){die('drown');return l}}}else P.oxy=Math.min(30,(P.oxy===undefined?30:P.oxy)+dt*6);
+  const mv=Math.hypot(P.x-ox,P.z-oz);S.moved+=mv;if(keys.shift&&!P.crouch&&mv>0&&Math.random()<dt*4)noise(P.x,P.z,16);
+  pkStamTick(dt,sprinting);
+  if(sprinting&&P.onGround){PK.sprintD+=mv;if(PK.sprintD>=25){PK.sprintD-=25;pkXP('agility',1,'Sprinting')}PK.sprintT+=dt;
+    if(PK.sprintT>2.5)pkTip('pk_slide','Sliding','While sprinting, tap <b>C</b> to <b>slide</b>: a burst of speed that ducks under low gaps. Jump out of a slide to carry the speed into a long jump.')}else PK.sprintT=0;
+  pkCam(dt);return l}
+
+/* ---- camera & viewmodel feel ---- */
+const PK_KF={climbP:[[0,0],[.22,.09],[.6,-.22],[1,0]],climbY:[[0,0],[.3,-.05],[.62,-.3],[1,0]],climbR:[[0,0],[.35,.035],[.72,-.03],[1,0]],
+  hip:[[0,.2],[.18,1.15],[.3,1.95],[.55,1.88],[.82,.75],[1,.2]],hipAir:[[0,.3],[.18,1.35],[.3,2.2],[.6,2.1],[.85,.9],[1,.3]],
+  knee:[[0,-.3],[.18,-1.75],[.3,-.05],[.55,-.08],[.82,-1.3],[1,-.4]],ankle:[[0,-.1],[.18,.25],[.3,-.2],[.55,-.2],[1,-.1]],legY:[[0,-.38],[.14,0],[.82,0],[1,-.42]]};
+function pkCam(dt){let ey=0,ep=0,er=0,ef=0,ty=0,tp=0,tr=0,tf=0,tv=0;const A=PK.act;
+  if(A){const u=Math.min(1,A.t/A.dur);
+    if(A.type==='climb'){ep=pkKF(u,PK_KF.climbP);ey=pkKF(u,PK_KF.climbY);er=pkKF(u,PK_KF.climbR);ef=-2*Math.sin(Math.PI*u);tv=1}
+    else if(A.type==='vault'){const s=Math.sin(Math.PI*u);er=-.085*s;ep=-.1*s;ey=-.2*s;ef=3*s;tv=.85}
+    else if(A.type==='roll'){ep=-Math.PI*2*smooth(.04,.96,u);ey=-.8*Math.sin(Math.PI*u);tv=1}
+    else if(A.type==='slide'){tr=.065;tf=6;tp=-.03;tv=.35}}
+  const G=PK.gr;if(G&&G.phase==='pull'){tf+=8;tr+=clamp(-(P.vx*Math.cos(P.yaw)-P.vz*Math.sin(P.yaw))*.004,-.06,.06)}
+  let kk=0;if(PK.kickT>=0){kk=Math.sin(Math.PI*Math.min(1,PK.kickT/PK.kickDur));if(PK.kickAir){ep+=.14*kk;er+=.05*kk}else ep+=.035*kk;ey-=.04*kk}
+  if(P.exhausted){const b=Math.sin(S.time*4.4);ty+=.012*b;tp+=.006*b}
+  const k=1-Math.exp(-dt*10),c=PK.cs;c.y=lerp(c.y,ty,k);c.p=lerp(c.p,tp,k);c.r=lerp(c.r,tr,k);c.f=lerp(c.f,tf,k);
+  PK.vmLow=lerp(PK.vmLow,tv,1-Math.exp(-dt*(tv>PK.vmLow?16:7)));
+  P.camYOff=c.y+ey;P.camPitchOff=c.p+ep;P.camRoll=c.r+er;P.fovAdd=c.f+ef;
+  const v=PK.vmo,L=PK.vmLow;v.x=.04*L-.03*kk;v.y=-.42*L+.05*kk;v.z=.06*L;v.rx=-.75*L;v.ry=0;v.rz=.2*L+.14*kk;P.vmOff=v}
+
+/* ---- first-person rig: grabbing hands, kicking leg, grapnel rope ---- */
+const PKV=(()=>{const fs={flatShading:true};
+  const skin=M('#c99d7b',fs),sleeve=M('#8a7656',{roughness:1,flatShading:true}),wrap=M('#d8cfb9',{roughness:1,flatShading:true}),
+    pants=M('#4f4a3c',{roughness:1,flatShading:true}),boot=M('#3b2e22',{roughness:.9,flatShading:true}),sole=M('#1c1814',{roughness:1}),
+    lace=M('#b9a27e',{roughness:1}),steel=M('#a2a8ac',{metalness:.75,roughness:.32,flatShading:true}),rope=M('#b9a27e',{roughness:1});
+  const arm=s=>{const g=new THREE.Group();g.add(box(.088,.038,.1,skin,0,0,-.005));
+    const f=box(.084,.028,.066,skin,0,-.024,-.07);f.rotation.x=-.95;g.add(f);
+    const th=box(.026,.026,.06,skin,s*.052,-.008,-.02);th.rotation.y=s*.5;g.add(th);
+    g.add(box(.094,.046,.04,wrap,0,.003,.05));g.add(box(.074,.068,.24,skin,0,.004,.18));g.add(box(.1,.096,.3,sleeve,0,.008,.42));
+    g.visible=false;camera.add(g);return g};
+  const leg=new THREE.Group();leg.position.set(.13,-.74,.1);const thigh=new THREE.Group();leg.add(thigh);thigh.add(box(.17,.46,.18,pants,0,-.21,0));
+  const knee=new THREE.Group();knee.position.y=-.44;thigh.add(knee);knee.add(box(.145,.44,.15,pants,0,-.2,0));knee.add(box(.15,.06,.16,pants,0,-.37,0));
+  const ankle=new THREE.Group();ankle.position.y=-.42;knee.add(ankle);
+  ankle.add(box(.15,.14,.16,boot,0,-.04,-.01));ankle.add(box(.15,.085,.27,boot,0,-.1,-.08));ankle.add(box(.16,.03,.29,sole,0,-.152,-.08));ankle.add(box(.07,.012,.12,lace,0,-.055,-.12));
+  leg.visible=false;camera.add(leg);
+  const N=10,segGeo=new THREE.CylinderGeometry(1,1,1,5,1,true),segs=[],ropeG=new THREE.Group();
+  for(let i=0;i<N;i++){const m=new THREE.Mesh(segGeo,rope);ropeG.add(m);segs.push(m)}
+  const lp=new Float32Array((N+1)*3),lg=new THREE.BufferGeometry(),lAttr=new THREE.BufferAttribute(lp,3);lg.setAttribute('position',lAttr);
+  const line=new THREE.Line(lg,new THREE.LineBasicMaterial({color:0xcdb991}));line.frustumCulled=false;ropeG.add(line);ropeG.visible=false;scene.add(ropeG);
+  const hook=new THREE.Group();hook.add(box(.022,.022,.17,steel,0,0,0));hook.add(box(.04,.04,.03,steel,0,0,-.08));
+  for(let i=0;i<3;i++){const pg=new THREE.Group();pg.position.z=.075;pg.rotation.z=i*2.094;const pi=new THREE.Group();pi.rotation.x=-.65;pg.add(pi);pi.add(box(.016,.085,.016,steel,0,.04,0));hook.add(pg)}
+  hook.visible=false;scene.add(hook);
+  return{armL:arm(-1),armR:arm(1),leg,thigh,knee,ankle,rope:ropeG,segs,lp,lAttr,hook,N,steel,ropeMat:rope}})();
+const _pv1=new V3(),_pv2=new V3(),_pv3=new V3(),_pvY=new V3(0,1,0),_pvZ=new V3(0,0,1);
+function pkPlaceArm(arm,wx,wy,wz,k,side){if(!(k>.001)){arm.visible=false;return}arm.visible=true;
+  _pv1.set(wx,wy,wz);camera.worldToLocal(_pv1);const e=k*k*(3-2*k),x=lerp(side*.27,_pv1.x,e),y=lerp(-.66,_pv1.y,e),z=lerp(-.2,_pv1.z,e);arm.position.set(x,y,z);
+  _pv2.set(side*.2-x,-.3-y,.14-z);const L=_pv2.length();if(L>1e-4){_pv2.multiplyScalar(1/L);arm.quaternion.setFromUnitVectors(_pvZ,_pv2);arm.scale.set(1,1,clamp(L/.56,.8,1.6))}}
+function pkHeadPos(G,out){if(G.phase==='fly')return out.set(G.ox+G.dx*G.trav,G.oy+G.dy*G.trav,G.oz+G.dz*G.trav);if(G.phase==='pull')return out.set(G.ax,G.ay,G.az);
+  const e=G.rt*G.rt;return out.set(lerp(G.hx,_pv1.x,e),lerp(G.hy,_pv1.y,e),lerp(G.hz,_pv1.z,e))}
+function pkRender(){if(!P)return;const A=PK.act,V=PKV;let shownL=false,shownR=false;
+  if(P.alive&&A){const u=Math.min(1,A.t/A.dur);
+    if(A.type==='climb'){const out=u>.78?clamp(1-(u-.78)/.18,0,1):1;pkPlaceArm(V.armL,A.ex-A.rx*.24,A.ey+.02,A.ez-A.rz*.24,Math.min(1,u/.16)*out,-1);pkPlaceArm(V.armR,A.ex+A.rx*.24,A.ey+.02,A.ez+A.rz*.24,clamp((u-.05)/.16,0,1)*out,1);shownL=shownR=true}
+    else if(A.type==='vault'){pkPlaceArm(V.armL,A.hx,A.hy+.02,A.hz,u<.12?u/.12:u>.6?clamp(1-(u-.6)/.2,0,1):1,-1);shownL=true}
+    else if(A.type==='slide'){pkPlaceArm(V.armL,P.x+A.dx*.42+A.dz*.34,P.y+.03,P.z+A.dz*.42-A.dx*.34,(u<.15?u/.15:u>.75?clamp(1-(u-.75)/.25,0,1):1)*.9,-1);shownL=true}}
+  if(!shownL)V.armL.visible=false;if(!shownR)V.armR.visible=false;
+  // kicking leg
+  if(PK.kickT>=0&&P.alive){const u=Math.min(1,PK.kickT/PK.kickDur);V.leg.visible=true;V.thigh.rotation.x=pkKF(u,PK.kickAir?PK_KF.hipAir:PK_KF.hip);V.knee.rotation.x=pkKF(u,PK_KF.knee);V.ankle.rotation.x=pkKF(u,PK_KF.ankle);V.leg.position.y=-.74+pkKF(u,PK_KF.legY)}
+  else V.leg.visible=false;
+  // grapnel rope + hook
+  const G=PK.gr,U=vmCur&&vmCur.userData;if(U&&U.pkHead)U.pkHead.visible=!G;
+  if(!G||!P.alive){V.rope.visible=false;V.hook.visible=false;return}
+  if(U&&U.pkTip)U.pkTip.getWorldPosition(_pv1);else _pv1.set(P.x,P.y+1.35,P.z);
+  pkHeadPos(G,_pv2);const ax=_pv1.x,ay=_pv1.y,az=_pv1.z,bx=_pv2.x,by=_pv2.y,bz=_pv2.z,len=Math.hypot(bx-ax,by-ay,bz-az);
+  const sag=G.phase==='fly'?len*.035+.1:G.phase==='pull'?Math.max(0,.2-G.pt*.8)*len*.06:len*.06,wob=G.phase==='fly'?1:G.phase==='retract'?.6:Math.max(0,1-G.pt*4)*.4,lp=V.lp,N=V.N;
+  for(let i=0;i<=N;i++){const s=i/N,k=Math.sin(Math.PI*s);lp[i*3]=lerp(ax,bx,s)+Math.sin(s*9+S.time*37)*.05*wob*k;lp[i*3+1]=lerp(ay,by,s)-sag*k;lp[i*3+2]=lerp(az,bz,s)+Math.cos(s*7+S.time*31)*.05*wob*k}
+  V.lAttr.needsUpdate=true;
+  for(let i=0;i<N;i++){const m=V.segs[i],j=i*3,dx=lp[j+3]-lp[j],dy=lp[j+4]-lp[j+1],dz=lp[j+5]-lp[j+2],L=Math.hypot(dx,dy,dz)||1e-4;
+    m.position.set((lp[j]+lp[j+3])/2,(lp[j+1]+lp[j+4])/2,(lp[j+2]+lp[j+5])/2);_pv3.set(dx/L,dy/L,dz/L);m.quaternion.setFromUnitVectors(_pvY,_pv3);m.scale.set(.011,L,.011)}
+  V.rope.visible=true;const h=V.hook;h.visible=true;h.position.set(bx,by,bz);if(G.phase==='fly'){_pv3.set(bx+G.dx,by+G.dy,bz+G.dz);h.lookAt(_pv3)}}
+
+/* ---- HUD: stamina bar, winded vignette, grapnel range ring, controls ---- */
+const PKH=(()=>{const css=document.createElement('style');css.textContent=`
+#vitals .pk-sta{transition:opacity .5s}#vitals .pk-sta.full{opacity:.55}
+#vitals .pk-sta .fill i{background:linear-gradient(90deg,#b8902a,#e8cb4c);transition:width .12s linear}
+#vitals .pk-sta.exh .fill i{background:linear-gradient(90deg,#b8502a,#e0903e);animation:pkBlink .5s ease-in-out infinite alternate}
+#vitals .pk-sta.exh .val{color:#ffc27a}
+@keyframes pkBlink{from{opacity:1}to{opacity:.3}}
+#pkVig{position:absolute;left:0;top:0;right:0;bottom:0;pointer-events:none;opacity:0;background:radial-gradient(ellipse at center,rgba(0,0,0,0) 52%,rgba(30,14,0,.6) 100%)}
+#pkHook{position:absolute;left:50%;top:50%;width:30px;height:30px;margin:-15px 0 0 -15px;border:2px solid rgba(150,232,120,.9);border-radius:50%;pointer-events:none;opacity:0;transition:opacity .12s,border-color .12s;box-shadow:0 0 6px rgba(0,0,0,.5)}
+#pkHook.no{border-color:rgba(232,140,110,.45);border-style:dashed}
+#pkHook b{position:absolute;top:32px;left:50%;transform:translateX(-50%);font:700 11px 'Roboto Condensed',Arial,sans-serif;color:#d6f0c8;text-shadow:0 1px 2px #000;white-space:nowrap}
+#pkHook.no b{color:#f0c0a8}`;document.head.appendChild(css);
+  const vit=$('#vitals');if(vit)vit.insertAdjacentHTML('beforeend','<div class="vbar pk-sta" id="pkSta"><div class="ic">STA</div><div class="fill"><i id="bSta" style="width:100%"></i></div><div class="val" id="vSta">100</div></div>');
+  const hud=$('#hud');if(hud)hud.insertAdjacentHTML('beforeend','<div id="pkVig"></div><div id="pkHook"><b></b></div>');
+  const tb=document.querySelector('#pause table');if(tb)tb.insertAdjacentHTML('beforeend','<tr><td>F</td><td>Kick (mid-air: dropkick) · breaks a grab</td></tr><tr><td>Space</td><td>At a ledge: climb · in front of low cover: vault</td></tr><tr><td>Shift + C</td><td>Slide · hold C when landing a big drop to roll</td></tr>');
+  return{row:$('#pkSta'),bar:$('#bSta'),val:$('#vSta'),vig:$('#pkVig'),hook:$('#pkHook'),v:-1,cls:'',vg:-1,ok:-1,txt:''}})();
+function pkHookInd(){const el=PKH.hook;if(!el)return;const id=P.alive&&S.active?P.hot[P.sel]:null;
+  if(id!=='grapple'||PK.gr){if(PK.hookShown){PK.hookShown=false;el.style.opacity=0}return}
+  const now=performance.now();
+  if(now-PK.hookT>130){PK.hookT=now;const r=aimRay(),h=pkRay(r.o,r.d,PKC.grRange),ok=h&&h.t>=2.2&&h.face!=='bottom'?1:0;
+    const txt=ok?Math.round(h.t)+' m':'';if(ok!==PKH.ok){PKH.ok=ok;el.className=ok?'':'no'}if(txt!==PKH.txt){PKH.txt=txt;el.firstChild.textContent=txt}}
+  const fc=freeCursor()&&S.active&&mouseX>=0;el.style.left=fc?mouseX+'px':'50%';el.style.top=fc?mouseY+'px':'50%';
+  if(!PK.hookShown){PK.hookShown=true;el.style.opacity=1}}
+function pkHud(){if(!P||!S||!(P.stam>=0))return;const v=Math.round(P.stam);
+  if(v!==PKH.v){PKH.v=v;PKH.bar.style.width=v+'%';PKH.val.textContent=P.exhausted?'WINDED':v}
+  const cls='vbar pk-sta'+(P.exhausted?' exh':'')+(PK.fullT>2.5?' full':'');if(cls!==PKH.cls){PKH.cls=cls;PKH.row.className=cls;PKH.val.textContent=P.exhausted?'WINDED':v}
+  const vg=!P.alive?0:P.exhausted?.42+.18*Math.sin(S.time*4.4):P.stam<20?.16:0;if(Math.abs(vg-PKH.vg)>.02){PKH.vg=vg;PKH.vig.style.opacity=vg.toFixed(2)}
+  pkHookInd()}
+
+/* ---- sounds (synth) ---- */
+const PK_SFX={
+ pk_grunt(t,d){tn(t,'sawtooth',165,118,.16,.015,.2,bp(d,620,1.1));nz(t,.25,'bandpass',1300,.9,.1,.02,.2,d,700);nz(t+.04,.08,'highpass',2600,.7,.07,.003,.06,d)},
+ pk_pull(t,d){nz(t,.2,'bandpass',1700,1,.16,.01,.14,d,800);tn(t+.1,'sine',130,70,.22,.003,.1,d)},
+ pk_vault(t,d){nz(t,.2,'bandpass',800,1.3,.3,.03,.16,d,2600);nz(t+.05,.06,'highpass',1700,.7,.22,.002,.05,d);tn(t+.05,'sine',240,130,.14,.002,.06,d)},
+ pk_slide(t,d){nz(t,.75,'lowpass',1300,.7,.32,.03,.68,d,420);for(let i=0;i<7;i++)nz(t+.04+i*.09,.05,'highpass',2600+Math.random()*1400,.7,.05,.002,.03,d)},
+ pk_kick(t,d){nz(t,.18,'bandpass',650,1.2,.34,.04,.14,d,2100)},
+ pk_kickhit(t,d){tn(t,'sine',150,46,.85,.002,.17,d);nz(t,.1,'lowpass',1500,.7,.65,.002,.09,d);nz(t,.14,'bandpass',320,1,.38,.003,.12,d)},
+ pk_breath(t,d){nz(t,.3,'bandpass',1500,1.1,.08,.12,.17,d,2100);nz(t+.42,.45,'bandpass',950,1,.11,.05,.36,d,480);tn(t+.43,'sawtooth',118,98,.025,.05,.28,bp(d,520,1))},
+ pk_fire(t,d){tn(t,'sine',230,80,.5,.002,.12,d);nz(t,.2,'highpass',2400,.7,.32,.003,.17,d);tn(t+.02,'sawtooth',950,280,.05,.01,.32,bp(d,1500,2))},
+ pk_clank(t,d){tn(t,'triangle',1280,1120,.42,.001,.24,d);tn(t,'square',2380,2240,.1,.001,.08,d);nz(t,.05,'highpass',3600,.7,.38,.001,.045,d);tn(t,'sine',170,90,.32,.002,.12,d)},
+ pk_reel(t,d){for(let i=0;i<6;i++)tn(t+i*.055,'square',1500+Math.random()*400,0,.045,.001,.014,d)},
+ pk_miss(t,d){tn(t,'triangle',1050,880,.14,.001,.09,d);nz(t,.04,'highpass',3000,.7,.12,.001,.03,d)},
+ pk_roll(t,d){tn(t,'sine',115,52,.55,.003,.17,d);nz(t,.22,'lowpass',650,.7,.36,.005,.2,d);nz(t+.14,.25,'bandpass',1050,1,.18,.02,.2,d,2300);tn(t+.32,'sine',95,50,.3,.003,.12,d)},
+ pk_land(t,d){tn(t,'sine',100,48,.6,.003,.16,d);nz(t,.18,'lowpass',520,.7,.45,.004,.16,d)}};
+const PK_REV={pk_clank:.3,pk_kickhit:.1,pk_land:.08,pk_miss:.2};
+{const _pkSfx=sfx;sfx=function(type,vol,pos){const f=PK_SFX[type];if(!f)return _pkSfx(type,vol,pos);if(muted||!ac())return;if(AC.state==='suspended')AC.resume();
+  f(AC.currentTime+.005,bus(pos,vol===undefined?1:vol,PK_REV[type]||0))}}
+
+/* ---- item: Grapnel Line ---- */
+ITEMS.grapple={n:'Grapnel Line',c:'#7c8f52',cat:'Tool',hot:1,
+  d:'A spring-fired steel grapnel on a braided line. Hook a roof edge, rock or tree and haul yourself up to it.',
+  f:'Craft: 2 rope, 75 metal fragments, 1 gears. Needs its blueprint: research a found one, unlock it on the Workbench tech tree, or learn the agility perk. Rare in supply drops and town toolboxes.',
+  u:'Left click: fire at something within 35 m and get hauled in (10 stamina). Space: let go and keep your momentum. R: let go.',
+  onUse:()=>pkGrappleUse(),onSecondary:()=>pkGrappleRelease(false)};
+{const i=RECIPES.findIndex(r=>r.wb);RECIPES.splice(i<0?RECIPES.length:i,0,{id:'grapple',cost:{rope:2,metal_frag:75,gears:1},time:20,cat:'Parkour gear',bp:1,rc:75})}
+VMB.grapple=[.22,-.24,-.18];
+{const _pkBp=bpKnown;bpKnown=function(r){if(r&&r.id==='grapple'&&pkPerk('ag_grapple'))return true;return _pkBp(r)}}
+{const _pkHint=hintFor;hintFor=function(id){if(id==='grapple')return'Left click fire line · Space / R let go';return _pkHint(id)}}
+{const _pkVm=vmFor;vmFor=function(id){if(id!=='grapple'||vmCache[id])return _pkVm(id);
+  const root=new THREE.Group(),g=new THREE.Group();g.position.z=-.25;root.add(g);g.add(armMesh());const it=new THREE.Group();it.position.set(0,0,-.06);g.add(it);const U=root.userData;
+  const gun=M('#3c4044',{metalness:.6,roughness:.45,flatShading:true}),acc=M('#c8762e',{roughness:.6,flatShading:true}),rub=M('#262422',{roughness:1}),rp=M('#b9a27e',{roughness:1});
+  const cyl=(rt,rb,h,mat,seg)=>new THREE.Mesh(new THREE.CylinderGeometry(rt,rb,h,seg||8),mat);
+  const body=cyl(.031,.036,.26,gun);body.rotation.x=Math.PI/2;body.position.set(0,.055,-.12);it.add(body);
+  const ring=cyl(.038,.038,.028,acc);ring.rotation.x=Math.PI/2;ring.position.set(0,.055,-.215);it.add(ring);
+  const gp=box(.032,.1,.045,rub,0,-.005,0);gp.rotation.x=.3;it.add(gp);it.add(box(.012,.03,.025,gun,0,.02,-.045));
+  for(const x of [.03,.075]){const fl=cyl(.05,.05,.008,gun,10);fl.rotation.z=Math.PI/2;fl.position.set(x,.05,-.07);it.add(fl)}
+  const coil=cyl(.042,.042,.04,rp,10);coil.rotation.z=Math.PI/2;coil.position.set(.0525,.05,-.07);it.add(coil);
+  const head=new THREE.Group();head.position.set(0,.055,-.255);head.add(box(.02,.02,.06,PKV.steel,0,0,-.02));
+  for(let i=0;i<3;i++){const pg=new THREE.Group();pg.position.z=-.045;pg.rotation.z=i*2.094;const pi=new THREE.Group();pi.rotation.x=.65;pg.add(pi);pi.add(box(.013,.06,.013,PKV.steel,0,.028,0));head.add(pg)}
+  it.add(head);U.pkHead=head;const tip=new THREE.Object3D();tip.position.set(0,.055,-.29);it.add(tip);U.pkTip=tip;
+  shadowAll(root,false,false);vmCache[id]=root;return root}}
+// fall damage scaling for landing rolls above 12 m
+{const _pkHurt=hurt;hurt=function(dmg,cause,a,b){if(cause==='fall'&&PK.fallMul!==1)dmg*=PK.fallMul;return _pkHurt(dmg,cause,a,b)}}
+
+/* ---- hooks ---- */
+function pkLazyInit(){if(PK.lootWrapped)return;PK.lootWrapped=true;
+  try{if(typeof rollLoot==='function'){const _rl=rollLoot;rollLoot=function(kind,mult){const r=_rl.apply(this,arguments)||{};const ch={airdrop:.2,toolbox:.05,trunk:.03,cabinet:.015}[kind];
+    if(ch&&Math.random()<ch*Math.min(2,mult||1))r.grapple=(r.grapple||0)+1;return r}}}catch(err){}}
+onHook('newGame',()=>{pkReset();pkLazyInit()});
+onHook('respawn',()=>pkReset());
+onHook('death',()=>{pkReset();PKV.armL.visible=PKV.armR.visible=PKV.leg.visible=PKV.rope.visible=PKV.hook.visible=false});
+onHook('equip',id=>{if(PK.gr&&id!=='grapple'){if(PK.gr.phase==='pull'){PK.boost=true;P.airPeak=P.y}PK.gr=null}});
+onHook('gain',id=>{if(id==='grapple')pkTip('pk_grapple_got','Grapnel Line','You have a <b>Grapnel Line</b>. Select it, aim at a roof edge, rock or tree within 35 m and left click to haul yourself up there. The ring around your crosshair turns green when something is in reach.',true)});
+onHook('render',pkRender);
+onHook('hud',pkHud);
+onHook('status',o=>{if(P&&P.exhausted)o.push('<span style="color:#f0b060">WINDED</span>')});
+onHook('worldTick',pkPushTick);
+onHook('netMsg',m=>{if(m&&m.k==='p_knock'&&NET.role==='host'){const t=(m.a?animals:npcs).find(q=>q.id===m.id);const dx=+m.dx||0,dz=+m.dz||0,p=clamp(+m.p||0,0,25),l=Math.hypot(dx,dz);if(t&&!t.dead&&l>.01)pkPush(t,dx/l,dz/l,p)}});
+onHook('playerTick',dt=>{PK.threatT-=dt;if(PK.threatT>0||!S.shown||S.shown.pk_kick)return;PK.threatT=.6;let near=false;
+  if(typeof infectedNear==='function'){try{const r=infectedNear(P.x,P.z,6);near=!!(r&&r.length)}catch(err){}}
+  if(!near)for(const n of npcs)if(n.foe===P&&dist2(n.x,n.z,P.x,P.z)<6){near=true;break}
+  if(!near)for(const a of animals)if(!a.dead&&a.state==='attack'&&a.foe===P&&dist2(a.x,a.z,P.x,P.z)<7){near=true;break}
+  if(near)pkTip('pk_kick','Kick','Press <b>F</b> to kick whatever is in front of you: it shoves enemies back and buys you room. Kick in mid-air for a <b>dropkick</b> with double damage, and kick to break free when the infected grab you.',true)});
 
 /* ================= SKILL TREES XP AND SENSE PULSE ================= */
 // Three XP trees (Agility / Power / Survivor) that level up from play, perks bought with skill points in the
