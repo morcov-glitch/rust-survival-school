@@ -8536,6 +8536,540 @@ const DF_SND={
  df_hammer:{f:(t,d)=>{tn(t,'triangle',950,700,.25,.001,.06,d);nz(t,.04,'highpass',3200,.7,.25,.001,.035,d)}}};
 {const _dfSfx=sfx;sfx=function(type,vol,pos){const S_=DF_SND[type];if(!S_)return _dfSfx.apply(this,arguments);if(muted||!ac())return;if(AC.state==='suspended')AC.resume();const t=AC.currentTime+.005;S_.f(t,bus(pos,vol===undefined?1:vol,S_.rv||0))}}
 
+/* ================= GLIDER AND ZIPLINES ================= */
+// Traversal tools: the craftable Patchwork Glider (Space while falling), gravity ziplines strung between town
+// rooftops, launch towers and hills (E at a post), rope ladders up to the launch points, and daytime thermals.
+// Integration is by wrapping only (pkMove, primary, secondary, interactTarget, interact, sfx) plus hooks.
+// Contract: item 'glider' (owning it = usable) · ZIPLINES[] {a:{x,y,z} high end, b:{x,y,z} low end, L, kind, ...}
+//   · P.gliding (bool) · P.onZip (the line being ridden, else null) · tvBusy() → gliding / on a line / on a ladder
+// Network: 't_gl' {on:0|1} shows the glider on other players' avatars (relayed by the host). Everything else is local.
+const TV_HANG=2.3,TV_POSTA=3.2,TV_POSTB=2.9,TV_TOWER=7.5,TV_SPD=11,TV_SINK=1.8,TV_DRAG=.0095,TV_FRIC=.15,TV_PULL=2.4,TV_VMAX=18,TV_CEIL=175;
+const ZIPLINES=[],TV_LADDERS=[],TV_THERMALS=[];
+const tv={P:null,gl:null,zip:null,lad:null,canDeploy:false,roll:0,pitch:0,fov:0,fovA:0,fovOn:false,vmHid:false,ck:0,cHd:0,cBank:0,cPitch:0,armsBy:null,
+  hudT:0,hudKey:'',hintOn:null,nearT:0,netT:0,remote:{},loop:null,retry:0,best:0};
+const tvGen={geos:[],objs:[],handles:{},boxes:[],clear:[],count:{town:0,radio:0,hill:0}};
+function tvRng(seed){let a=seed>>>0;return()=>{a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296}}
+let tvRand=tvRng(7);
+const tvSag=L=>Math.min(3,L*(L<70?.012:.018));   // short spans are strung tighter
+const tvBackOut=t=>{const c=1.4,u=t-1;return 1+(c+1)*u*u*u+c*u*u};
+
+// ---------- item, recipe, info cards, prompts, guide ----------
+ITEMS.glider={n:'Patchwork Glider',c:'#c8833a',cat:'Traversal',d:'A folding canvas wing stitched from cloth over a light wooden frame. It rides folded on your back — owning one is enough, it needs no hotbar slot.',
+  f:'Craft: 60 cloth, 150 wood, 2 rope (Tab → Traversal, no workbench needed).',
+  u:'Fall from a height and press Space to open it. Mouse (or A/D) steers, S dives, W flares, Space stows. No fall damage while it is open.'};
+{const rec={id:'glider',cost:{cloth:60,wood:150,rope:2},time:40,cat:'Traversal'};const i=RECIPES.findIndex(r=>r.wb);if(i<0)RECIPES.push(rec);else RECIPES.splice(i,0,rec)}
+{const Zi={k:'Traversal',t:'Zipline',d:'A steel line strung downhill between two posts. Press E beside the post to clip on and let gravity carry you.',
+  rows:[['On the line','Space: jump off with your speed · S: brake · E: let go'],['Uphill','Gentle lines can be hauled up hand over hand, slowly'],['Combo','Jump off high up and open a glider']],g:'traversal'};
+ const La={k:'Traversal',t:'Rope Ladder',d:'Hold W (or press E) to climb, S to climb down, Space to jump off.',rows:[['Where','Launch towers and the rooftops that hold zipline posts']],g:'traversal'};
+ Object.assign(INFO,{zipline:Zi,zipline_up:Object.assign({},Zi,{d:'This line is gentle enough to haul yourself up hand over hand. Press E to clip on.'}),
+  zipline_end:Object.assign({},Zi,{t:'Zipline · bottom end',d:'The line runs downhill to this post. Ride it from the post with the orange pennant at the other end.'}),
+  tv_ladder:La,tv_ladder_down:La,glider:{k:'Equipment',t:'Patchwork Glider',d:ITEMS.glider.u,rows:[['Craft','60 cloth · 150 wood · 2 rope']],g:'traversal'}});
+ Object.assign(PROMPTS,{zipline:'Ride zipline',zipline_up:'Haul up the zipline',zipline_end:'Zipline · ride it from the top',tv_ladder:'Climb ladder',tv_ladder_down:'Climb down the ladder'})}
+try{if(typeof GUIDE!=='undefined'&&Array.isArray(GUIDE)&&!GUIDE.some(g=>g&&g.id==='traversal'))GUIDE.push({id:'traversal',t:'Gliders & Ziplines',h:`<h2>Gliders &amp; Ziplines</h2><p class="lead">Getting around fast: a home-made glider, steel ziplines and rope ladders. None of this is in Rust itself — it is an extra for the training island.</p>
+<h3>The Patchwork Glider</h3><p>Craft it from the <b>Traversal</b> section of the crafting menu (<b>Tab</b>): <b>60 cloth, 150 wood, 2 rope</b>, no workbench needed. It rides folded on your back, so you never select it — owning one is enough. Like everything you carry, it ends up in your backpack when you die.</p>
+<table><tr><th>Key</th><th>While gliding</th></tr><tr><td><b>Space</b></td><td>Open the wing while falling (needs about 4 m of air under you) · press again to stow it</td></tr>
+<tr><td><b>Mouse</b> / <b>A</b> <b>D</b></td><td>Steer — the wing banks into turns</td></tr><tr><td><b>S</b></td><td>Dive: trade height for speed (up to about 16 m/s)</td></tr>
+<tr><td><b>W</b></td><td>Flare: bleed off speed to stop sinking for a moment. Hold it too long and the wing <b>stalls</b> — let go to recover</td></tr></table>
+<div class="box g">Cruising at about <b>11 m/s</b> while sinking about <b>1.8 m/s</b>, you cover roughly <b>6 m for every metre of height</b>. A 20 m tower is worth a 120 m flight.</div>
+<ul><li><b>No fall damage</b> while the wing is open — but flying into a wall at speed hurts.</li><li>Holding the wing costs <b>stamina</b>. Run dry and you sink faster.</li><li>Flare with <b>W</b> just before touchdown for a soft landing.</li>
+<li><b>Thermals:</b> on sunny days warm air rises over hilltops and sun-baked rooftops. Circle inside one to climb — the vario beeps faster the harder you rise. No thermals at night or in heavy rain.</li></ul>
+<h3>Ziplines</h3><p>Steel lines strung downhill between posts: across rooftops in town and down from launch towers on the high hills. They show as <b>orange lines</b> on the map (<b>M</b>); the arrow points downhill.</p>
+<ul><li>Stand next to the <b>start post</b> (orange pennant) and press <b>E</b> to clip on.</li><li>Speed depends on the slope: roughly <b>8–18 m/s</b>. <b>S</b> brakes (sparks fly), <b>Space</b> jumps off and keeps your speed, <b>E</b> lets go.</li>
+<li>Gentle lines can be <b>hauled up hand over hand</b> from the bottom — slowly, and it costs stamina.</li><li>A fast trolley is <b>loud</b>: anything nearby hears you coming.</li><li>You take no fall damage while clipped on, but jumping off high up is a real fall… unless you open a glider.</li></ul>
+<h3>Rope ladders &amp; launch towers</h3><p>Launch towers and the rooftops that hold zipline posts have <b>rope ladders</b>. Walk into one and hold <b>W</b> (or press <b>E</b>); <b>S</b> climbs down and <b>Space</b> jumps off. At the top you step onto the deck or roof.</p>
+<div class="box">Best combo: ride a long line, jump off high above the valley, open your glider and circle a thermal back up.</div>`})}catch(e){}
+
+// ---------- shared materials & prototype geometry (created once) ----------
+const TVM={vc:new THREE.MeshStandardMaterial({vertexColors:true,flatShading:true,roughness:.86}),cable:new THREE.MeshStandardMaterial({vertexColors:true,metalness:.55,roughness:.42}),
+  canopy:new THREE.MeshStandardMaterial({vertexColors:true,flatShading:true,roughness:.8,side:THREE.DoubleSide}),cord:new THREE.LineBasicMaterial({color:0x2b2723,transparent:true,opacity:.8}),
+  line:new THREE.LineBasicMaterial({color:0x1e1f21,transparent:true,opacity:.5}),sleeve:M('#8a7656',{roughness:1,flatShading:true})};
+const TVG={box:new THREE.BoxGeometry(1,1,1),cyl:new THREE.CylinderGeometry(.5,.5,1,7),cyl5:new THREE.CylinderGeometry(.5,.5,1,5,1,true),wheel:new THREE.CylinderGeometry(.5,.5,1,12),ball:new THREE.IcosahedronGeometry(.5,0)};
+const TV_Y=new V3(0,1,0),_tvV=new V3(),_tvQ=new THREE.Quaternion(),_tvP={x:0,y:0,z:0},_tvH={x:0,y:0,z:0};
+const _tvCC=new Map();const tvCol=c=>{let v=_tvCC.get(c);if(!v){v=col(c);_tvCC.set(c,v)}return v};
+// merge {g,c,m} parts (prototype geometry, '#hex', Matrix4) into one vertex-coloured BufferGeometry
+function tvMerge(parts,jit){let n=0;const L=[];
+  for(const p of parts){const g=p.g.index?p.g.toNonIndexed():p.g.clone();g.applyMatrix4(p.m);const pa=g.attributes.position;const cnt=pa?pa.count|0:0;L.push([g,cnt,p.c]);n+=cnt}
+  const pos=new Float32Array(n*3),nor=new Float32Array(n*3),cl=new Float32Array(n*3);let o=0;
+  for(const [g,cnt,c] of L){const A=g.attributes.position.array,N=g.attributes.normal.array,C=tvCol(c),j=jit?1+(tvRand()-.5)*jit:1;
+    for(let i=0;i<cnt*3;i++){pos[o*3+i]=A[i];nor[o*3+i]=N[i]}for(let i=0;i<cnt;i++){cl[(o+i)*3]=C.r*j;cl[(o+i)*3+1]=C.g*j;cl[(o+i)*3+2]=C.b*j}o+=cnt;g.dispose()}
+  const geo=new THREE.BufferGeometry();geo.setAttribute('position',new THREE.BufferAttribute(pos,3));geo.setAttribute('normal',new THREE.BufferAttribute(nor,3));geo.setAttribute('color',new THREE.BufferAttribute(cl,3));geo.computeBoundingSphere();return geo}
+function tvM(x,y,z,ry,sx,sy,sz){return new THREE.Matrix4().compose(new V3(x,y,z),new THREE.Quaternion().setFromAxisAngle(TV_Y,ry||0),new V3(sx,sy,sz))}
+function tvBox(W,c,x,y,z,w,h,d,ry){W.push({g:TVG.box,c,m:tvM(x,y,z,ry,w,h,d)})}
+function tvSeg(W,c,g,ax,ay,az,bx,by,bz,r){const dx=bx-ax,dy=by-ay,dz=bz-az,L=Math.hypot(dx,dy,dz);if(!(L>1e-4))return;
+  W.push({g,c,m:new THREE.Matrix4().compose(new V3((ax+bx)/2,(ay+by)/2,(az+bz)/2),new THREE.Quaternion().setFromUnitVectors(TV_Y,new V3(dx/L,dy/L,dz/L)),new V3(r*2,L,r*2))})}
+
+// ---------- the canopy: an arched, patchwork paraglider-style wing (vertex coloured, trailing edge flutters) ----------
+const TV_PATCH=['#c8833a','#e6d3a8','#a8452e','#3f6b6e','#d9a441','#6e7d48','#e6d3a8','#b8603e'];
+const TV_CAN=(()=>{const NS=14,R=3.3,A=1,CH=[-1.05,-.62,-.12,.42,1.02],TH=[0,.23,.19,.09,0],OFF=[0,3.05,-.45];
+  const pt=(i,j,top)=>{const th=-A+2*A*i/NS,k=1-.32*(th/A)*(th/A),sx=Math.sin(th),cy=Math.cos(th),off=(top?1:-.25)*TH[j]*k;return[R*sx+sx*off,R*(cy-1)+cy*off,CH[j]*k]};
+  const pos=[],cl=[],meta=[];const V=(i,j,top)=>{const p=pt(i,j,top);p.push(i,j);return p};
+  const tri=(a,b,c,C)=>{for(const v of[a,b,c]){pos.push(v[0],v[1],v[2]);cl.push(C.r,C.g,C.b);meta.push(v[3],v[4])}};const quad=(a,b,c,d,C)=>{tri(a,b,c,C);tri(a,c,d,C)};
+  for(let i=0;i<NS;i++){const base=col(TV_PATCH[(i*5+(i>>2))%TV_PATCH.length]);
+    for(let j=0;j<4;j++){const ct=base.clone().multiplyScalar(j===3?.86:1),cb=base.clone().multiplyScalar(.6);quad(V(i,j,1),V(i+1,j,1),V(i+1,j+1,1),V(i,j+1,1),ct);quad(V(i,j,0),V(i,j+1,0),V(i+1,j+1,0),V(i+1,j,0),cb)}}
+  {const C=col('#7a5a3a');for(const i of[0,NS])for(let j=0;j<4;j++)quad(V(i,j,1),V(i,j+1,1),V(i,j+1,0),V(i,j,0),C)}
+  const P_=new Float32Array(pos),geo=new THREE.BufferGeometry(),attr=new THREE.BufferAttribute(P_,3);if(attr.setUsage)attr.setUsage(THREE.DynamicDrawUsage);
+  geo.setAttribute('position',attr);geo.setAttribute('color',new THREE.BufferAttribute(new Float32Array(cl),3));geo.computeVertexNormals();geo.computeBoundingSphere();
+  // suspension lines converge on two risers just above the pilot's hands; brake lines run from the trailing edge
+  const cp=[],ris=s=>[s*.24,.44,-.28];
+  for(const i of[1,3,5,9,11,13])for(const j of[1,3]){const p=pt(i,j,0),r=ris(i<NS/2?-1:1);cp.push(p[0]+OFF[0],p[1]+OFF[1],p[2]+OFF[2],r[0],r[1],r[2])}
+  for(const i of[1,4,10,13]){const p=pt(i,4,0),r=ris(i<NS/2?-1:1);cp.push(p[0],p[1]+OFF[1],p[2]+OFF[2],r[0],r[1]-.1,r[2]+.04)}
+  const cg=new THREE.BufferGeometry();cg.setAttribute('position',new THREE.BufferAttribute(new Float32Array(cp),3));
+  return{geo,attr,pos:P_,base:new Float32Array(pos),meta:new Uint8Array(meta),cords:cg,off:OFF}})();
+function tvFlap(amp,freq){const A=TV_CAN.pos,B=TV_CAN.base,Mt=TV_CAN.meta,t=S.time,n=Mt.length>>1;
+  for(let v=0;v<n;v++){const j=Mt[v*2+1];if(j<2)continue;const i=Mt[v*2],w=j===4?1:j===3?.45:.12;A[v*3+1]=B[v*3+1]+Math.sin(t*freq+i*1.15+j*.6)*amp*w}TV_CAN.attr.needsUpdate=true}
+function tvMakeGlider(){const G=new THREE.Group(),wing=new THREE.Group();G.add(wing);const m=new THREE.Mesh(TV_CAN.geo,TVM.canopy);m.position.set(TV_CAN.off[0],TV_CAN.off[1],TV_CAN.off[2]);m.castShadow=true;wing.add(m);
+  const c=new THREE.LineSegments(TV_CAN.cords,TVM.cord);c.frustumCulled=false;wing.add(c);G.userData.wing=wing;G.rotation.order='YXZ';G.visible=false;return G}
+const tvGlider=tvMakeGlider();scene.add(tvGlider);
+// trolley + T-handle (origin on the cable, -Z = travel direction), the rider's arms (world space, like the parkour rig)
+const TV_HANDLE=(()=>{const W=[];tvBox(W,'#2f3438',0,-.045,0,.13,.15,.36,0);tvBox(W,'#23272a',.075,-.02,0,.02,.18,.38,0);tvBox(W,'#23272a',-.075,-.02,0,.02,.18,.38,0);
+  for(const z of[-.1,.1])tvSeg(W,'#9aa0a6',TVG.wheel,-.04,.03,z,.04,.03,z,.055);tvBox(W,'#c8662e',0,-.3,0,.05,.4,.018,0);
+  tvSeg(W,'#6b7075',TVG.cyl,-.26,-.5,0,.26,-.5,0,.021);for(const s of[-1,1])tvSeg(W,'#1f1d1b',TVG.cyl,s*.11,-.5,0,s*.25,-.5,0,.031);return tvMerge(W,0)})();
+const TV_FIST=(()=>{const W=[];tvBox(W,'#c99d7b',0,0,0,.092,.1,.085,0);tvBox(W,'#b98d6b',0,.055,.035,.085,.035,.03,0);return tvMerge(W,0)})();
+const TVG_ARM=new THREE.BoxGeometry(.085,1,.085);TVG_ARM.translate(0,.5,0);
+function tvMakeArm(){const s=new THREE.Mesh(TVG_ARM,TVM.sleeve),h=new THREE.Mesh(TV_FIST,TVM.vc);s.visible=h.visible=false;s.frustumCulled=h.frustumCulled=false;scene.add(s);scene.add(h);return{s,h}}
+const tvArms=[tvMakeArm(),tvMakeArm()];
+const tvTrolley=new THREE.Mesh(TV_HANDLE,TVM.vc);tvTrolley.visible=false;tvTrolley.castShadow=true;scene.add(tvTrolley);
+function tvArm(a,sx,sy,sz,hx,hy,hz){const dx=hx-sx,dy=hy-sy,dz=hz-sz,L=Math.hypot(dx,dy,dz)||.01;_tvV.set(dx/L,dy/L,dz/L);_tvQ.setFromUnitVectors(TV_Y,_tvV);
+  a.s.position.set(sx,sy,sz);a.s.quaternion.copy(_tvQ);a.s.scale.set(1,Math.max(.05,L-.05),1);a.h.position.set(hx,hy,hz);a.h.quaternion.copy(_tvQ);a.s.visible=a.h.visible=true}
+function tvArmsOff(){for(const a of tvArms)a.s.visible=a.h.visible=false}
+function tvArmsOffIf(who){if(tv.armsBy===who){tvArmsOff();tv.armsBy=null}}
+const TV_DUST=['#efe8cf','#e2d6ac','#f6f2e6'].map(c=>col(c)),TV_SPARK=['#fff4b8','#ffd25e','#ff9a30'].map(c=>col(c));
+function tvSpark(x,y,z,n){for(let i=0;i<n;i++)parts.push({x,y,z,vx:R(-1.5,1.5),vy:R(.3,1.7),vz:R(-1.5,1.5),g:9.8,life:R(.14,.34),c:pick(TV_SPARK),gh:-99});if(parts.length>PMAX)parts.splice(0,parts.length-PMAX)}
+function tvDust(){for(let i=0;i<2;i++)parts.push({x:P.x+R(-8,8),y:P.y+R(-5,1.5),z:P.z+R(-8,8),vx:R(-.3,.3),vy:R(1.6,3),vz:R(-.3,.3),g:-.25,life:R(1.2,2.2),c:pick(TV_DUST),gh:-99});if(parts.length>PMAX)parts.splice(0,parts.length-PMAX)}
+
+// ---------- sounds (wrapped sfx types, a lazily created wind/whirr loop, vario beeps) ----------
+const TV_SFX={
+ tv_open:(t,d)=>{nz(t,.4,'bandpass',260,1.1,.55,.012,.34,d,2400);tn(t+.03,'sine',105,52,.45,.006,.24,d);nz(t+.16,.22,'highpass',2600,.7,.16,.005,.18,d)},
+ tv_catch:(t,d)=>{nz(t,.24,'lowpass',520,.8,.5,.004,.2,d);tn(t,'sine',84,46,.4,.004,.2,d)},
+ tv_stow:(t,d)=>{nz(t,.42,'bandpass',950,.9,.32,.03,.36,d,320);nz(t+.2,.26,'bandpass',1500,1,.18,.02,.22,d,520)},
+ tv_flap:(t,d)=>{for(let i=0;i<3;i++)nz(t+i*.055,.05,'bandpass',520+i*170,1.4,.32,.004,.05,d)},
+ tv_clip:(t,d)=>{tn(t,'triangle',2300,1950,.32,.001,.12,d);tn(t+.05,'square',3150,3000,.07,.001,.05,d);nz(t,.05,'highpass',3600,.7,.22,.001,.04,d)},
+ tv_clunk:(t,d)=>{tn(t,'sine',150,62,.55,.003,.22,d);tn(t,'triangle',880,690,.22,.002,.17,d);nz(t,.12,'lowpass',900,.7,.42,.002,.1,d)},
+ tv_rung:(t,d)=>{tn(t,'sawtooth',118,92,.11,.01,.12,bp(d,520,4));nz(t,.05,'lowpass',700,.7,.14,.003,.05,d)}};
+const _tvSfx=sfx;sfx=function(type,vol,pos){const f=TV_SFX[type];if(!f)return _tvSfx.apply(this,arguments);if(muted||!ac())return;if(AC.state==='suspended')AC.resume();
+  try{f(AC.currentTime+.005,bus(pos,vol===undefined?1:vol,type==='tv_clunk'?.15:0))}catch(e){}};
+function tvBeep(f){if(muted||!AC||!MASTER)return;try{tn(AC.currentTime+.005,'sine',f,f*1.03,.07,.004,.07,bus(null,.5,0))}catch(e){}}
+function tvLoopInit(){const src=AC.createBufferSource();src.buffer=NBUF;src.loop=true;
+  const mk=(type,f,q)=>{const fl=AC.createBiquadFilter();fl.type=type;fl.frequency.value=f;fl.Q.value=q;const gn=AC.createGain();gn.gain.value=0;fl.connect(gn);gn.connect(MASTER);return[fl,gn]};
+  const [wf,wg]=mk('bandpass',500,.7),[hf,hg]=mk('highpass',3400,.7);src.connect(wf);src.connect(hf);
+  const o=AC.createOscillator();o.type='sawtooth';o.frequency.value=60;const [of,og]=mk('bandpass',220,5);o.connect(of);src.start();o.start();tv.loop={wf,wg,hf,hg,o,of,og}}
+function tvSound(){if(!AC||!MASTER||!NBUF)return;const g=tv.gl,z=tv.zip,act=!!((P.gliding&&g)||(P.onZip&&z));if(!tv.loop){if(!act)return;try{tvLoopInit()}catch(e){return}}
+  const L=tv.loop,t=AC.currentTime,on=!muted&&inGame()&&S.active&&P.alive?1:0,gs=P.gliding&&g?g.spd:0,zv=P.onZip&&z&&z.mount>=1?z.v:0;
+  L.wg.gain.setTargetAtTime(on*(gs?clamp((gs-3)/14,0,1)*.16+(g.stall?.05:0):zv?clamp(zv/18,0,1)*.06:0),t,.15);L.wf.frequency.setTargetAtTime(360+Math.max(gs,zv)*50,t,.2);
+  L.og.gain.setTargetAtTime(on*(zv?clamp(zv/14,0,1)*.045:z&&z.pull?.012:0),t,.08);L.o.frequency.setTargetAtTime(42+zv*10,t,.1);L.of.frequency.setTargetAtTime(150+zv*36,t,.1);
+  L.hg.gain.setTargetAtTime(on*(zv?clamp(zv/18,0,1)*.03*(keys.s?2.6:1):0),t,.1)}
+
+// ---------- HUD: flight / line strip and the "open glider" hint ----------
+{const st=document.createElement('style');st.textContent=`
+#tvHud{position:absolute;left:50%;bottom:150px;transform:translateX(-50%);min-width:260px;max-width:calc(100vw - 32px);background:rgba(20,20,18,.74);border-left:3px solid #e8a24a;padding:5px 11px 6px;font-size:13px;text-shadow:0 1px 2px #000;white-space:nowrap}
+#tvHud .tm{color:#f0b25a;font-weight:700;font-size:11px;letter-spacing:.16em;text-transform:uppercase;margin-right:9px}
+#tvHud .ts{font-weight:700}#tvHud .up{color:#9fe08a}#tvHud .dn{color:#ffb894}
+#tvHud .tw{color:#ff8a6a;font-weight:700;font-size:11px;letter-spacing:.1em;margin-left:9px}
+#tvHud .tb{height:3px;background:rgba(255,255,255,.1);margin-top:5px}#tvHud .tb i{display:block;height:100%;width:0;background:linear-gradient(90deg,#e8a24a,#ffd28a);transition:width .15s linear}
+#tvHud .tk{margin-top:5px;font-size:11.5px;color:#cfc7b8}
+#tvHud kbd,#tvHint kbd{background:#e3dccf;color:#111;padding:0 5px;margin:0 4px 0 8px;font-family:inherit;font-size:11px;font-weight:700}#tvHud .tk kbd:first-child,#tvHint kbd{margin-left:0}
+#tvHint{position:absolute;left:50%;top:calc(50% + 66px);transform:translateX(-50%);background:rgba(20,20,18,.78);border:1px solid rgba(232,162,74,.65);padding:5px 12px;font-weight:700;font-size:14px;white-space:nowrap;animation:tvPulse .9s ease-in-out infinite alternate}
+@keyframes tvPulse{from{box-shadow:0 0 0 rgba(232,162,74,0)}to{box-shadow:0 0 16px rgba(232,162,74,.6)}}
+@media(max-width:760px){#tvHud{bottom:160px;min-width:0}}`;document.head.appendChild(st);
+ const h=document.createElement('div');h.id='tvHud';h.className='hidden';h.innerHTML='<div><span class="tm"></span><span class="ts"></span><span class="tw"></span></div><div class="tb"><i></i></div><div class="tk"></div>';
+ const n=document.createElement('div');n.id='tvHint';n.className='hidden';n.innerHTML='<kbd>Space</kbd>Open glider';const hud=$('#hud');if(hud){hud.appendChild(h);hud.appendChild(n)}}
+const tvEl={hud:$('#tvHud'),hint:$('#tvHint')};
+if(tvEl.hud){tvEl.tm=tvEl.hud.querySelector('.tm');tvEl.ts=tvEl.hud.querySelector('.ts');tvEl.tw=tvEl.hud.querySelector('.tw');tvEl.tb=tvEl.hud.querySelector('.tb');tvEl.ti=tvEl.hud.querySelector('.tb i');tvEl.tk=tvEl.hud.querySelector('.tk')}
+function tvHud(){if(!tvEl.hud||!tvEl.tm)return;let mode='',stat='',keysH='',warn='',bar=-1;const g=tv.gl,z=tv.zip;
+  if(P.alive&&P.gliding&&g){mode='Gliding';const vs=g.vy;stat=`${Math.max(0,Math.round(g.agl))} m up · ${Math.round(g.spd)} m/s · <span class="${vs>=0?'up':'dn'}">${vs>=0?'▲':'▼'} ${Math.abs(vs).toFixed(1)} m/s</span>`;
+    keysH='<kbd>Space</kbd>stow<kbd>S</kbd>dive<kbd>W</kbd>flare<kbd>A</kbd><kbd>D</kbd>turn';warn=g.stall?'STALL — let go of W':g.tired?'ARMS TIRING':g.lift>.6?'THERMAL ▲':'';bar=clamp(g.agl/50,0,1)}
+  else if(P.alive&&P.onZip&&z){mode='Zipline';stat=z.mount<1?'clipping on…':z.pull?'hauling hand over hand':`${Math.round(z.v)} m/s`;keysH='<kbd>Space</kbd>jump off<kbd>S</kbd>brake<kbd>E</kbd>let go';warn=keys.s&&z.v>.5?'BRAKING':'';bar=z.dir>0?z.t:1-z.t}
+  else if(P.alive&&tv.lad){mode='Rope ladder';keysH='<kbd>W</kbd>up<kbd>S</kbd>down<kbd>Space</kbd>jump off'}
+  const key=mode+'|'+stat+'|'+warn+'|'+(bar>=0?Math.round(bar*60):'')+'|'+keysH;
+  if(key!==tv.hudKey){tv.hudKey=key;const el=tvEl.hud;if(!mode)el.classList.add('hidden');else{el.classList.remove('hidden');tvEl.tm.textContent=mode;tvEl.ts.innerHTML=stat;tvEl.tw.textContent=warn;tvEl.tk.innerHTML=keysH;tvEl.tb.style.display=bar>=0?'':'none';if(bar>=0)tvEl.ti.style.width=(bar*100).toFixed(1)+'%'}}
+  const hint=!!(P.alive&&S.active&&tv.canDeploy&&!mode);if(hint!==tv.hintOn){tv.hintOn=hint;if(tvEl.hint)tvEl.hint.classList.toggle('hidden',!hint)}}
+
+// ---------- state helpers ----------
+function tvS(){if(tv.P!==P){tv.P=P;tv.gl=null;tv.zip=null;tv.lad=null;tv.canDeploy=false;if(P){P.gliding=false;P.onZip=null}tvArmsOff();tv.armsBy=null;tvTrolley.visible=false}return tv}
+function tvBusy(){return!!(P&&tv.P===P&&((P.gliding&&tv.gl)||(P.onZip&&tv.zip)||tv.lad))}
+function tvPK(){return typeof PK!=='undefined'&&PK?PK:null}
+function tvCanStart(){if(!P||!P.alive||P.swim||P.grabbed||tvBusy())return false;if(typeof isDriving==='function'){try{if(isDriving())return false}catch(e){}}
+  const K=tvPK();if(K&&(K.gr||(K.act&&(K.act.type==='climb'||K.act.type==='vault'))))return false;return true}
+// keep the parkour module's buffers sane after we hand control back (stale jump buffer / coyote time)
+function tvPkSync(air){const K=tvPK();if(!K)return;try{K.act=null;K.jbuf=9;K.spaceLock=!!keys[' '];if(air){K.airT=1;K.jumped=true}}catch(e){}}
+function tvNetGl(on){tv.netT=1.5;if(!NET.role)return;try{netSend({k:'t_gl',on:on?1:0})}catch(e){}}
+function tvEndAll(quiet){if(tv.gl){tv.gl=null;if(!quiet)tvNetGl(0)}if(tv.zip){const h=tvGen.handles[tv.zip.Z.id+tv.zip.end];if(h)h.visible=true;tv.zip=null}tv.lad=null;if(P){P.gliding=false;P.onZip=null}tv.canDeploy=false}
+
+// ---------- glider ----------
+function tvThermal(x,y,z){if(!TV_THERMALS.length)return 0;const day=S.dayF===undefined?1:S.dayF;if(day<.3)return 0;const k=day*(1-.8*(S.rain||0));let best=0;
+  for(const th of TV_THERMALS){const d=dist2(x,z,th.x,th.z);if(d>=th.r)continue;const above=y-th.y0;if(above<-6||above>th.top)continue;
+    const f=(1-(d/th.r)*(d/th.r))*clamp(1-above/th.top,0,1)*(.8+.2*Math.sin(S.time*.06+th.ph));best=Math.max(best,th.s*f*k)}return best}
+function tvStorm(){if(typeof stormActive!=='function')return false;try{return!!stormActive()}catch(e){return false}}
+function tvGlideStart(){const hs=Math.hypot(P.vx,P.vz),hd=hs>2?Math.atan2(-P.vx,-P.vz):P.yaw,K=tvPK();if(K&&K.act)K.act=null;
+  tv.gl={t:0,open:0,hd,spd:clamp(hs,7.5,15),vy:P.vy,bank:0,turn:0,x:P.x,y:P.y,z:P.z,dist:0,flareT:0,stall:false,recT:0,tired:false,lift:0,agl:P.y-supportH(P.x,P.z,P.y),beepT:0,gustT:0,gust:0,gustR:0,caught:false,flapT:0,dustT:0};
+  P.gliding=true;P.drawing=false;P.draw=0;P.airPeak=P.y;tv.canDeploy=false;sfx('tv_open',.9);P.camShake=Math.max(P.camShake||0,.1);tvNetGl(1);
+  tip('tv_fly','Gliding','Steer with the mouse (or <b>A</b>/<b>D</b>). <b>S</b> dives to build speed, <b>W</b> flares to slow your sink — hold it too long and the wing stalls. <b>Space</b> stows the glider. No fall damage while the wing is open, but slamming into walls at speed hurts.')}
+function tvGlideEnd(why){const g=tv.gl;if(!g)return;tv.gl=null;P.gliding=false;tvNetGl(0);tvPkSync(why!=='land');const fx=-Math.sin(g.hd),fz=-Math.cos(g.hd);
+  if(why==='stow'){P.vx=fx*g.spd;P.vz=fz*g.spd;P.vy=g.vy;P.airPeak=P.y;sfx('tv_stow',.7)}else if(why==='land'||why==='water')sfx('tv_stow',.45);
+  if(g.dist>=25&&why!=='crash'&&why!=='death'){const xp=clamp(Math.round(g.dist/10),2,30);if(typeof gainXP==='function'){try{gainXP('agility',xp,'Glide '+Math.round(g.dist)+' m')}catch(e){}}
+    if(g.dist>=60&&g.dist>tv.best){tv.best=g.dist;feedMsg('Longest glide: '+Math.round(g.dist)+' m')}}}
+function tvStall(g){g.stall=true;g.recT=0;sfx('tv_flap',.8);P.camShake=Math.max(P.camShake||0,.2);
+  tip('tv_stall','Stall!','You flared too long and the wing lost its bite. Let go of <b>W</b> (or press <b>S</b> to dive) and it re-inflates.')}
+function tvGlideLand(x,z,sup,fx,fz,flare){const g=tv.gl;P.x=x;P.z=z;P.y=sup;P.vy=0;P.onGround=true;P.airPeak=sup;
+  const soft=flare&&g.spd<9.5,hard=!soft&&(g.spd>12.5||g.vy<-4.2),k=soft?.3:hard?.35:.5;P.vx=fx*g.spd*k;P.vz=fz*g.spd*k;
+  P.landT=soft?.2:hard?.85:.45;P.camShake=Math.max(P.camShake||0,hard?.3:.08);sfx(hard?'thud':'step',hard?.7:.6);burst(new V3(x,sup+.08,z),CHIP.dirt,hard?14:soft?4:7,2.2,1.2);
+  if(soft)feedMsg('Smooth landing');else if(hard)tip('tv_hard','Rough landing','Pull <b>W</b> just before touchdown to flare: the wing bleeds off speed and you land softly.');
+  tvGlideEnd('land')}
+// like core collide(), but solid ents (trees, rocks, barrels) only block when the glider is actually below their top
+function tvGlideCollide(o,rad,feet,height){
+  for(const e of nearEnts(o.x,o.z,3)){if(!e.solid)continue;const base=e.y!==undefined?e.y:groundH(e.x,e.z),top=base+(e.ph||1.5)*(e.t==='tree'?(e.s||1)*(e.sy||1)*1.08:1);if(feet>top||feet+height<base)continue;
+    const rr=e.r+rad,dx=o.x-e.x,dz=o.z-e.z,d=Math.hypot(dx,dz);if(d<rr&&d>1e-4){o.x=e.x+dx/d*rr;o.z=e.z+dz/d*rr;o.blocked=1}}
+  for(const b of nearBoxes(o.x,o.z,rad+.5)){if(b.maxy<=feet+.55||b.miny>=feet+height)continue;
+    const cx=clamp(o.x,b.minx,b.maxx),cz=clamp(o.z,b.minz,b.maxz),dx=o.x-cx,dz=o.z-cz,d=Math.hypot(dx,dz);
+    if(d<rad){if(d<1e-4){const opts=[[o.x-b.minx,-1,0],[b.maxx-o.x,1,0],[o.z-b.minz,0,-1],[b.maxz-o.z,0,1]].sort((a,c)=>a[0]-c[0]);const pen=opts[0];o.x+=pen[1]*(pen[0]+rad);o.z+=pen[2]*(pen[0]+rad)}else{o.x=cx+dx/d*rad;o.z=cz+dz/d*rad}o.blocked=1}}}
+function tvGlideCrash(fx,fz){const g=tv.gl,dmg=Math.round(5+(g.spd-8.5)*2.4);P.x=g.x;P.y=g.y;P.z=g.z;P.vx=-fx*2.5;P.vz=-fz*2.5;P.vy=Math.min(0,g.vy);P.airPeak=P.y;
+  sfx('thud',.9);sfx('tv_flap',.6);P.camShake=Math.max(P.camShake||0,.5);burst(new V3(P.x,P.y+1.4,P.z),['#c8833a','#e6d3a8','#8a7656'],10,2.5,1.5);tvGlideEnd('crash');feedMsg('Glider crash!');hurt(dmg,'fall')}
+function tvGlideTick(dt){const g=tv.gl;g.t+=dt;g.open=Math.min(1,g.open+dt/.45);
+  if(!has('glider')||P.swim||P.grabbed){tvGlideEnd('stow');return}
+  if(Math.abs(P.x-g.x)+Math.abs(P.z-g.z)+Math.abs(P.y-g.y)>6){g.x=P.x;g.y=P.y;g.z=P.z}   // something teleported us: fly on from there
+  const K=tvPK();if(K&&K.act&&(K.act.type==='climb'||K.act.type==='vault')){tvGlideEnd('stow');return}
+  if(g.t>.3&&keyPressed(' ')){tvGlideEnd('stow');return}
+  const turnIn=(keys.a?1:0)-(keys.d?1:0);if(turnIn)P.yaw+=turnIn*1.3*dt;
+  const dive=!!keys.s&&!keys.w,flare=!!keys.w&&!keys.s;
+  if(flare&&!g.stall){g.flareT+=dt;if(g.spd<6.4&&g.flareT>.5)tvStall(g)}else if(!flare)g.flareT=Math.max(0,g.flareT-dt*2);
+  if(g.stall){if(!keys.w)g.recT+=dt*(dive?2:1);else g.recT=0;if(g.recT>.65){g.stall=false;g.flareT=0;sfx('tv_catch',.55)}g.flapT-=dt;if(g.flapT<=0){g.flapT=R(.16,.32);sfx('tv_flap',.4)}}
+  // the wing follows the camera heading with a limited turn rate and banks into the turn
+  const dh=((P.yaw-g.hd+Math.PI*3)%(Math.PI*2))-Math.PI,maxT=g.stall?.5:dive?1.1:1.55,turn=clamp(dh*2.4,-maxT,maxT);
+  g.hd+=turn*dt;g.turn=lerp(g.turn,turn,Math.min(1,dt*6));g.bank=lerp(g.bank,clamp(g.turn*.36,-.55,.55)+(g.gustR||0),Math.min(1,dt*4));
+  // airspeed: dives convert height into speed, flares (and pulling out of a dive) convert speed back into lift
+  const tgt=g.stall?4.5:dive?16.5:flare?5.2:TV_SPD,rate=g.stall?3:dive?4.2:flare?5.2:g.spd>TV_SPD?2:3,old=g.spd;
+  g.spd=g.spd<tgt?Math.min(tgt,g.spd+rate*dt):Math.max(tgt,g.spd-rate*dt);
+  const dE=(g.spd*g.spd-old*old)*.5,zoom=(dE<0?-dE*.7:-dE*1.05)/9.8/Math.max(dt,1e-3);
+  const q=g.spd/TV_SPD;let sink=g.stall?5.6:TV_SINK*(.62+.38*q*q)+Math.max(0,7.2-g.spd)*.5+Math.abs(g.turn)*.3;
+  if(typeof useStamina==='function'){const ok=useStamina((flare?4:3)*dt);if(!ok&&!g.tired){g.tired=true;tip('tv_tired','Arms tiring','Out of stamina: you can\'t hold the wing trim and you sink faster. Land and catch your breath.')}else if(ok)g.tired=false}
+  if(g.tired)sink+=1.3;
+  const lift=tvThermal(g.x,g.y,g.z)*(g.stall?.3:1);g.lift=lift;if(lift>.8)tip('tv_thermal','Thermal!','Warm air rises over sun-baked rooftops and hilltops. Circle inside it to climb — the vario beeps faster the harder you rise.');
+  if(tvStorm()){g.gustT-=dt;if(g.gustT<=0){g.gustT=R(.4,1.1);g.gust=R(-2.4,1.6);g.gustR=R(-.18,.18)}}else{g.gust=lerp(g.gust,0,Math.min(1,dt*2));g.gustR=lerp(g.gustR,0,Math.min(1,dt*2))}
+  g.vy=lerp(g.vy,-sink+zoom+lift+g.gust,Math.min(1,dt*(g.open<1?2.6:4.5)));
+  if(!g.caught&&g.t>.32){g.caught=true;sfx('tv_catch',.7);P.camShake=Math.max(P.camShake||0,.14)}
+  const fx=-Math.sin(g.hd),fz=-Math.cos(g.hd);let nx=g.x+fx*g.spd*dt,nz=g.z+fz*g.spd*dt,ny=Math.min(g.y+g.vy*dt,TV_CEIL);
+  const o={x:nx,z:nz,blocked:0};tvGlideCollide(o,.34,ny,1.75);
+  if(o.blocked){const push=Math.hypot(o.x-nx,o.z-nz);if(g.spd>8.5&&push>g.spd*dt*.3){tvGlideCrash(fx,fz);return}nx=o.x;nz=o.z;g.spd=Math.max(5,g.spd-6*dt)}
+  nx=clamp(nx,6,WS-6);nz=clamp(nz,6,WS-6);
+  for(const b of nearBoxes(nx,nz,.4))if(nx>b.minx-.3&&nx<b.maxx+.3&&nz>b.minz-.3&&nz<b.maxz+.3&&b.miny<ny+1.85&&b.miny>=g.y+1.7){ny=b.miny-1.86;g.vy=Math.min(g.vy,0)}
+  if(!Number.isFinite(nx+ny+nz)){tvGlideEnd('stow');return}
+  const sup=supportH(nx,nz,ny);g.agl=ny-sup;g.dist+=Math.hypot(nx-g.x,nz-g.z);
+  if(ny<=sup+.02){tvGlideLand(nx,nz,sup,fx,fz,flare);return}
+  if(ny<.1&&groundH(nx,nz)<-.3){P.x=nx;P.z=nz;P.y=ny;P.vx=fx*g.spd*.4;P.vz=fz*g.spd*.4;P.vy=-1;tvGlideEnd('water');sfx('splash',.9);return}
+  g.x=nx;g.y=ny;g.z=nz;P.x=nx;P.y=ny;P.z=nz;P.vx=fx*g.spd;P.vz=fz*g.spd;P.vy=g.vy;P.onGround=false;P.airPeak=P.y;P.landT=0;
+  g.beepT-=dt;if(g.vy>.3&&g.beepT<=0){g.beepT=clamp(.55-g.vy*.09,.16,.55);tvBeep(640+Math.min(g.vy,4)*170)}
+  if(lift>.5){g.dustT-=dt;if(g.dustT<=0){g.dustT=.06;tvDust()}}
+  tv.netT-=dt;if(tv.netT<=0)tvNetGl(1)}
+
+// ---------- ziplines: riding ----------
+function tvZipPoint(Z,t,o){o=o||{};o.x=Z.a.x+(Z.b.x-Z.a.x)*t;o.z=Z.a.z+(Z.b.z-Z.a.z)*t;o.y=Z.a.y+(Z.b.y-Z.a.y)*t-Z.sag*4*t*(1-t);return o}
+function tvZipSlope(Z,t){return((Z.b.y-Z.a.y)-Z.sag*4*(1-2*t))/Z.L}   // rise per horizontal metre, a → b
+function tvHang(Z,t,face,sw,o){tvZipPoint(Z,t,o);const back=.4+Math.sin(sw)*1.4;o.x-=Z.dx*face*back;o.z-=Z.dz*face*back;o.y+=-TV_HANG+(1-Math.cos(sw))*1.4;return o}
+function tvZipMount(Z,end){if(!Z||!tvCanStart())return;
+  if(end==='b'&&!Z.twoWay){feedMsg('This is the bottom of the line — ride it from the post at the other end');return}
+  const K=tvPK();if(K&&K.act)K.act=null;
+  const d=end==='a'?1:-1,t0=end==='a'?.9/Z.L:1-.9/Z.L,push=Math.max(0,P.vx*Z.dx*d+P.vz*Z.dz*d);
+  tv.zip={Z,end,t:t0,dir:d,face:d,v:end==='a'?clamp(push,(Z.b.y<Z.a.y-2?6:4.5),9):TV_PULL*.6,mount:0,mdur:.3+Math.min(.3,Math.abs(tvHang(Z,t0,d,0,_tvH).y-P.y)*.07),sx:P.x,sy:P.y,sz:P.z,sw:0,swV:0,acc:0,dist:0,pull:false,sparkT:0,noiseT:0,lx:P.x,ly:P.y,lz:P.z};
+  P.onZip=Z;P.drawing=false;P.draw=0;P.pending=null;P.vx=P.vz=0;const h=tvGen.handles[Z.id+end];if(h)h.visible=false;sfx('tv_clip',.75);
+  tip('tv_zipride','On the line','Gravity does the work. <b>S</b> brakes (sparks!), <b>Space</b> jumps off and keeps your speed, <b>E</b> lets go.'+(has('glider')?' Jump off high up and open your glider.':''))}
+function tvZipPlace(dt){const z=tv.zip,h=tvHang(z.Z,z.t,z.face,z.sw,_tvH),id=1/Math.max(dt,1e-3);P.x=h.x;P.y=h.y;P.z=h.z;P.vx=(h.x-z.lx)*id;P.vy=(h.y-z.ly)*id;P.vz=(h.z-z.lz)*id;
+  z.lx=h.x;z.ly=h.y;z.lz=h.z;P.onGround=false;P.airPeak=P.y;P.landT=0}
+function tvZipEnd(why){const z=tv.zip;if(!z)return;const Z=z.Z;tv.zip=null;P.onZip=null;const h=tvGen.handles[Z.id+z.end];if(h)h.visible=true;
+  const sl=tvZipSlope(Z,z.t)*z.dir,vh=z.mount<1?0:z.v/Math.sqrt(1+sl*sl),fx=Z.dx*z.dir,fz=Z.dz*z.dir;
+  if(why==='jump'){P.vx=fx*vh;P.vz=fz*vh;P.vy=sl*vh+4.2;sfx('swish',.5)}
+  else if(why==='end'){P.vx=fx*vh*.5;P.vz=fz*vh*.5;P.vy=vh>7?1.6:0;sfx('tv_clunk',.8,tvZipPoint(Z,z.t,{}));P.camShake=Math.max(P.camShake||0,.12)}
+  else if(why==='bump'){P.vx=-fx*2;P.vz=-fz*2;P.vy=0}
+  else if(why==='tp'){P.vx=P.vz=P.vy=0}
+  else{P.vx=fx*vh;P.vz=fz*vh;P.vy=sl*vh}
+  P.onGround=false;P.airPeak=P.y;tvPkSync(true);
+  if(z.dist>=15&&why!=='bump'&&typeof gainXP==='function'){try{gainXP('agility',clamp(Math.round(z.dist/12),2,20),'Zipline ride')}catch(e){}}
+  if(!has('glider')&&z.dist>40)tip('tv_wantglider','Want to fly?','Craft a <b>Patchwork Glider</b> (Tab → Traversal: 60 cloth, 150 wood, 2 rope). Jump off a zipline high up and press <b>Space</b> to open it.');
+  if(why==='bump'){sfx('thud',.8);feedMsg('Knocked off the line');hurt(6,'fall')}}
+function tvZipTick(dt){const z=tv.zip,Z=z.Z;
+  if(P.grabbed){tvZipEnd('let');return}
+  if(z.mount<1){z.mount=Math.min(1,z.mount+dt/z.mdur);const e=z.mount*z.mount*(3-2*z.mount),h=tvHang(Z,z.t,z.face,0,_tvH);
+    P.x=lerp(z.sx,h.x,e);P.y=lerp(z.sy,h.y,e)+Math.sin(e*Math.PI)*.2;P.z=lerp(z.sz,h.z,e);P.vx=P.vz=P.vy=0;P.onGround=false;P.airPeak=P.y;z.lx=P.x;z.ly=P.y;z.lz=P.z;
+    if(z.mount>=1){sfx('tv_clip',.5);P.camShake=Math.max(P.camShake||0,.08)}return}
+  if(Math.abs(P.x-z.lx)+Math.abs(P.z-z.lz)+Math.abs(P.y-z.ly)>6){tvZipEnd('tp');return}   // teleported away from the line
+  if(keyPressed(' ')){tvZipEnd('jump');return}
+  const brake=!!keys.s,sl=tvZipSlope(Z,z.t)*z.dir,sn=sl/Math.sqrt(1+sl*sl);
+  let acc=-9.8*sn-TV_DRAG*z.v*z.v-TV_FRIC-(brake?5.5:0);z.v+=acc*dt;z.pull=false;
+  if(!brake&&sn<-.08){const vt=clamp(8+(-sn-.12)*40,8,TV_VMAX);if(z.v<vt){const nv=Math.min(vt,z.v+Math.max(1.5,(vt-z.v)*1.6)*dt);acc+=(nv-z.v)/Math.max(dt,1e-3);z.v=nv}}   // the trolley runs up to a slope-dependent cruise speed (8 m/s gentle, up to 18 m/s steep)
+  if(brake&&z.v<.45)z.v=0;   // braking holds you in place instead of letting gravity reverse you
+  else if(!brake&&z.v<TV_PULL&&sl<.3&&z.v>-.6&&(typeof useStamina!=='function'||useStamina(2.5*dt))){z.v=Math.min(TV_PULL,Math.max(0,z.v)+4.5*dt);z.pull=true}
+  if(z.v<0){z.dir=-z.dir;z.v=-z.v}
+  z.v=Math.min(z.v,TV_VMAX);if(z.v>.8)z.face=z.dir;
+  const s2=tvZipSlope(Z,z.t)*z.dir,dh=z.v*dt/Math.sqrt(1+s2*s2);z.t+=z.dir*dh/Z.L;z.dist+=dh;
+  const tA=.8/Z.L,tB=1-.8/Z.L;
+  if((z.dir>0&&z.t>=tB)||(z.dir<0&&z.t<=tA)){z.t=clamp(z.t,tA,tB);tvZipPlace(dt);tvZipEnd('end');return}
+  // the body swings fore/aft under the trolley when it speeds up or brakes
+  z.acc=lerp(z.acc,acc,Math.min(1,dt*6));z.swV+=(-6.5*z.sw-2.2*z.swV+z.acc*.35)*dt;z.sw=clamp(z.sw+z.swV*dt,-.5,.5);
+  tvZipPlace(dt);
+  for(const b of nearBoxes(P.x,P.z,.6))if(!b.mon&&b.maxy>P.y+.3&&b.miny<P.y+1.7&&P.x>b.minx-.35&&P.x<b.maxx+.35&&P.z>b.minz-.35&&P.z<b.maxz+.35){tvZipEnd('bump');return}
+  z.sparkT-=dt;if(z.sparkT<=0){z.sparkT=.035;const k=clamp(z.v/16,0,1)+(brake&&z.v>.5?.9:0);if(Math.random()<k){const c=tvZipPoint(Z,z.t,_tvP);tvSpark(c.x,c.y+.03,c.z,brake?3:1)}}
+  z.noiseT-=dt;if(z.noiseT<=0&&z.v>7){z.noiseT=.6;noise(P.x,P.z,20)}}   // > 18 so a client's whirr reaches the host's AI
+
+// ---------- rope ladders ----------
+function tvLadderStart(L,y){if(!L||!tvCanStart())return false;const K=tvPK();if(K&&K.act)K.act=null;
+  tv.lad={L,y:clamp(y,L.y0,L.y1-.05),stepY:y,t:0};P.vx=P.vz=P.vy=0;P.onGround=false;P.drawing=false;P.draw=0;sfx('tv_rung',.5);
+  tip('tv_ladder','Rope ladder','Hold <b>W</b> to climb and <b>S</b> to climb down. <b>Space</b> jumps off.');return true}
+function tvLadderEnd(air){tv.lad=null;tvPkSync(air)}
+function tvLadderGrab(){const fx=-Math.sin(P.yaw),fz=-Math.cos(P.yaw);
+  for(const L of TV_LADDERS){const rx=P.x-L.x,rz=P.z-L.z,dn=rx*L.nx+rz*L.nz,dl=-rx*L.nz+rz*L.nx;if(dn<0||dn>.85||Math.abs(dl)>.5)continue;
+    if(P.y<L.y0-.4||P.y>L.y1-.25||fx*-L.nx+fz*-L.nz<.3)continue;return tvLadderStart(L,Math.max(P.y,L.y0))}return false}
+function tvLadderTick(dt){const l=tv.lad,L=l.L;l.t+=dt;
+  if(P.grabbed||dist2(P.x,P.z,L.x+L.nx*.42,L.z+L.nz*.42)>3||Math.abs(P.y-l.y)>3){tvLadderEnd(true);return}
+  if(l.t>.15&&keyPressed(' ')){P.vx=L.nx*3.4;P.vz=L.nz*3.4;P.vy=3.2;P.airPeak=P.y;tvLadderEnd(true);sfx('swish',.4);return}
+  const up=(keys.w?1:0)-(keys.s?1:0);let sp=up>0?2.7:3.4;if(up>0&&typeof useStamina==='function'&&!useStamina(3*dt))sp=1.2;
+  l.y=clamp(l.y+up*sp*dt,L.y0,L.y1);P.x=L.x+L.nx*.42;P.z=L.z+L.nz*.42;P.y=l.y;P.vx=P.vz=P.vy=0;P.onGround=false;P.airPeak=P.y;P.landT=0;
+  if(Math.abs(l.y-l.stepY)>.34){l.stepY=l.y;sfx('tv_rung',.35)}
+  if(up>0&&l.y>=L.y1-.02){P.x=L.tx;P.z=L.tz;P.y=L.y1;P.onGround=true;tvLadderEnd(false);return}
+  if(up<0&&l.y<=L.y0+.01){P.y=L.y0;P.onGround=true;tvLadderEnd(false)}}
+
+// ---------- ziplines: deterministic layout (rooftops, radio mast hill, ridges) ----------
+function tvAddLine(a,b,kind,baseA,baseB,name){const L=dist2(a.x,a.z,b.x,b.z);
+  const Z={id:ZIPLINES.length,kind,name,a:{x:a.x,y:a.y,z:a.z},b:{x:b.x,y:b.y,z:b.z},L,dx:(b.x-a.x)/L,dz:(b.z-a.z)/L,sag:tvSag(L),sa:{x:a.x,z:a.z,y:baseA},sb:{x:b.x,z:b.z,y:baseB}};
+  Z.twoWay=(a.y-b.y)/L<=.155&&L<=60;ZIPLINES.push(Z);return Z}
+function tvObst(a,b,except){const m=2.5,x0=Math.min(a.x,b.x)-m,x1=Math.max(a.x,b.x)+m,z0=Math.min(a.z,b.z)-m,z1=Math.max(a.z,b.z)+m,bx=[],en=[];
+  for(const q of boxes)if(q.maxx>x0&&q.minx<x1&&q.maxz>z0&&q.minz<z1&&!(except&&except.includes(q)))bx.push(q);
+  for(const q of tvGen.boxes)if(q.maxx>x0&&q.minx<x1&&q.maxz>z0&&q.minz<z1)bx.push(q);
+  for(const e of ents)if(e.solid&&e.t!=='tree'&&e.x>x0&&e.x<x1&&e.z>z0&&e.z<z1)en.push(e);return{bx,en}}
+// the rider hanging under the cable must clear terrain, water, buildings and rocks along the whole line
+function tvLineClear(a,b,except){const L=dist2(a.x,a.z,b.x,b.z),sag=tvSag(L),O=tvObst(a,b,except),n=Math.ceil(L/1.5),ts=[.45/L,.9/L,1-.9/L];   // + where you clip on / get off
+  for(let i=1;i<n;i++)ts.push(i/n);
+  for(const t of ts){const x=lerp(a.x,b.x,t),z=lerp(a.z,b.z,t),cy=lerp(a.y,b.y,t)-sag*4*t*(1-t),fy=cy-TV_HANG;
+    if(fy<Math.max(groundH(x,z),0)+(t>.9?.3:1.2))return false;
+    for(const q of O.bx)if(x>q.minx-.45&&x<q.maxx+.45&&z>q.minz-.45&&z<q.maxz+.45&&q.maxy>fy-.05&&q.miny<cy+.3)return false;
+    for(const e of O.en)if(dist2(x,z,e.x,e.z)<(e.r||.5)+.55&&fy<e.y+(e.ph||1.5)+.2)return false}
+  return true}
+// terrain-only clearance along a line: -1 if the rider would touch ground/water, else the mean height above it
+function tvTerrainOK(a,b){const L=dist2(a.x,a.z,b.x,b.z),sag=tvSag(L),n=Math.ceil(L/2.5);let sum=0;
+  for(let i=1;i<n;i++){const t=i/n,x=lerp(a.x,b.x,t),z=lerp(a.z,b.z,t),fy=lerp(a.y,b.y,t)-sag*4*t*(1-t)-TV_HANG,c=fy-Math.max(groundH(x,z),0);if(c<(t>.9?.3:1.2))return-1;sum+=c}return sum/Math.max(1,n-1)}
+function tvAway(x,z,mT,mP,skip){if(typeof TOWN!=='undefined'&&TOWN&&typeof TOWN.x0==='number'&&x>TOWN.x0-mT&&x<TOWN.x1+mT&&z>TOWN.z0-mT&&z<TOWN.z1+mT)return false;
+  if(typeof POIS!=='undefined'&&Array.isArray(POIS))for(const p of POIS)if(p&&p!==skip&&typeof p.x==='number'&&dist2(x,z,p.x,p.z)<(p.r||30)+mP)return false;return true}
+function tvRoadAt(x,z){if(Math.abs(x-ROAD_X)<6)return true;try{return typeof onRoad==='function'&&!!onRoad(x,z)}catch(e){return false}}
+function tvEndOK(x,z,skip){const g=groundH(x,z);if(g<1.8||slopeAt(x,z)>.45||inMon(x,z,25)||inLake(x,z,8)||tvRoadAt(x,z)||!tvAway(x,z,12,6,skip))return false;
+  for(const q of boxes)if(q.maxx>x-2.5&&q.minx<x+2.5&&q.maxz>z-2.5&&q.minz<z+2.5)return false;
+  for(const q of tvGen.boxes)if(q.maxx>x-3&&q.minx<x+3&&q.maxz>z-3&&q.minz<z+3)return false;return true}
+function tvTowerSite(x,z){const H=1.75;let gmin=1e9,gmax=-1e9;for(const [ox,oz] of[[-H,-H],[H,-H],[-H,H],[H,H],[0,0]]){const g=groundH(x+ox,z+oz);gmin=Math.min(gmin,g);gmax=Math.max(gmax,g)}
+  if(gmin<2.5||gmax-gmin>1.8||tvRoadAt(x,z)||Math.abs(x-ROAD_X)<12||inMon(x,z,30)||inLake(x,z,12))return null;
+  for(const q of boxes)if(q.maxx>x-3&&q.minx<x+3&&q.maxz>z-3&&q.minz<z+3)return null;
+  for(const q of tvGen.boxes)if(q.maxx>x-4&&q.minx<x+4&&q.maxz>z-4&&q.minz<z+4)return null;
+  for(const e of ents)if(e.solid&&e.t!=='tree'&&Math.abs(e.x-x)<3+e.r&&Math.abs(e.z-z)<3+e.r)return null;return{x,z,g:gmax}}
+// post with a pulley block; (ux,uz) = direction the cable leaves the post
+function tvPost(W,x,base,z,h,ux,uz,start,where){const px=-uz,pz=ux,ry=Math.atan2(-pz,px),top=base+h;
+  tvSeg(W,'#5b4430',TVG.cyl,x,base-.25,z,x,top+.12,z,.12);tvBox(W,'#7b776f',x,base+.08,z,.5,.2,.5,0);
+  tvBox(W,'#4a3726',x,top-.2,z,.95,.12,.14,ry);
+  const wx=x+ux*.16,wz=z+uz*.16;tvSeg(W,'#555a5e',TVG.wheel,wx-px*.04,top,wz-pz*.04,wx+px*.04,top,wz+pz*.04,.13);tvBox(W,'#3a3e42',wx,top-.02,wz,.06,.32,.06,ry);
+  if(where==='ground'){const bx=x-ux*2.1,bz=z-uz*2.1,bg=groundH(bx,bz);tvSeg(W,'#4f3b28',TVG.cyl,x,top-.45,z,bx,bg-.15,bz,.065);tvBox(W,'#6e6a62',bx,bg+.05,bz,.36,.2,.36,0)}
+  else tvSeg(W,'#4f3b28',TVG.cyl,x,top-.6,z,x-ux*1.2,base+.02,z-uz*1.2,.06);
+  tvSeg(W,start?'#e8752a':'#d8d0c0',TVG.cyl,x,top-.95,z,x,top-.7,z,.128);
+  if(start){tvSeg(W,'#2e2a26',TVG.cyl,x,top+.1,z,x,top+.95,z,.022);tvBox(W,'#e8752a',x+px*.23,top+.78,z+pz*.23,.42,.26,.025,ry)}
+  tvGen.boxes.push({minx:x-.2,maxx:x+.2,minz:z-.2,maxz:z+.2,miny:base-.3,maxy:top+.1,mon:1,tvb:1});tvGen.clear.push({x,z,r:1.6})}
+function tvLadder(W,L){const tx=-L.nz,tz=L.nx,gy=groundH(L.x,L.z),top=L.y1+(L.lip||0)+.08;   // ropes hook over a parapet lip if there is one
+  for(const s of[-1,1]){const rx=L.x+tx*.22*s,rz=L.z+tz*.22*s;tvSeg(W,'#b49a68',TVG.cyl,rx,top,rz,rx,gy+.05,rz,.022);tvSeg(W,'#3a3e42',TVG.box,rx,top,rz,rx-L.nx*.5,top,rz-L.nz*.5,.035)}
+  for(let y=gy+.32;y<L.y1-.05;y+=.34)tvSeg(W,'#7a5a35',TVG.cyl,L.x-tx*.25,y,L.z-tz*.25,L.x+tx*.25,y,L.z+tz*.25,.024);
+  TV_LADDERS.push(L);tvGen.clear.push({x:L.sx,z:L.sz,r:1.2})}
+// launch tower: four legs, cross braces, plank deck, side rails, a rope ladder at the back; (nx,nz) = launch side
+function tvTower(W,site,nx,nz){const cx=site.x,cz=site.z,deck=site.g+TV_TOWER,H=1.55,wood='#5a4430',dark='#46351f';
+  for(const [ox,oz] of[[-H,-H],[H,-H],[-H,H],[H,H]]){const x=cx+ox,z=cz+oz,g=groundH(x,z);tvSeg(W,wood,TVG.box,x,g-.3,z,x,deck-.1,z,.11);tvBox(W,'#77736b',x,g+.06,z,.42,.22,.42,0);
+    tvGen.boxes.push({minx:x-.14,maxx:x+.14,minz:z-.14,maxz:z+.14,miny:g-.3,maxy:deck-.2,mon:1,tvb:1})}
+  const C=[[-H,-H],[H,-H],[H,H],[-H,H]],y0=site.g+.5,y1=(site.g+deck)/2,y2=deck-.45;
+  for(let i=0;i<4;i++){const [ax,az]=C[i],[bx,bz]=C[(i+1)%4];for(const [u,v] of[[y0,y1],[y1,y2]]){tvSeg(W,dark,TVG.box,cx+ax,u,cz+az,cx+bx,v,cz+bz,.05);tvSeg(W,dark,TVG.box,cx+ax,v,cz+az,cx+bx,u,cz+bz,.05)}}
+  tvBox(W,'#6e5034',cx,deck-.11,cz,3.5,.16,3.5,0);for(let i=0;i<6;i++)tvBox(W,i%2?'#7d5c3a':'#8a6842',cx,deck-.015,cz-1.46+i*.584,3.45,.03,.54,0);
+  tvGen.boxes.push({minx:cx-1.75,maxx:cx+1.75,minz:cz-1.75,maxz:cz+1.75,miny:deck-.2,maxy:deck,mon:1,tvb:1});
+  const tx=-nz,tz=nx,ax2=Math.abs(nx)>.5;
+  for(const s of[-1,1]){const rx=cx+tx*1.68*s,rz=cz+tz*1.68*s;
+    for(const k of[-1.66,0,1.66])tvSeg(W,wood,TVG.box,rx+nx*k,deck,rz+nz*k,rx+nx*k,deck+1.05,rz+nz*k,.045);
+    for(const hy of[.55,1.02])tvSeg(W,'#7d5c3a',TVG.box,rx-nx*1.7,deck+hy,rz-nz*1.7,rx+nx*1.7,deck+hy,rz+nz*1.7,.035);
+    tvGen.boxes.push({minx:rx-(ax2?1.72:.07),maxx:rx+(ax2?1.72:.07),minz:rz-(ax2?.07:1.72),maxz:rz+(ax2?.07:1.72),miny:deck,maxy:deck+1.05,mon:1,tvb:1})}
+  const lx=cx-nx*1.82,lz=cz-nz*1.82,sx=lx-nx*.42,sz=lz-nz*.42;tvLadder(W,{x:lx,z:lz,nx:-nx,nz:-nz,y0:groundH(sx,sz),y1:deck,sx,sz,tx:cx-nx*.85,tz:cz-nz*.85});
+  tvGen.clear.push({x:cx,z:cz,r:4.5});return deck}
+// best downhill line from a launch tower: coarse terrain search, then a full clearance check on the best few
+function tvHillLine(W,anchors,site,o){const deck=site.g+TV_TOWER,ay=deck+TV_POSTA,c=[];
+  for(let k=0;k<32;k++){const an=k/32*Math.PI*2+.07,ux=Math.sin(an),uz=Math.cos(an),sx=site.x+ux*1.3,sz=site.z+uz*1.3;
+    for(let L=o.minL;L<=o.maxL;L+=10){const ex=sx+ux*L,ez=sz+uz*L;if(ex<45||ez<45||ex>WS-45||ez>WS-45)break;const ge=groundH(ex,ez);if(ge<1.8)continue;
+      const by=ge+TV_POSTB,sl=(ay-by)/L;if(sl<o.minS||sl>.42)continue;const mc=tvTerrainOK({x:sx,y:ay,z:sz},{x:ex,y:by,z:ez});if(mc<0||!tvEndOK(ex,ez,o.skip))continue;
+      c.push({ux,uz,ex,ez,ge,by,sc:Math.min(L,140)*(1-Math.abs(sl-.22)*4)+Math.min(mc,12)*3+tvRand()*4})}}   // favour lively ~22% grades over long flat ones
+  c.sort((p,q)=>q.sc-p.sc);
+  for(const q of c.slice(0,48)){if(anchors.some(an=>dist2(an.x,an.z,q.ex,q.ez)<30))continue;
+    const axis=Math.abs(q.ux)>=Math.abs(q.uz),nx=axis?Math.sign(q.ux):0,nz=axis?0:Math.sign(q.uz),a={x:site.x+nx*1.3,y:ay,z:site.z+nz*1.3},b={x:q.ex,y:q.by,z:q.ez};
+    const L=dist2(a.x,a.z,b.x,b.z),sl=(a.y-b.y)/L;if(sl<o.minS-.02||sl>.45||!tvLineClear(a,b,null))continue;
+    tvTower(W,site,nx,nz);const Z=tvAddLine(a,b,o.kind,deck,q.ge,o.name);tvPost(W,a.x,deck,a.z,TV_POSTA,Z.dx,Z.dz,true,'deck');tvPost(W,b.x,q.ge,b.z,TV_POSTB,-Z.dx,-Z.dz,false,'ground');
+    anchors.push({x:site.x,z:site.z},{x:b.x,z:b.z});TV_THERMALS.push({x:site.x,z:site.z,r:26,s:3.4,y0:site.g,top:55,ph:tvRand()*6});return Z}
+  return null}
+function tvRectEdge(b,cx,cz,ux,uz,inset){let t=1e9;if(ux>1e-6)t=Math.min(t,(b.maxx-cx)/ux);else if(ux<-1e-6)t=Math.min(t,(b.minx-cx)/ux);
+  if(uz>1e-6)t=Math.min(t,(b.maxz-cz)/uz);else if(uz<-1e-6)t=Math.min(t,(b.minz-cz)/uz);t-=inset;if(!(t>.3)||t>1e8)return null;
+  const x=cx+ux*t,z=cz+uz*t;if(x<b.minx+.6||x>b.maxx-.6||z<b.minz+.6||z>b.maxz-.6)return null;return{x,z}}
+function tvSiteFree(x,z,y,r,own){for(const q of boxes)if(q!==own&&q.maxx>x-r&&q.minx<x+r&&q.maxz>z-r&&q.minz<z+r&&q.maxy>y+.1&&q.miny<y+3.5)return false;
+  for(const q of tvGen.boxes)if(q.maxx>x-r&&q.minx<x+r&&q.maxz>z-r&&q.minz<z+r&&q.maxy>y+.1&&q.miny<y+3.5)return false;return true}
+// rope ladder down an outside wall of a roof, on the side facing away from the line
+function tvRoofLadder(W,r,ux,uz){if(r.lad)return;const b=r.b,sides=[[1,0],[-1,0],[0,1],[0,-1]].sort((p,q)=>(p[0]*ux+p[1]*uz)-(q[0]*ux+q[1]*uz));
+  for(const [nx,nz] of sides)for(const f of[0,-.3,.3]){const along=nx?(b.maxz-b.minz):(b.maxx-b.minx);
+    const lx=nx>0?b.maxx+.07:nx<0?b.minx-.07:r.cx+f*along,lz=nz>0?b.maxz+.07:nz<0?b.minz-.07:r.cz+f*along,sx=lx+nx*.42,sz=lz+nz*.42,y0=groundH(sx,sz),y1=r.top;
+    if(y1-y0<2.4||y1-y0>18||y0<.5)continue;
+    const x0=nx?Math.min(lx,lx+nx*.85):lx-.45,x1=nx?Math.max(lx,lx+nx*.85):lx+.45,z0=nz?Math.min(lz,lz+nz*.85):lz-.45,z1=nz?Math.max(lz,lz+nz*.85):lz+.45;let ok=true;
+    for(const q of boxes)if(q!==b&&q.maxx>x0&&q.minx<x1&&q.maxz>z0&&q.minz<z1&&q.maxy>y0+.15&&q.miny<y1-.15){ok=false;break}
+    if(ok)for(const q of tvGen.boxes)if(q.maxx>x0&&q.minx<x1&&q.maxz>z0&&q.minz<z1&&q.maxy>y0+.15&&q.miny<y1-.15){ok=false;break}
+    if(!ok)continue;
+    // parapet / trim along this roof edge: the ladder hooks over it and you step over it at the top
+    let lip=0;const ix0=nx?Math.min(lx,lx-nx*.7):lx-.3,ix1=nx?Math.max(lx,lx-nx*.7):lx+.3,iz0=nz?Math.min(lz,lz-nz*.7):lz-.3,iz1=nz?Math.max(lz,lz-nz*.7):lz+.3;
+    for(const q of boxes)if(q!==b&&q.maxx>ix0&&q.minx<ix1&&q.maxz>iz0&&q.minz<iz1&&q.miny>y1-.15&&q.miny<y1+.15&&q.maxy<y1+1.2)lip=Math.max(lip,q.maxy-y1);
+    tvLadder(W,{x:lx,z:lz,nx,nz,y0,y1,sx,sz,tx:lx-nx*.85,tz:lz-nz*.85,lip});r.lad=true;return}}
+function tvGenTown(W,anchors){if(typeof TOWN==='undefined'||!TOWN)return 0;const T=TOWN;
+  const inT=(x,z)=>{if(typeof T.x0==='number')return x>T.x0&&x<T.x1&&z>T.z0&&z<T.z1;try{return typeof inTown==='function'&&!!inTown(x,z,0)}catch(e){return false}};
+  let Rf=[];for(const b of boxes){if(!b.mon||b.tvb)continue;const w=b.maxx-b.minx,d=b.maxz-b.minz;if(w<3.2||d<3.2||w>70||d>70)continue;const cx=(b.minx+b.maxx)/2,cz=(b.minz+b.maxz)/2;if(!inT(cx,cz))continue;
+    const h=b.maxy-groundH(cx,cz);if(h<4.4||h>45)continue;Rf.push({b,cx,cz,top:b.maxy,w,d,n:0,lad:false})}
+  if(Rf.length>140){Rf.sort((p,q)=>q.top-p.top);Rf=Rf.slice(0,140)}
+  // a usable roof is open sky: small props (vents, tanks, stair huts) are fine, an upper floor covering it is not
+  Rf=Rf.filter(r=>{const b=r.b;let cov=0;for(const o of boxes){if(o===b||o.maxy<=b.maxy+.05||o.miny>=b.maxy+3)continue;const ox=Math.min(o.maxx,b.maxx)-Math.max(o.minx,b.minx),oz=Math.min(o.maxz,b.maxz)-Math.max(o.minz,b.minz);if(ox>0&&oz>0)cov+=ox*oz}return cov<r.w*r.d*.35});
+  const cand=[];
+  for(let i=0;i<Rf.length;i++)for(let j=i+1;j<Rf.length;j++){const A=Rf[i],B=Rf[j],dC=dist2(A.cx,A.cz,B.cx,B.cz);if(dC<16||dC>85)continue;
+    const hi=A.top>=B.top?A:B,lo=hi===A?B:A,ux=(lo.cx-hi.cx)/dC,uz=(lo.cz-hi.cz)/dC,pa=tvRectEdge(hi.b,hi.cx,hi.cz,ux,uz,1.1),pb=tvRectEdge(lo.b,lo.cx,lo.cz,-ux,-uz,1.7);if(!pa||!pb)continue;   // low post set deeper in: the rider stops ~1.2 m short of it, still over the roof
+    const L=dist2(pa.x,pa.z,pb.x,pb.z);if(L<20||L>70)continue;let ay=hi.top+TV_POSTA;const by=lo.top+TV_POSTB,need=.15*L-(ay-by);let extra=0;if(need>0){if(need>2.3)continue;extra=need;ay+=need}
+    const sl=(ay-by)/L;if(sl>.5)continue;cand.push({hi,lo,pa,pb,ay,by,extra,ux,uz,sc:60-Math.abs(L-42)*.6-Math.abs(sl-.16)*45-extra*3+tvRand()*2})}
+  cand.sort((p,q)=>q.sc-p.sc);let n=0;const mids=[];
+  for(const c of cand){if(n>=7)break;if(c.hi.n>=2||c.lo.n>=2)continue;
+    if(anchors.some(a=>dist2(a.x,a.z,c.pa.x,c.pa.z)<4.5||dist2(a.x,a.z,c.pb.x,c.pb.z)<4.5))continue;
+    const mx=(c.pa.x+c.pb.x)/2,mz=(c.pa.z+c.pb.z)/2;if(mids.some(m=>dist2(m.x,m.z,mx,mz)<14))continue;
+    const a={x:c.pa.x,y:c.ay,z:c.pa.z},b={x:c.pb.x,y:c.by,z:c.pb.z};
+    if(!tvSiteFree(a.x,a.z,c.hi.top,.5,c.hi.b)||!tvSiteFree(b.x,b.z,c.lo.top,.5,c.lo.b)||!tvLineClear(a,b,[c.hi.b,c.lo.b]))continue;
+    const Z=tvAddLine(a,b,'town',c.hi.top,c.lo.top,'Rooftop line');tvPost(W,a.x,c.hi.top,a.z,a.y-c.hi.top,Z.dx,Z.dz,true,'roof');tvPost(W,b.x,c.lo.top,b.z,TV_POSTB,-Z.dx,-Z.dz,false,'roof');
+    c.hi.n++;c.lo.n++;anchors.push({x:a.x,z:a.z},{x:b.x,z:b.z});mids.push({x:mx,z:mz});n++;tvRoofLadder(W,c.hi,c.ux,c.uz);tvRoofLadder(W,c.lo,-c.ux,-c.uz)}
+  // sun-baked roofs breed thermals: one over the town, a couple over the biggest roofs
+  if(typeof T.x0==='number'){const w=T.x1-T.x0,d=T.z1-T.z0,cx=(T.x0+T.x1)/2,cz=(T.z0+T.z1)/2;TV_THERMALS.push({x:cx,z:cz,r:clamp(Math.min(w,d)*.3,22,60),s:2.8,y0:groundH(cx,cz)+6,top:55,ph:tvRand()*6})}
+  for(const r of Rf.slice().sort((p,q)=>q.w*q.d-p.w*p.d).slice(0,2))TV_THERMALS.push({x:r.cx,z:r.cz,r:Math.max(r.w,r.d)*.6+5,s:2.5,y0:r.top,top:50,ph:tvRand()*6});
+  return n}
+function tvGenRadio(W,anchors){if(typeof POIS==='undefined'||!Array.isArray(POIS))return 0;const p=POIS.find(q=>q&&(q.id==='radio'||q.id==='tower'||q.id==='mast'))||POIS.find(q=>q&&/radio|mast/i.test((q.name||'')+' '+(q.sub||'')));if(!p||typeof p.x!=='number')return 0;
+  const sites=[];for(const r of[10,14,18,23,28,34])for(let k=0;k<12;k++){const an=k/12*Math.PI*2,s=tvTowerSite(p.x+Math.sin(an)*r,p.z+Math.cos(an)*r);if(s)sites.push(s)}
+  sites.sort((a,b)=>b.g-a.g);for(const s of sites.slice(0,8))if(tvHillLine(W,anchors,s,{minL:90,maxL:230,minS:.12,kind:'radio',name:'Mast line',skip:p}))return 1;return 0}
+function tvPeaks(west){const pts=[],st=12,nb=[[24,0],[-24,0],[0,24],[0,-24],[17,17],[-17,17],[17,-17],[-17,-17]];
+  for(let x=60;x<WS-60;x+=st)for(let z=60;z<WS-60;z+=st){if(west&&x>WS/2)continue;const h=groundH(x,z);if(h<7)continue;
+    if(inMon(x,z,MON.pad+30)||inLake(x,z,30)||Math.abs(x-ROAD_X)<22||!tvAway(x,z,50,30))continue;let top=true;for(const [dx,dz] of nb)if(groundH(x+dx,z+dz)>h){top=false;break}if(top)pts.push({x,z,h})}
+  pts.sort((a,b)=>b.h-a.h);const out=[];for(const p of pts){if(out.some(q=>dist2(q.x,q.z,p.x,p.z)<130))continue;out.push(p);if(out.length>=14)break}return out}
+function tvGenHills(W,anchors){const wm=typeof TOWN!=='undefined'||typeof POIS!=='undefined',want=wm?3:4,peaks=tvPeaks(!wm);let n=0;
+  for(const p of peaks.slice(0,6))TV_THERMALS.push({x:p.x,z:p.z,r:24,s:3.2,y0:p.h,top:50,ph:tvRand()*6});
+  for(const p of peaks){if(n>=want)break;if(anchors.some(a=>dist2(a.x,a.z,p.x,p.z)<120))continue;let site=null;
+    for(const [ox,oz] of[[0,0],[6,0],[-6,0],[0,6],[0,-6],[10,10],[-10,-10]]){site=tvTowerSite(p.x+ox,p.z+oz);if(site)break}
+    if(site&&tvHillLine(W,anchors,site,{minL:60,maxL:200,minS:.13,kind:'hill',name:'Ridge line'}))n++}
+  return n}
+// clear trees from the riding corridors and around posts/towers (same result on every peer)
+function tvClearTrees(){const rm=new Set();
+  for(const e of ents){if(e.t!=='tree')continue;const s=e.s||1,top=e.y+8.6*s*(e.sy||1),cr=2.4*s+.8;let hit=false;
+    for(const c of tvGen.clear)if(dist2(e.x,e.z,c.x,c.z)<c.r+cr*.5){hit=true;break}
+    if(!hit)for(const Z of ZIPLINES){const t=clamp(((e.x-Z.a.x)*Z.dx+(e.z-Z.a.z)*Z.dz)/Z.L,0,1),px=Z.a.x+Z.dx*Z.L*t,pz=Z.a.z+Z.dz*Z.L*t;if(dist2(e.x,e.z,px,pz)>cr+.6)continue;
+      if(top>tvZipPoint(Z,t,_tvP).y-TV_HANG-.4){hit=true;break}}
+    if(hit)rm.add(e)}
+  if(!rm.size)return;for(const e of rm){try{hideTree(e);const T=treeInst[e.kind];if(T&&T.free)T.free.push(e.idx)}catch(err){}}ents=ents.filter(e=>!rm.has(e))}
+function tvCableParts(C,LP,Z){const n=Math.max(6,Math.ceil(Z.L/2.5));let p0=tvZipPoint(Z,0,{});
+  for(let i=1;i<=n;i++){const p1=tvZipPoint(Z,i/n,{});tvSeg(C,'#3b3e41',TVG.cyl5,p0.x,p0.y,p0.z,p1.x,p1.y,p1.z,.021);p0=p1}
+  if(Z.L>45)for(let d=18;d<Z.L-12;d+=18){const p=tvZipPoint(Z,d/Z.L,{});C.push({g:TVG.ball,c:'#e8752a',m:tvM(p.x,p.y,p.z,0,.24,.24,.24)})}
+  const pb=tvZipPoint(Z,1-.55/Z.L,{});C.push({g:TVG.box,c:'#202020',m:tvM(pb.x,pb.y,pb.z,Math.atan2(-Z.dz,Z.dx),.16,.12,.12)});
+  const m=Math.max(4,Math.ceil(Z.L/5));let q0=tvZipPoint(Z,0,{});for(let i=1;i<=m;i++){const q1=tvZipPoint(Z,i/m,{});LP.push(q0.x,q0.y,q0.z,q1.x,q1.y,q1.z);q0=q1}}
+function tvGenerate(){
+  for(const o of tvGen.objs)if(o.parent)o.parent.remove(o);for(const g of tvGen.geos)g.dispose();
+  tvGen.objs=[];tvGen.geos=[];tvGen.handles={};tvGen.boxes=[];tvGen.clear=[];boxes=boxes.filter(b=>!b.tvb);
+  ZIPLINES.length=0;TV_LADDERS.length=0;TV_THERMALS.length=0;tvRand=tvRng(0x51DE7A11);
+  const W=[],C=[],LP=[],anchors=[],cnt={town:0,radio:0,hill:0};
+  try{cnt.town=tvGenTown(W,anchors)}catch(e){console.error('traversal: town lines',e)}
+  try{cnt.radio=tvGenRadio(W,anchors)}catch(e){console.error('traversal: radio line',e)}
+  try{cnt.hill=tvGenHills(W,anchors)}catch(e){console.error('traversal: hill lines',e)}
+  for(const Z of ZIPLINES)tvCableParts(C,LP,Z);
+  const add=(geo,mat,sh)=>{const m=new THREE.Mesh(geo,mat);m.castShadow=sh;m.receiveShadow=sh;world.add(m);tvGen.geos.push(geo);tvGen.objs.push(m)};
+  if(W.length)add(tvMerge(W,.1),TVM.vc,true);if(C.length)add(tvMerge(C,0),TVM.cable,false);
+  if(LP.length){const g=new THREE.BufferGeometry();g.setAttribute('position',new THREE.BufferAttribute(new Float32Array(LP),3));const l=new THREE.LineSegments(g,TVM.line);world.add(l);tvGen.geos.push(g);tvGen.objs.push(l)}
+  for(const Z of ZIPLINES)for(const e of Z.twoWay?['a','b']:['a']){const d=e==='a'?1:-1,p=tvZipPoint(Z,e==='a'?.9/Z.L:1-.9/Z.L,{}),h=new THREE.Mesh(TV_HANDLE,TVM.vc);
+    h.position.set(p.x,p.y,p.z);h.rotation.y=Math.atan2(-Z.dx*d,-Z.dz*d);h.castShadow=true;world.add(h);tvGen.objs.push(h);tvGen.handles[Z.id+e]=h}
+  for(const b of tvGen.boxes)boxes.push(b);
+  try{tvClearTrees()}catch(e){console.error('traversal: corridor clearing',e)}
+  tvGen.count=cnt}
+
+// ---------- interaction (aim-independent proximity) ----------
+function tvNearTarget(){if(!P||!P.alive)return null;let best=null,bd=1e9;
+  for(const Z of ZIPLINES)for(const e of['a','b']){const s=e==='a'?Z.sa:Z.sb,d=dist2(P.x,P.z,s.x,s.z);if(d<2.5&&d<bd&&Math.abs(P.y-s.y)<1.7){bd=d;best={kind:e==='a'?'zipline':Z.twoWay?'zipline_up':'zipline_end',e:{Z,end:e}}}}
+  for(const L of TV_LADDERS){const d0=dist2(P.x,P.z,L.sx,L.sz);if(d0<1.3&&d0<bd&&Math.abs(P.y-L.y0)<1.3){bd=d0;best={kind:'tv_ladder',e:L}}
+    const d1=dist2(P.x,P.z,L.tx,L.tz);if(d1<1.3&&d1<bd&&Math.abs(P.y-L.y1)<.8){bd=d1;best={kind:'tv_ladder_down',e:L}}}
+  return best}
+INTERACT_DO.zipline=t=>tvZipMount(t.e.Z,t.e.end);INTERACT_DO.zipline_up=t=>tvZipMount(t.e.Z,t.e.end);
+INTERACT_DO.zipline_end=t=>{feedMsg('The line runs downhill to here — ride it from the post with the orange pennant');tip('tv_zip_end','Bottom of the line','This is where the zipline ends. Follow the cable uphill (or check the map) to find the start post.')};
+INTERACT_DO.tv_ladder=t=>{const L=t.e;if(tvLadderStart(L,Math.max(P.y,L.y0)))P.yaw=Math.atan2(L.nx,L.nz)};
+INTERACT_DO.tv_ladder_down=t=>{const L=t.e;if(tvLadderStart(L,L.y1-.12)){P.yaw=Math.atan2(L.nx,L.nz);P.x=L.x+L.nx*.42;P.z=L.z+L.nz*.42;P.y=L.y1-.12}};
+{const _it=interactTarget;interactTarget=function(){if(P&&tvBusy())return null;const r=_it.apply(this,arguments);return r||tvNearTarget()}}
+{const _in=interact;interact=function(){if(P&&P.alive&&tvBusy()){if(tv.zip&&tv.zip.mount>=1)tvZipEnd('let');return}return _in.apply(this,arguments)}}
+// hands are busy: no item use while gliding, on a line or on a ladder
+{const _pr=primary;primary=function(){if(tvBusy())return;return _pr.apply(this,arguments)}}
+{const _se=secondary;secondary=function(){if(tvBusy())return;return _se.apply(this,arguments)}}
+// while we drive the body, skip the parkour movement block (it would fight over position, ledge-grab mid-flight, etc.)
+function tvMoveStub(dt){P.landT=Math.max(0,(P.landT||0)-dt*2.4);P.crouch=false;P.swim=false;P.eye=lerp(P.eye||1.62,1.62,Math.min(1,dt*12));P.strafeV=lerp(P.strafeV||0,0,Math.min(1,dt*8));
+  if(typeof pkStamTick==='function'){try{pkStamTick(dt,false)}catch(e){}}
+  if(typeof pkCam==='function'){try{pkCam(dt)}catch(e){}}return 0}
+if(typeof pkMove==='function'){const _pk=pkMove;pkMove=function(dt){if(P&&P.alive&&tvBusy())return tvMoveStub(dt);return _pk.apply(this,arguments)}}
+
+// ---------- drawing (render hook) ----------
+function tvDrawGlider(dt){const g=tv.gl,want=!!(P.alive&&P.gliding&&g),G=tvGlider;tv.ck=clamp(tv.ck+(want?dt/.42:-dt/.3),0,1);
+  if(tv.ck<=0){if(G.visible)G.visible=false;tvArmsOffIf('gl');return false}
+  G.visible=true;G.position.set(P.x,P.y+1.38,P.z);if(g){tv.cHd=g.hd;tv.cBank=g.bank;tv.cPitch=g.stall?.3+Math.sin(S.time*9)*.07:keys.s?-.16:keys.w?.18:0}
+  G.rotation.set(lerp(G.rotation.x,tv.cPitch,Math.min(1,dt*6)),tv.cHd,tv.cBank,'YXZ');
+  const s=want?tvBackOut(tv.ck):tv.ck,st=g&&g.stall?.86+Math.sin(S.time*11)*.05:1;G.userData.wing.scale.set((.1+.9*s)*st,.15+.85*s,.15+.85*s);
+  if(want&&tv.ck>.35){G.updateMatrixWorld(true);const w=G.userData.wing,c=Math.cos(tv.cHd),sn=Math.sin(tv.cHd);
+    for(let i=0;i<2;i++){const sg=i?1:-1;_tvV.set(sg*.24,.44,-.28);w.localToWorld(_tvV);const hx=_tvV.x,hy=_tvV.y-.25,hz=_tvV.z,lx=sg*.22,lz=.12;
+      tvArm(tvArms[i],P.x+lx*c+lz*sn,P.y+1.26,P.z-lx*sn+lz*c,hx,hy,hz)}tv.armsBy='gl'}
+  else tvArmsOffIf('gl');return true}
+function tvDrawZip(){const z=tv.zip;if(!(P.alive&&P.onZip&&z)){if(tvTrolley.visible)tvTrolley.visible=false;tvArmsOffIf('zip');return}
+  const Z=z.Z,c=tvZipPoint(Z,z.t,_tvP),fx=Z.dx*z.face,fz=Z.dz*z.face,rx=-fz,rz=fx,ph=z.pull?Math.sin(S.time*7)*.13:0;
+  tvTrolley.visible=true;tvTrolley.position.set(c.x,c.y,c.z);tvTrolley.rotation.set(0,Math.atan2(-fx,-fz),0);
+  for(let i=0;i<2;i++){const sg=i?1:-1,o=sg*ph;tvArm(tvArms[i],P.x+rx*sg*.21+fx*.05,P.y+1.3,P.z+rz*sg*.21+fz*.05,c.x+rx*sg*.17+fx*o,c.y-.5,c.z+rz*sg*.17+fz*o)}tv.armsBy='zip'}
+function tvDrawRemote(dt){let any=false;const now=performance.now();
+  for(const id in tv.remote){const r=tv.remote[id],a=avatars[id],ok=!!(a&&a.obj),want=r.on&&now-r.t<4500&&ok;r.k=clamp(r.k+(want?dt/.45:-dt/.35),0,1);
+    if(r.k>0&&ok){if(!r.g)r.g=tvMakeGlider();if(r.g.parent!==a.obj){if(r.g.parent)r.g.parent.remove(r.g);a.obj.add(r.g)}r.g.visible=true;r.g.position.set(0,1.38,0);
+      const s=want?tvBackOut(r.k):r.k;r.g.userData.wing.scale.set(.1+.9*s,.15+.85*s,.15+.85*s);any=true}
+    else if(r.g){r.g.visible=false;if(!ok&&r.g.parent)r.g.parent.remove(r.g)}
+    if(!ok&&!r.on&&r.k<=0){if(r.g&&r.g.parent)r.g.parent.remove(r.g);delete tv.remote[id]}}
+  return any}
+
+// ---------- hooks ----------
+RELAY.add('t_gl');
+onHook('netMsg',m=>{if(!m||m.k!=='t_gl')return;const id=m.from;if(!id||id===NET.myId)return;const r=tv.remote[id]||(tv.remote[id]={on:false,t:0,k:0,g:null});r.on=!!m.on;r.t=performance.now()});
+onHook('newGame',()=>{tv.P=null;tvS();for(const id in tv.remote){const r=tv.remote[id];if(r.g&&r.g.parent)r.g.parent.remove(r.g)}tv.remote={};tv.hudKey='';tv.hintOn=null;
+  try{tvGenerate()}catch(e){console.error('traversal generate',e)}tv.retry=typeof TOWN!=='undefined'&&TOWN&&!tvGen.count.town?.001:0});
+onHook('death',()=>{tvS();tvEndAll(false)});
+onHook('respawn',()=>{tvS();tvEndAll(true);if(P){P.onGround=true;P.airPeak=P.y;P.vx=P.vz=P.vy=0;P.landT=0;try{tvPkSync(false);const K=tvPK();if(K){K.airT=0;K.jumped=false}}catch(e){}}});
+onHook('gain',id=>{if(id==='glider')tip('tv_glider','Patchwork Glider','It rides folded on your back — no hotbar slot needed. Jump off something high (a roof, a launch tower, a zipline) and press <b>Space</b> while falling to open it.')});
+onHook('anyTick',dt=>{if(!S||!P)return;if(tvBusy())mouseL=false;
+  if(tv.retry){tv.retry+=dt;if(tv.retry>1.5){tv.retry=0;if(!tvBusy()){try{tvGenerate()}catch(e){console.error('traversal regenerate',e)}}}}});
+onHook('playerTick',dt=>{if(!S||!P)return;tvS();if(!P.alive)return;
+  if(tv.zip){if(P.onZip)tvZipTick(dt);else tvZipEnd('let');return}
+  if(tv.gl){if(P.gliding)tvGlideTick(dt);else tvGlideEnd('stow');return}
+  if(tv.lad){tvLadderTick(dt);return}
+  tv.canDeploy=false;
+  if(tvCanStart()){
+    if(!P.onGround&&P.vy<-3&&has('glider')){const agl=P.y-supportH(P.x,P.z,P.y);if(agl>=4&&P.y>.5){tv.canDeploy=true;if(keyPressed(' ')){tvGlideStart();return}
+      tip('tv_deploy','Open your glider','You are falling — press <b>Space</b> to open your <b>Patchwork Glider</b>.')}}
+    if(keys.w&&tvLadderGrab())return}
+  tv.nearT-=dt;if(tv.nearT<=0){tv.nearT=.5;let nd=1e9;for(const Z of ZIPLINES)nd=Math.min(nd,dist2(P.x,P.z,Z.a.x,Z.a.z),dist2(P.x,P.z,Z.b.x,Z.b.z));
+    if(nd<18)tip('tv_zip','Ziplines','Steel lines run downhill from rooftops and launch towers (orange on the map). Stand by the start post with the orange pennant and press <b>E</b> to clip on. <b>S</b> brakes, <b>Space</b> jumps off with your speed.');
+    for(const L of TV_LADDERS)if(dist2(P.x,P.z,L.sx,L.sz)<6&&Math.abs(P.y-L.y0)<3){tip('tv_ladder','Rope ladder','Walk into it and hold <b>W</b> to climb (or press <b>E</b>). <b>S</b> climbs down, <b>Space</b> jumps off.');break}}});
+onHook('render',dt=>{if(!S||!P)return;tvS();const alive=P.alive,g=tv.gl,z=tv.zip;
+  // camera: bank into glider turns, sway on the line, speed FOV kick (camera.fov is restored in the hud hook after the draw)
+  let rT=0,pT=0,fT=0;
+  if(alive&&P.gliding&&g){rT=g.bank*.55+(g.stall?Math.sin(S.time*13)*.025:0);pT=g.stall?-.04:0;fT=clamp((g.spd-7)*.75,0,8)+(g.stall?2:0)}
+  else if(alive&&P.onZip&&z){rT=Math.sin(S.time*1.9)*.012*Math.min(1,z.v/8);pT=z.sw*.2;fT=clamp((z.v-5)*.6,0,8)}
+  const k=Math.min(1,dt*5);tv.roll=lerp(tv.roll,rT,k);tv.pitch=lerp(tv.pitch,pT,k);tv.fov=lerp(tv.fov,fT,Math.min(1,dt*3));
+  if(alive&&(Math.abs(tv.roll)>1e-4||Math.abs(tv.pitch)>1e-4)){camera.rotation.z+=tv.roll;camera.rotation.x+=tv.pitch;camera.updateMatrixWorld()}
+  if(tv.fov>.02){camera.fov+=tv.fov;tv.fovA=tv.fov;camera.updateProjectionMatrix();tv.fovOn=true}else if(tv.fovOn){tv.fovOn=false;camera.updateProjectionMatrix()}
+  const hands=!!(alive&&(P.gliding||P.onZip));if(hands){if(vm.visible){vm.visible=false;tv.vmHid=true}ghost.visible=false;const bm=$('#buildmode');if(bm)bm.classList.add('hidden')}else if(tv.vmHid){vm.visible=true;tv.vmHid=false}
+  const a=tvDrawGlider(dt);tvDrawZip();const b=tvDrawRemote(dt);
+  if(a||b)tvFlap(.025+(g?g.spd/16*.05+(g.stall?.22:0):.1),9+(g?g.spd*.55:4));
+  tvSound()});
+onHook('hud',()=>{if(tv.fovA){camera.fov-=tv.fovA;tv.fovA=0}if(!S||!P)return;const now=performance.now();if(now-tv.hudT<90)return;tv.hudT=now;tvHud()});
+onHook('minimap',(m,s)=>{if(!ZIPLINES.length)return;m.save();m.strokeStyle='rgba(255,160,70,.9)';m.lineWidth=1.3;m.beginPath();for(const Z of ZIPLINES){m.moveTo(Z.a.x*s,Z.a.z*s);m.lineTo(Z.b.x*s,Z.b.z*s)}m.stroke();m.restore()});
+onHook('bigmap',(g,s)=>{if(!ZIPLINES.length)return;g.save();g.lineWidth=2.2;g.strokeStyle='#ffa046';g.fillStyle='#ffa046';
+  for(const Z of ZIPLINES){const ax=Z.a.x*s,az=Z.a.z*s,bx=Z.b.x*s,bz=Z.b.z*s,an=Math.atan2(bz-az,bx-ax),mx=lerp(ax,bx,.6),mz=lerp(az,bz,.6);g.beginPath();g.moveTo(ax,az);g.lineTo(bx,bz);g.stroke();
+    g.beginPath();g.arc(ax,az,3.2,0,7);g.fill();g.beginPath();g.moveTo(mx+Math.cos(an)*6,mz+Math.sin(an)*6);g.lineTo(mx+Math.cos(an+2.5)*5,mz+Math.sin(an+2.5)*5);g.lineTo(mx+Math.cos(an-2.5)*5,mz+Math.sin(an-2.5)*5);g.closePath();g.fill()}
+  g.font='bold 12px Roboto Condensed,Arial';const lab=(x,z,t)=>{g.fillStyle='rgba(0,0,0,.6)';g.fillText(t,x+1,z+1);g.fillStyle='#ffc890';g.fillText(t,x,z)};
+  for(const Z of ZIPLINES)if(Z.kind!=='town')lab((Z.a.x+Z.b.x)/2*s+5,(Z.a.z+Z.b.z)/2*s-4,'Zipline');
+  const tw=ZIPLINES.filter(Z=>Z.kind==='town');if(tw.length){let x=0,z=0;for(const Z of tw){x+=Z.a.x;z+=Z.a.z}lab(x/tw.length*s-30,z/tw.length*s-10,'Rooftop ziplines')}g.restore()});
+
 /* ================= RENDER ================= */
 const tmpC=new THREE.Color(),tmpC2=new THREE.Color();
 const SKY={dayTop:new THREE.Color('#4a82c4'),dayBot:new THREE.Color('#bcd2de'),setTop:new THREE.Color('#3b4f7a'),setBot:new THREE.Color('#e8a26a'),nightTop:new THREE.Color('#03050b'),nightBot:new THREE.Color('#080b12'),
