@@ -6238,6 +6238,526 @@ onHook('minimap',(m,s)=>{if(!vehicles.length)return;const pv=P&&P.vehicle;for(co
 onHook('bigmap',(g,s)=>{if(!vehicles.length)return;g.font='bold 12px Roboto Condensed,Arial';for(const v of vehicles){const x=v.x*s,y=v.z*s;g.fillStyle=v.dead?'#6a6662':v.driver?'#9fe08a':'#f0d890';g.beginPath();g.arc(x,y,v.kind==='bike'?3.5:5,0,7);g.fill();g.strokeStyle='#000';g.lineWidth=1;g.stroke();
   g.fillStyle='rgba(0,0,0,.6)';const lab=v.dead?'Wreck':v.K.n;g.fillText(lab,x+7,y+4);g.fillStyle=v.dead?'#9a9690':'#f0e6c8';g.fillText(lab,x+6,y+3)}});
 
+/* ================= DOG COMPANION ================= */
+// Animal-companion mechanic (original design). Scruffy stray dogs roam near farms, cabins and fuel stops (seeded per
+// world, simulated by the host/solo game, mirrored to clients through the snapshot). Two meals (Cooked Meat or a Bone
+// Biscuit) win one over: it follows you, warns about threats, bites whatever attacks you or whatever you attack, sniffs
+// out loot, can be downed and revived. Each player owns at most one dog, simulated on their own machine and shown to
+// the others as a mirror ('c_dog'). Public API: dogs[] (my dog + mirrors), myDog(), dogStrays[].
+let dogs=[],dogStrays=[];
+const DOG={mine:null,seed:[],srN:0,lastT:-1,trail:[],players:[],rpos:{},flags:{},netT:0,plT:0,warn:null,warnT:0,aggro:null,aggroT:-99,ptgt:null,ptgtT:-99,
+  pointed:new Set(),find:null,hold:null,fed:{},pendingTame:null,iCd:0,snd:0,sndT:'',biting:false,wrapT:0,enem:[],toastUntil:0,tipT:0,mark:null,markE:null};
+function myDog(){const d=DOG.mine;return d&&d.state!=='runoff'?d:null}
+
+// ---- look & data ----
+const DOG_COATS=[
+ {fur:'#b98a55',lt:'#ecd6ae',dk:'#6b4527',ear:'#7a5230'},   // honey
+ {fur:'#2c2926',lt:'#ebe6dc',dk:'#151311',ear:'#1f1c1a'},   // ink & white
+ {fur:'#7c5836',lt:'#b3906a',dk:'#3f2b19',ear:'#4a3220'},   // brindle
+ {fur:'#8f8e8a',lt:'#dcd9d2',dk:'#4f4e4c',ear:'#5c5a57'},   // ash
+ {fur:'#b8642f',lt:'#f2dfc4',dk:'#6b3519',ear:'#8a4521'},   // ember
+ {fur:'#573826',lt:'#c19a74',dk:'#2d1d13',ear:'#3b2618'}];  // cocoa
+const DOG_NAMES=['Biscuit','Pepper','Scout','Juniper','Rocket','Mabel','Nugget','Ziggy','Pickles','Waffles','Bramble','Tater','Moxie','Clover','Dash','Pip'];
+const DOG_POSES=['stand','sit','lie','rest','beg','down','crouch','sniff','eat','alert','growl','scratch','happy','hide'],DOG_PC={};DOG_POSES.forEach((p,i)=>DOG_PC[p]=i);
+// static pose joint targets (tuned with forward kinematics so the paws meet the ground):
+// hip height / pitch / roll, spine shift, neck, head, front upper/lower, back upper/lower, tail elevation, ear perk, tail-mood factor
+const DOG_PT={
+ stand:{hy:.48,hp:0,hr:0,sx:0,nk:0,hd:0,ft:-.05,fl:.08,bt:.17,bl:-.29,tl:.95,ep:0,tm:1},
+ sit:{hy:.2,hp:.72,hr:0,sx:0,nk:0,hd:-.55,ft:-.72,fl:0,bt:.5,bl:-2.35,tl:1.05,ep:.05,tm:.35},
+ lie:{hy:.19,hp:.02,hr:0,sx:0,nk:-.15,hd:.1,ft:1,fl:.5,bt:1.35,bl:-2.6,tl:1.75,ep:-.05,tm:.25},
+ rest:{hy:.18,hp:.02,hr:.1,sx:0,nk:-1.6,hd:1.1,ft:1.05,fl:.45,bt:1.4,bl:-2.65,tl:1.8,ep:-.25,tm:.15},
+ beg:{hy:.21,hp:1.15,hr:0,sx:0,nk:.1,hd:-.85,ft:-.45,fl:-1.4,bt:.08,bl:-2.35,tl:.6,ep:.3,tm:.5},
+ down:{hy:.2,hp:0,hr:1.45,sx:0,nk:-.3,hd:0,ft:.5,fl:-.25,bt:.45,bl:-.35,tl:1.6,ep:-.5,tm:0},
+ crouch:{hy:.38,hp:-.06,hr:0,sx:0,nk:-.35,hd:.15,ft:-.76,fl:1.6,bt:.76,bl:-1.39,tl:3,ep:-.6,tm:.4},
+ sniff:{hy:.44,hp:-.06,hr:0,sx:0,nk:-1.5,hd:.75,ft:-.53,fl:1.16,bt:.52,bl:-.89,tl:.85,ep:.05,tm:1},
+ eat:{hy:.4,hp:-.14,hr:0,sx:0,nk:-1.8,hd:.95,ft:-.63,fl:1.68,bt:.74,bl:-1.24,tl:.8,ep:0,tm:1},
+ alert:{hy:.49,hp:-.03,hr:0,sx:.02,nk:.15,hd:-.05,ft:-.16,fl:.38,bt:.01,bl:0,tl:.5,ep:.75,tm:.3},
+ growl:{hy:.41,hp:-.1,hr:0,sx:.03,nk:-.45,hd:.2,ft:-.49,fl:1.48,bt:.59,bl:-1.14,tl:.55,ep:-.4,tm:.2}};
+DOG_PT.happy=DOG_PT.stand;DOG_PT.scratch=DOG_PT.sit;DOG_PT.hide=DOG_PT.stand;
+const DOG_JK=['hy','hp','hr','sx','nk','hd','ft','fl','bt','bl','tl','ep','tm'];
+const DOG_WO=[.25,.75,0,.5],DOG_TO=[0,.5,.5,0],DOG_GO=[0,.12,.55,.67];   // leg phase offsets FL,FR,BL,BR: walk / trot / rotary gallop
+const DOG_VOL={dogbark:1,doggrowl:.75,dogwhimper:.55,dogyelp:.75,dogyip:.6,dogpant:.25,dogeat:.45,dogwhistle:.45};
+const DOG_LOOT=new Set(['barrel','crate','hemp','cabinet','trunk','toolbox']);
+const DOG_PAW='<svg viewBox="0 0 24 24" aria-hidden="true"><ellipse cx="12" cy="16.2" rx="5.3" ry="4.4"/><ellipse cx="5.4" cy="10.2" rx="2.1" ry="2.7"/><ellipse cx="9.5" cy="6.2" rx="2.1" ry="2.8"/><ellipse cx="14.5" cy="6.2" rx="2.1" ry="2.8"/><ellipse cx="18.6" cy="10.2" rx="2.1" ry="2.7"/></svg>';
+const dogName=n=>DOG_NAMES.includes(n)?n:'';            // names that arrive over the network are whitelisted
+const dogEsc=s=>String(s).replace(/[<>&"']/g,c=>'&#'+c.charCodeAt(0)+';');
+const dogWrap=a=>((a+Math.PI*3)%(Math.PI*2))-Math.PI;
+
+// ---- model: merged vertex-colour parts per coat (cached), 14 meshes per dog, all on MAT.vc ----
+const DOG_GEO={};
+function dogGeo(ci){if(DOG_GEO[ci])return DOG_GEO[ci];const C=DOG_COATS[ci]||DOG_COATS[0];
+  const I=(r,dt)=>new THREE.IcosahedronGeometry(r,dt===undefined?1:dt),B=(w,h,d)=>new THREE.BoxGeometry(w,h,d),K=(r,h)=>new THREE.ConeGeometry(r,h,4),Y=(a,b,h)=>new THREE.CylinderGeometry(a,b,h,6);
+  const torso=[{g:I(.2),c:C.fur,p:[.15,.02,0],s:[1.25,1.05,.95]},{g:I(.19),c:C.fur,p:[-.03,0,0],s:[1.5,.92,.86]},{g:I(.19),c:C.fur,p:[-.22,.02,0],s:[1.1,1.05,.95]},
+   {g:I(.15),c:C.lt,p:[.02,-.1,0],s:[1.9,.55,.78]},{g:I(.12),c:C.lt,p:[.28,-.02,0],s:[.75,1.15,.9]},
+   {g:K(.05,.13),c:C.dk,p:[.06,.2,0],r:[0,0,.5]},{g:K(.045,.12),c:C.fur,p:[-.1,.19,.04],r:[.3,0,.7]},{g:K(.045,.12),c:C.dk,p:[.2,.22,-.03],r:[-.3,0,.4]},
+   {g:K(.04,.11),c:C.fur,p:[-.25,.17,-.05],r:[-.4,0,.9]},{g:K(.04,.1),c:C.fur,p:[-.36,-.02,.08],r:[.4,0,2]},{g:K(.04,.1),c:C.fur,p:[-.36,-.02,-.08],r:[-.4,0,2]}];
+  if(ci===0)torso.push({g:I(.16),c:C.dk,p:[-.05,.12,0],s:[1.55,.42,.82]});
+  if(ci===2)for(const x of[-.22,-.12,-.02,.08])for(const s of[1,-1])torso.push({g:B(.026,.15,.02),c:C.dk,p:[x,.04,.165*s],r:[0,0,.3]});
+  if(ci===3)torso.push({g:I(.08),c:C.dk,p:[.02,.11,.12],s:[1.5,.6,.7]},{g:I(.07),c:C.dk,p:[-.2,.09,-.12],s:[1.4,.7,.7]});
+  const head=[{g:I(.11),c:C.fur,p:[0,0,0],s:[1.15,1,1]},{g:B(.15,.085,.1),c:C.lt,p:[.13,-.035,0]},{g:B(.052,.046,.066),c:'#191513',p:[.215,-.008,0],j:.03},
+   {g:B(.026,.03,.03),c:'#120f0d',p:[.078,.035,.062],j:.02},{g:B(.026,.03,.03),c:'#120f0d',p:[.078,.035,-.062],j:.02},
+   {g:K(.035,.08),c:C.fur,p:[0,.1,.035],r:[.3,0,.3]},{g:K(.035,.08),c:C.fur,p:[0,.1,-.035],r:[-.3,0,.3]},
+   {g:K(.03,.07),c:C.lt,p:[.07,-.075,.05],r:[.3,0,2.7]},{g:K(.03,.07),c:C.lt,p:[.07,-.075,-.05],r:[-.3,0,2.7]}];
+  if(ci===1)head.push({g:B(.05,.04,.035),c:C.lt,p:[.09,.065,0]});
+  if(ci===3)head.push({g:I(.05,0),c:C.dk,p:[.06,.04,.066],s:[1,1,.45]});
+  if(ci===5)head.push({g:B(.03,.015,.024),c:C.lt,p:[.075,.066,.05]},{g:B(.03,.015,.024),c:C.lt,p:[.075,.066,-.05]});
+  return DOG_GEO[ci]={torso:buildGeo(torso),head:buildGeo(head),
+   neck:buildGeo([{g:B(.13,.27,.12),c:C.fur,p:[.06,.11,0],r:[0,0,-.5]},{g:I(.08),c:C.lt,p:[.07,.03,0],s:[1,1.2,1]}]),
+   jaw:buildGeo([{g:B(.13,.032,.084),c:C.lt,p:[.06,0,0]},{g:B(.085,.014,.05),c:'#d46a74',p:[.085,.018,0],j:.04}]),
+   ear:buildGeo([{g:B(.09,.15,.026),c:C.ear,p:[0,-.065,0]},{g:B(.07,.04,.024),c:C.ear,p:[0,-.15,0]}]),
+   tail:buildGeo([{g:Y(.022,.042,.3),c:C.fur,p:[0,.15,0]},{g:K(.045,.13),c:ci===1||ci===4?C.lt:C.fur,p:[0,.34,0]}]),
+   fUp:buildGeo([{g:B(.075,.23,.08),c:C.fur,p:[0,-.105,0]}]),
+   fLo:buildGeo([{g:B(.06,.2,.065),c:C.fur,p:[0,-.1,0]},{g:B(.085,.045,.08),c:C.lt,p:[.018,-.2,0]}]),
+   bUp:buildGeo([{g:B(.1,.23,.095),c:C.fur,p:[0,-.1,0]},{g:I(.075,0),c:C.fur,p:[0,-.01,0],s:[1.25,1,1]}]),
+   bLo:buildGeo([{g:B(.06,.22,.065),c:C.fur,p:[0,-.11,0]},{g:B(.085,.045,.08),c:C.lt,p:[.018,-.22,0]}])}}
+// rig (model faces +X like the other animals): root > hip (rear pivot: sit / lie / roll) > spine > neck > head > jaw, ears; tail; 4 two-segment legs
+function dogRig(ci,sc){const G=dogGeo(ci),grp=()=>new THREE.Group(),mk=(g,sh)=>{const m=new THREE.Mesh(g,MAT.vc);m.castShadow=!!sh;m.receiveShadow=!!sh;return m};
+  const root=grp(),hip=grp(),spine=grp(),neck=grp(),head=grp(),jaw=grp(),tail=grp();
+  root.add(hip);hip.position.set(-.24,.48,0);hip.add(spine);spine.position.set(.24,0,0);spine.add(mk(G.torso,1));
+  spine.add(neck);neck.position.set(.27,.07,0);neck.add(mk(G.neck));neck.add(head);head.position.set(.12,.22,0);head.add(mk(G.head,1));
+  head.add(jaw);jaw.position.set(.07,-.072,0);jaw.add(mk(G.jaw));
+  const ears=[];for(const s of[1,-1]){const e=grp();e.position.set(-.015,.075,.072*s);e.add(mk(G.ear));head.add(e);ears.push(e)}
+  spine.add(tail);tail.position.set(-.37,.1,0);tail.add(mk(G.tail));
+  const legs=[];for(const [f,s] of[[1,1],[1,-1],[0,1],[0,-1]]){const up=grp(),lo=grp();up.add(mk(f?G.fUp:G.bUp,!f));lo.add(mk(f?G.fLo:G.bLo));lo.position.y=-.21;up.add(lo);
+    if(f){up.position.set(.2,-.04,.095*s);spine.add(up)}else{up.position.set(0,-.02,.1*s);hip.add(up)}legs.push({up,lo,f})}
+  root.scale.setScalar(sc||1);return{g:root,hip,spine,neck,head,jaw,tail,ears,legs}}
+function dogNew(o){const d=Object.assign({x:0,y:0,z:0,yaw:0,speed:0,vis:0,gph:0,mood:0,moodT:0,pose:'stand',wagPh:0,pantPh:0,earA:0,earV:0,headY:0,tilt:0,tiltT:0,
+    barkT:0,lungeT:0,jumpT:0,hopT:0,hopCd:0,eatT:0,coat:0,sc:1,voice:1,look:null,lookA:0,idleT:0,actT:0,act:null},o);
+  d.coat=((d.coat|0)%DOG_COATS.length+DOG_COATS.length)%DOG_COATS.length;d.J=Object.assign({},DOG_PT.stand);d.rig=dogRig(d.coat,d.sc);d.obj=d.rig.g;d.vy=d.y;d.lx=d.x;d.lz=d.z;
+  d.obj.position.set(d.x,d.y,d.z);d.obj.rotation.y=d.yaw-Math.PI/2;world.add(d.obj);return d}
+function dogFree(d){if(!d)return;d.dead=true;if(d.obj)world.remove(d.obj)}
+function dogTag(d){if(d.tag)d.obj.remove(d.tag);d.tag=labelSprite(d.name||'Dog','#ffd9a0');d.tag.scale.set(2.3,2.3,1);d.tag.position.y=1.3;d.obj.add(d.tag)}
+
+// ---- procedural animation: per-leg gait phases blended walk -> trot -> gallop, smoothed static poses, floppy-ear spring, mood-driven tail ----
+function dogAnimate(d,dt){const r=d.rig;if(!r||!(dt>0))return;
+  const mv=Math.min(14,Math.hypot(d.x-d.lx,d.z-d.lz)/dt);d.lx=d.x;d.lz=d.z;d.vis+=(mv-d.vis)*Math.min(1,dt*7);
+  d.vy+=(d.y-d.vy)*Math.min(1,dt*12);
+  const show=!d.hidden&&dist2(d.x,d.z,P.x,P.z)<150;r.g.visible=show;if(!show)return;
+  const T=S.time,v=d.vis,k=clamp(v/1.2,0,1),tw=smooth(2.3,3.7,v),gal=smooth(6.2,8.6,v),wW=(1-tw)*(1-gal),tW=tw*(1-gal),TAU=6.2832;
+  d.gph+=dt*(v<.05?0:wW*(1.4+.6*v)+tW*(2.1+.2*v)+gal*(2.5+.08*v))*TAU;const ph=d.gph;
+  const PT=DOG_PT[d.pose]||DOG_PT.stand,J=d.J,ks=Math.min(1,dt*(d.pose==='down'?3.5:7));for(const q of DOG_JK)J[q]+=(PT[q]-J[q])*ks;
+  d.mood+=((d.moodT||0)-d.mood)*Math.min(1,dt*2.5);const hap=Math.max(0,d.mood),sad=Math.max(0,-d.mood);
+  const bob=k*((wW*.012+tW*.022)*Math.cos(2*ph)+gal*.05*Math.sin(ph)),pit=k*(gal*.13*Math.sin(ph+.8)+tW*.02*Math.sin(2*ph));
+  let jy=0,tuck=0,lunge=0,bark=0;
+  if(d.jumpT>0){d.jumpT-=dt;const p=Math.sin(Math.PI*clamp(1-d.jumpT/.55,0,1));jy=p*.32;tuck=p}
+  if(d.hopT>0){d.hopT-=dt;const p=Math.sin(Math.PI*clamp(1-d.hopT/.32,0,1));jy+=p*.16;tuck=Math.max(tuck,p*.7)}
+  if(d.hopCd>0)d.hopCd-=dt;
+  if(d.lungeT>0){d.lungeT-=dt;lunge=Math.sin(Math.PI*clamp(1-d.lungeT/.34,0,1))}
+  if(d.barkT>0){d.barkT-=dt;bark=Math.abs(Math.sin(TAU*(1-d.barkT/.28)))}
+  const lying=d.pose==='down'||d.pose==='rest'||d.pose==='lie';
+  r.hip.position.y=J.hy+bob+(lying?Math.sin(T*2.1+d.x)*.01:0);r.hip.rotation.z=J.hp+pit;r.hip.rotation.x=J.hr+k*wW*.035*Math.sin(ph);
+  r.spine.position.x=.24+J.sx+lunge*.14;
+  let ly=d.lookA||0;const L=d.look;if(L&&L.x!==undefined)ly=clamp(dogWrap(Math.atan2(L.x-d.x,L.z-d.z)-d.yaw),-.9,.9);
+  if(d.pose==='down')ly=0;d.headY+=(ly-d.headY)*Math.min(1,dt*4.5);
+  d.tilt+=((d.pose==='scratch'?.35:d.tiltT||0)-d.tilt)*Math.min(1,dt*5);
+  let hz=J.hd-bob*2.5+bark*.12,hy=d.headY*.6,hx=d.tilt;
+  if(d.pose==='sniff'){hz+=Math.sin(T*19)*.035;hy+=Math.sin(T*2.1+d.z)*.35}
+  if(d.pose==='growl')hx+=Math.sin(T*31)*.025;
+  r.neck.rotation.z=J.nk-pit*.6+bark*.1-lunge*.15;r.neck.rotation.y=d.headY*.4;r.head.rotation.set(hx,hy,hz);
+  d.pantPh+=dt*TAU*3.3;let jaw=d.pant?.13+.09*Math.sin(d.pantPh):0;
+  jaw=Math.max(jaw,bark*.55,lunge*.85,d.pose==='eat'?.24*Math.max(0,Math.sin(T*10)):0,d.pose==='growl'?.07:0);r.jaw.rotation.z=-jaw;
+  d.earV+=(-d.earA*130-d.earV*9)*dt;d.earA+=d.earV*dt;const flop=Math.sin(2*ph-.9)*k*(.12+.25*gal)+d.earA;
+  for(let i=0;i<2;i++){const e=r.ears[i],s=i?-1:1;e.rotation.x=-s*clamp(.32+J.ep*.9+flop*.5,-.1,1.9);e.rotation.z=-.12+flop-gal*.55}
+  const th=clamp(J.tl-.5*hap*J.tm+.85*sad+gal*.35,.15,3.35),wAmp=(.1+.55*hap)*(1-.45*k)*(.35+.65*J.tm);
+  d.wagPh+=dt*TAU*(1.6+6.5*hap);const w=Math.sin(d.wagPh)*wAmp;r.tail.rotation.set(w*Math.cos(th),w*Math.sin(th),th);
+  for(let i=0;i<4;i++){const Lg=r.legs[i],f=Lg.f,a1=ph+TAU*DOG_WO[i],a2=ph+TAU*DOG_TO[i],a3=ph+TAU*DOG_GO[i];
+    const sw=wW*Math.sin(a1)+tW*Math.sin(a2)+gal*Math.sin(a3),lift=Math.max(0,wW*Math.cos(a1)+tW*Math.cos(a2)+gal*Math.cos(a3));
+    let up=(f?J.ft:J.bt)+sw*k*((f?.34:.3)+tW*.14+gal*(f?.42:.5)),lo=(f?J.fl:J.bl)-lift*k*(f?.75+.5*gal:.55+.45*gal);
+    if(tuck>0){if(f){up+=tuck*.7;lo-=tuck*.9}else{up-=tuck*.55;lo+=tuck*.5}}
+    if(f&&lunge>0){up+=lunge*.55;lo-=lunge*.3}
+    if(f&&d.pose==='beg')up+=Math.sin(T*5+i*Math.PI)*.12;
+    if(i===3&&d.pose==='scratch'){up=1.75+Math.sin(T*30)*.25;lo=-.9+Math.sin(T*30+1)*.2}
+    Lg.up.rotation.z=up;Lg.lo.rotation.z=lo}
+  r.g.position.set(d.x,d.vy+jy,d.z);r.g.rotation.y=d.yaw-Math.PI/2}
+
+// ---- voice: synth bark / growl / whimper / yelp / yip / pant / munch, positional, pitched per dog ----
+{const _dogSfx=sfx;sfx=function(type,vol,pos){if(typeof type!=='string'||!DOG_VOL.hasOwnProperty(type))return _dogSfx.apply(this,arguments);
+  if(muted||!ac())return;if(AC.state==='suspended')AC.resume();if(vol===undefined)vol=DOG_VOL[type];const t=AC.currentTime+.005,v=pos&&pos.voice>0?pos.voice:1;
+  switch(type){
+   case 'dogbark':{const d=bus(pos,vol,.22);const woof=(t0,f)=>{tn(t0,'sawtooth',f,f*.6,.5,.006,.12,bp(d,850*v,1.2));tn(t0,'square',f*2.1,f*1.25,.1,.004,.07,bp(d,1900*v,2.2));nz(t0,.1,'bandpass',1250*v,1.3,.32,.004,.085,d);tn(t0,'sine',f*.52,f*.36,.42,.004,.09,d)};
+     woof(t,430*v);if(Math.random()<.65)woof(t+.2+Math.random()*.06,405*v);break}
+   case 'doggrowl':{const d=bus(pos,vol,.1);for(let i=0;i<15;i++)nz(t+i*.05,.06,'bandpass',(200+Math.random()*90)*v,3.2,.14+Math.random()*.14,.008,.045,d);tn(t,'sawtooth',96*v,80*v,.3,.08,.72,bp(d,520,.9,'lowpass'));break}
+   case 'dogwhimper':{const d=bus(pos,vol,.12);tn(t,'triangle',1080*v,1380*v,.15,.05,.28,d);tn(t+.36,'triangle',1320*v,820*v,.12,.04,.42,d);break}
+   case 'dogyelp':{const d=bus(pos,vol,.12);tn(t,'triangle',1250*v,620*v,.38,.004,.2,d);nz(t,.08,'bandpass',1800*v,2,.18,.003,.07,d);break}
+   case 'dogyip':{const d=bus(pos,vol,.1);tn(t,'triangle',820*v,1400*v,.28,.005,.11,d);tn(t+.14,'triangle',900*v,1500*v,.2,.005,.1,d);nz(t,.05,'bandpass',2100,1.6,.1,.003,.04,d);break}
+   case 'dogpant':{const d=bus(pos,vol,0);for(let i=0;i<4;i++)nz(t+i*.16,.09,'bandpass',i%2?1450:2100,.9,.13,.015,.065,d);break}
+   case 'dogeat':{const d=bus(pos,vol,0);for(let i=0;i<4;i++){nz(t+i*.14,.05,'lowpass',950,.7,.32,.003,.05,d);tn(t+i*.14,'square',1350,1150,.035,.001,.02,d)}break}
+   case 'dogwhistle':{const d=bus(null,vol,.15);tn(t,'sine',1850,2550,.11,.02,.15,d);tn(t+.2,'sine',2500,1750,.09,.02,.2,d);break}}}}
+function dogEmit(d,type,vol){sfx(type,vol===undefined?DOG_VOL[type]:vol,d);if(d.t==='dogstray'){d.sndSeq=(d.sndSeq|0)+1;d.sndType=type}else if(d.local){DOG.snd++;DOG.sndT=type}
+  if(type==='dogbark')d.barkT=.28;if(type==='dogyelp'||type==='dogbark')d.earV+=2.5}
+
+// ---- shared movement / perception helpers ----
+function dogMoveTo(d,tx,tz,spd,dt){const dx=tx-d.x,dz=tz-d.z,L=Math.hypot(dx,dz);if(L<.25||!(spd>0)){d.speed=0;return}const ox=d.x,oz=d.z;
+  if(d.hopCd<=0){const top=supportH(d.x+dx/L*.5,d.z+dz/L*.5,d.y+.85,.3);if(top-d.y>.45&&top-d.y<1.45){d.y=top;d.hopT=.32;d.hopCd=.6;d.earV+=3}}   // hop onto foundations / ledges
+  moveCreature(d,tx,tz,spd,dt,.33);const mv=Math.hypot(d.x-ox,d.z-oz);d.blockT=mv<spd*dt*.3?(d.blockT||0)+dt:Math.max(0,(d.blockT||0)-dt*2)}
+function dogFace(d,x,z,dt){d.yaw+=dogWrap(Math.atan2(x-d.x,z-d.z)-d.yaw)*Math.min(1,dt*6)}
+function dogPlaceAt(d,x,z,refY){d.x=clamp(x,8,WS-8);d.z=clamp(z,8,WS-8);const g=groundH(d.x,d.z);d.y=supportH(d.x,d.z,Math.max(refY===undefined?g:refY,g)+.3,.3);d.vy=d.y;d.lx=d.x;d.lz=d.z;d.vis=0;d.blockT=0}
+function dogIdle(d,dt,lazy){d.idleT+=dt;d.actT-=dt;
+  if(!d.act||d.actT<=0){const q=Math.random(),it=d.idleT;
+    if(it<2){d.act='stand';d.actT=R(1,2.2)}
+    else if(it>30&&q<.55){d.act='rest';d.actT=R(10,20)}
+    else if(it>12&&q<(lazy?.55:.3)){d.act='lie';d.actT=R(6,12)}
+    else if(!lazy&&q<.16){d.act='scratch';d.actT=R(1.3,1.9)}
+    else if(!lazy&&q<.34){d.act='sniff';d.actT=R(2,3.5)}
+    else if(q<.5){d.act='stand';d.actT=R(1.5,3)}
+    else{d.act='sit';d.actT=R(4,9)}
+    d.lookA=R(-.7,.7);d.lookP=Math.random()<.6}
+  d.pose=d.act}
+function dogEnemies(){const L=DOG.enem;L.length=0;
+  if(typeof zombies!=='undefined'&&Array.isArray(zombies))for(const z of zombies)if(z&&!z.dead&&!z.rm&&z.x!==undefined)L.push(z);
+  for(const a of animals)if(!a.dead&&(a.t==='wolf'||(a.state==='attack'&&ANIM[a.t]&&ANIM[a.t].dmg>0)))L.push(a);
+  for(const n of npcs)if(!n.dead)L.push(n);return L}
+function dogEnemyNear(x,z,r){let best=null,bd=r;for(const e of dogEnemies()){const q=dist2(e.x,e.z,x,z);if(q<bd){bd=q;best=e}}return best}
+function dogValid(t){if(!t||t.dead||t.rm||t===P)return false;if(t.t==='npc')return npcs.includes(t);if(t.t==='z')return typeof zombies!=='undefined'&&Array.isArray(zombies)&&zombies.includes(t);
+  if(ANIM[t.t])return animals.includes(t);if(t.t==='rplayer'||t.t==='dog'||t.t==='dogstray')return false;return t.x!==undefined&&!(t.hp<=0)}
+function dogFood(){return has('bone_biscuit')?'bone_biscuit':has('cooked_meat')?'cooked_meat':null}
+function dogHearts(d,n){burst(new V3(d.x,d.y+.95,d.z),['#ffd27a','#ffb0a0','#fff0c8'],n||7,.55,1.4,-.6,.95)}
+function dogOutOfSight(d){const fx=-Math.sin(P.yaw),fz=-Math.cos(P.yaw),dx=d.x-P.x,dz=d.z-P.z,l=Math.hypot(dx,dz)||1;if((dx*fx+dz*fz)/l<.35)return true;return !los(P.x,P.y+1.6,P.z,d.x,d.y+.5,d.z)}
+
+// ---- strays: seeded placement (spawnWorld runs with the seeded RNG) -> created per game in the newGame hook ----
+{const _dogSpawnWorld=spawnWorld;spawnWorld=function(){const r=_dogSpawnWorld.apply(this,arguments);dogSeedStrays();return r}}
+function dogSeedStrays(){DOG.seed=[];const spots=[];
+  const ok=(x,z)=>x>20&&z>20&&x<WS-20&&z<WS-20&&landOK(x,z,2.6)&&!nearBoxes(x,z,1.5).length&&!ents.some(o=>Math.abs(o.x-x)<2.5&&Math.abs(o.z-z)<2.5)&&spots.every(u=>dist2(u.x,u.z,x,z)>60);
+  const near=(cx,cz,r0,r1)=>{for(let k=0;k<40;k++){const a=R(0,6.283),rr=R(r0,r1),x=cx+Math.cos(a)*rr,z=cz+Math.sin(a)*rr;if(ok(x,z))return{x,z}}return null};
+  if(typeof POIS!=='undefined'&&Array.isArray(POIS))for(const p of POIS){if(spots.length>=3)break;if(!p||!(p.x>=0)||!/ranch|cabin|gas|farm|barn|camp|mill|radio/i.test(String(p.id||'')))continue;const s=near(p.x,p.z,(p.r||20)*.5+6,(p.r||20)+18);if(s)spots.push(s)}
+  // the rest roam meadows / forest edges in the west half; the first of them within reach of the spawn beach
+  for(let i=0,first=true;spots.length<4&&i<12;i++){let s=null;
+    for(let k=0;k<140&&!s;k++){let x,z;if(first){const a=R(-1.4,1.4),rr=R(60,180);x=P.x+Math.cos(a)*rr;z=P.z+Math.sin(a)*rr}else{x=R(60,WS*.55);z=R(60,WS-60)}
+      if(x<WS*.55&&forest(x,z)<.47&&ok(x,z))s={x,z}}
+    if(s){spots.push(s);first=false}else if(first)first=false}
+  spots.forEach((s,i)=>DOG.seed.push({id:'sd'+i,x:s.x,z:s.z,coat:Math.floor(R(0,DOG_COATS.length))%DOG_COATS.length,sc:R(.9,1.08),voice:R(.85,1.18)}))}
+function dogStrayAdd(o){const s=dogNew({id:o.id,t:'dogstray',x:o.x,y:groundH(o.x,o.z),z:o.z,yaw:R(0,6.28),coat:o.coat,sc:o.sc||1,voice:o.voice||1,name:dogName(o.name),
+    home:{x:o.hx!==undefined?o.hx:o.x,z:o.hz!==undefined?o.hz:o.z},state:'wander',thinkT:R(0,.3),scareT:0,sndSeq:0,sndType:'',trust:null,r:.35});dogStrays.push(s);return s}
+function dogStrayRemove(s){dogFree(s);dogStrays=dogStrays.filter(q=>q!==s)}
+function dogStrayReturn(o){if(!isFinite(o.hx)||!isFinite(o.hz))return;dogStrayAdd({id:'sr'+(DOG.srN++),x:clamp(o.hx,20,WS-20),z:clamp(o.hz,20,WS-20),coat:o.coat|0,sc:clamp(+o.sc||1,.85,1.12),voice:clamp(+o.voice||1,.8,1.25),name:o.name})}
+onHook('newGame',()=>{dogs=[];dogStrays=[];DOG.mine=null;DOG.trail=[];DOG.warn=null;DOG.warnT=0;DOG.aggro=null;DOG.ptgt=null;DOG.pointed=new Set();DOG.find=null;DOG.hold=null;DOG.fed={};
+  DOG.pendingTame=null;DOG.srN=0;DOG.lastT=-1;DOG.flags={};DOG.rpos={};DOG.iCd=0;DOG.warnNew=-99;DOG.toastUntil=0;dogMarkHide();if(NET.role!=='client')for(const s of DOG.seed)dogStrayAdd(s)});
+
+// ---- stray AI (host / solo): wary of sprinting players, curious about crouching ones, beg for meat, flee danger ----
+function dogPlayersUpdate(){const L=DOG.players;L.length=0;
+  if(P&&P.alive){const sel=P.hot[P.sel],sp=Math.hypot(P.vx,P.vz);L.push({id:NET.myId||'me',x:P.x,z:P.z,vx:P.vx,vz:P.vz,spd:sp,crouch:!!P.crouch,meat:sel==='cooked_meat'||sel==='bone_biscuit',sprint:sp>6.3})}
+  if(NET.role==='host')for(const r of remoteList()){if(r.dead)continue;let e=DOG.rpos[r.id];if(!e)e=DOG.rpos[r.id]={x:r.x,z:r.z,t:S.time,vx:0,vz:0};
+    if(S.time-e.t>=.2){const q=S.time-e.t;e.vx=(r.x-e.x)/q;e.vz=(r.z-e.z)/q;e.x=r.x;e.z=r.z;e.t=S.time}
+    const sp=r.speed||0,f=DOG.flags[r.id],fresh=f&&S.time-f.t<2;L.push({id:r.id,x:r.x,z:r.z,vx:e.vx,vz:e.vz,spd:sp,crouch:fresh?!!f.c:(sp>.3&&sp<2.7),meat:!!(fresh&&f.m),sprint:sp>6.3})}}
+function dogStraySet(s,ns){const old=s.state;s.state=ns;s.stateT=0;s.wTgt=null;s.act=null;s.idleT=0;
+  if(ns==='wary')dogEmit(s,'doggrowl',.5);else if(ns==='flee'&&old!=='flee')dogEmit(s,Math.random()<.5?'dogyelp':'dogbark',.7);else if(ns==='curious'&&old!=='curious'&&Math.random()<.5)dogEmit(s,'dogwhimper',.3)}
+function dogStrayFed(s,pid){s.eatT=2;s.trust={id:pid,until:S.time+40};dogStraySet(s,'eat')}
+function dogStrayCalled(s,pid){if(s.state==='wander'||s.state==='shy'||s.state==='home'){s.trust={id:pid,until:S.time+6};dogStraySet(s,'trust');dogEmit(s,'dogwhimper',.4)}}
+function dogStrayAI(s,dt){s.thinkT-=dt;if(s.scareT>0)s.scareT-=dt;if(s.eatT>0)s.eatT-=dt;
+  if(s.thinkT<=0){s.thinkT=R(.2,.32);let pl=null,pd=1e9;for(const p of DOG.players){const q=dist2(s.x,s.z,p.x,p.z);if(q<pd){pd=q;pl=p}}s.pl=pl;s.pd=pd;
+    let th=null,td=14;for(const e of dogEnemies()){const q=dist2(e.x,e.z,s.x,s.z)*(e.t==='npc'?1.5:1);if(q<td){td=q;th=e}}
+    let ns=s.state;
+    if(s.eatT>0)ns='eat';
+    else if(th){ns='flee';s.from={x:th.x,z:th.z};s.scareT=4}
+    else if(pl&&pd<15&&pl.sprint&&((s.x-pl.x)*pl.vx+(s.z-pl.z)*pl.vz)>0){ns='wary';s.from=pl;s.scareT=R(3,4.5)}
+    else if(s.scareT>0&&(s.state==='wary'||s.state==='flee')){/* keep backing off */}
+    else if(pl&&s.trust&&s.trust.id===pl.id&&s.trust.until>S.time&&pd<35)ns='trust';
+    else if(pl&&pd<17&&(pl.crouch||pl.meat))ns='curious';
+    else if(pl&&pd<7)ns='shy';
+    else if(s.state!=='home')ns='wander';
+    if(ns==='wander'&&dist2(s.x,s.z,s.home.x,s.home.z)>42)ns='home';
+    if(ns!==s.state)dogStraySet(s,ns)}
+  const pl=s.pl;
+  switch(s.state){
+   case 'eat':s.speed=0;s.pose='eat';s.moodT=.8;s.look=null;break;
+   case 'flee':{const f=s.from||P,a=Math.atan2(s.x-f.x,s.z-f.z);dogMoveTo(s,s.x+Math.sin(a)*8,s.z+Math.cos(a)*8,7.5,dt);s.pose='stand';s.moodT=-1;s.look=null;if(s.scareT<=0)dogStraySet(s,'wander');break}
+   case 'wary':{const f=s.from||P,a=Math.atan2(s.x-f.x,s.z-f.z),fd=dist2(s.x,s.z,f.x,f.z);if(fd<16)dogMoveTo(s,s.x+Math.sin(a)*6,s.z+Math.cos(a)*6,fd<6?6:3.6,dt);else s.speed=0;
+     s.pose='crouch';s.moodT=-.9;s.look=f;if(s.scareT<=0)dogStraySet(s,'shy');break}
+   case 'shy':{if(!pl){dogStraySet(s,'wander');break}s.look=pl;s.moodT=-.25;
+     if(s.pd<5.5){const a=Math.atan2(s.x-pl.x,s.z-pl.z);dogMoveTo(s,s.x+Math.sin(a)*4,s.z+Math.cos(a)*4,1.8,dt);s.pose='crouch'}else{s.speed=0;s.pose=s.pd<8?'alert':'stand';dogFace(s,pl.x,pl.z,dt)}break}
+   case 'curious':{if(!pl){dogStraySet(s,'wander');break}s.look=pl;const want=pl.meat?1.7:2.4;
+     if(s.pd>want+.4){dogMoveTo(s,pl.x,pl.z,pl.meat?2.6:1.5,dt);s.pose='stand';s.moodT=.25}
+     else{s.speed=0;s.pose=pl.meat?'beg':'sit';s.moodT=.55;dogFace(s,pl.x,pl.z,dt);if(pl.meat&&S.time-(s.begT||-99)>6){s.begT=S.time;dogEmit(s,'dogwhimper',.35)}}break}
+   case 'trust':{if(!pl){dogStraySet(s,'wander');break}s.look=pl;s.moodT=.8;if(s.pd>3){dogMoveTo(s,pl.x,pl.z,clamp(s.pd*1.4,1.5,7),dt);s.pose='stand'}else{s.speed=0;s.pose=pl.meat?'beg':'sit';dogFace(s,pl.x,pl.z,dt)}break}
+   case 'home':dogMoveTo(s,s.home.x,s.home.z,3,dt);s.pose='stand';s.moodT=0;s.look=null;if(dist2(s.x,s.z,s.home.x,s.home.z)<6)dogStraySet(s,'wander');break;
+   default:{s.wT=(s.wT||0)-dt;s.moodT=.1;
+     if(s.wTgt){if(dist2(s.x,s.z,s.wTgt.x,s.wTgt.z)>.8&&s.wT>0){dogMoveTo(s,s.wTgt.x,s.wTgt.z,s.wSpd,dt);s.pose=s.wSpd<1.2?'sniff':'stand';s.idleT=0;s.act=null}else{s.wTgt=null;s.wT=R(4,12)}}
+     else{s.speed=0;dogIdle(s,dt,false);if(s.wT<=0){const a=R(0,6.283),rr=R(4,16),x=s.home.x+Math.cos(a)*rr,z=s.home.z+Math.sin(a)*rr;if(groundH(x,z)>1.5){s.wTgt={x,z};s.wSpd=Math.random()<.35?.9:1.4;s.wT=R(8,14)}else s.wT=2}}
+     s.look=pl&&s.pd<14?pl:null}}
+  s.pant=S.dayF>.6&&s.vis<.5&&(s.pose==='stand'||s.pose==='sit'||s.pose==='beg');dogAnimate(s,dt)}
+// clients: strays mirrored from the host snapshot
+function dogStrayMirrorTick(dt){const k=Math.min(1,dt*10);for(const s of dogStrays){if(s.tx!==undefined){s.x=lerp(s.x,s.tx,k);s.y=lerp(s.y,s.ty,k);s.z=lerp(s.z,s.tz,k);s.yaw+=dogWrap(s.tyaw-s.yaw)*k}
+  s.moodT=s.netMood||0;s.look=P.alive&&dist2(s.x,s.z,P.x,P.z)<12?P:null;s.pant=S.dayF>.6&&s.vis<.5&&(s.pose==='stand'||s.pose==='sit'||s.pose==='beg');dogAnimate(s,dt)}}
+onHook('snapshot',m=>{const f=v=>Math.round(v*100)/100;m.c_dgs=dogStrays.map(s=>[s.id,s.coat,f(s.x),f(s.y),f(s.z),f(s.yaw),DOG_PC[s.pose]|0,f(s.vis||0),s.sndSeq|0,s.sndType||0,s.name||0,Math.round((s.mood||0)*10)])});
+onHook('applySnap',m=>{const L=m.c_dgs;if(!Array.isArray(L))return;const seen=new Set();
+  for(const r of L){if(!Array.isArray(r)||typeof r[0]!=='string')continue;const [id,coat,x,y,z,yaw,pc,spd,seq,stp,nm,md]=r;if(!isFinite(x)||!isFinite(z))continue;seen.add(id);let s=dogStrays.find(q=>q.id===id);
+    if(!s){const sd=DOG.seed.find(q=>q.id===id);s=dogStrayAdd({id,x:+x,z:+z,coat:coat|0,sc:sd?sd.sc:1,voice:sd?sd.voice:1,name:nm});s.y=s.vy=+y||0;s.yaw=+yaw||0;s.sndSeq=seq}
+    s.tx=+x;s.ty=+y||0;s.tz=+z;s.tyaw=+yaw||0;s.pose=DOG_POSES[pc|0]||'stand';s.name=dogName(nm);s.netMood=clamp((md|0)/10,-1,1);
+    if(seq!==s.sndSeq){s.sndSeq=seq;if(DOG_VOL[stp])dogEmitLocal(s,stp)}}
+  for(const s of [...dogStrays])if(!seen.has(s.id))dogStrayRemove(s)});
+function dogEmitLocal(d,type){sfx(type,DOG_VOL[type],d);if(type==='dogbark')d.barkT=.28}
+
+// ---- taming ----
+function dogFeedStray(s){if(DOG.iCd>0||DOG.pendingTame)return;if(myDog()){feedMsg('One companion at a time');return}const f=dogFood();if(!f){feedMsg('It is hungry — bring Cooked Meat or a Bone Biscuit');return}
+  take(f,1);DOG.iCd=1.2;const n=(DOG.fed[s.id]||0)+1;DOG.fed[s.id]=n;sfx('dogeat',.5,s);burst(new V3(s.x,s.y+.35,s.z),['#8a4d2e','#c9a46a','#6a3a22'],6,.7,1,9.8,.5);
+  if(n<2){feedMsg(`The stray wolfs it down (${n}/2)`);tip('dog_feed1','Almost there','The stray trusts you a little now and will tag along for a bit. One more meal and it is yours — just don\'t sprint at it.');
+    if(NET.role==='client')hostSend({k:'c_feed',id:s.id});else dogStrayFed(s,NET.myId||'me')}
+  else if(NET.role==='client'){DOG.pendingTame={id:s.id,t:S.time,food:f};hostSend({k:'c_tame',id:s.id})}
+  else{dogStrayRemove(s);dogMakeMine({coat:s.coat,sc:s.sc,voice:s.voice,name:s.name,x:s.x,y:s.y,z:s.z,yaw:s.yaw,home:{x:s.home.x,z:s.home.z}})}}
+function dogMakeMine(o){if(DOG.mine){if(DOG.mine.state==='runoff')dogRemoveMine(true);else{dogFree(DOG.mine);dogs=dogs.filter(q=>q!==DOG.mine);DOG.mine=null}}
+  const used=new Set(dogs.map(q=>q.name)),pool=DOG_NAMES.filter(n=>!used.has(n)),name=dogName(o.name)||pick(pool.length?pool:DOG_NAMES);
+  const d=dogNew({id:'dog:'+(NET.myId||'me'),t:'dog',owner:NET.myId||'me',local:true,name,coat:o.coat,sc:o.sc||1,voice:o.voice||1,x:o.x,y:o.y,z:o.z,yaw:o.yaw||0,
+    hp:100,maxHp:100,dead:false,hostileToNpc:true,eyeH:.55,r:.35,state:'follow',mode:'follow',home:o.home||{x:o.x,z:o.z},goal:{x:o.x,z:o.z},cs:0,blockT:0,trailT:0,
+    findT:R(45,80),moodT:1,mood:1,jumpT:.55,biteCd:0,lastHurtT:-99,fightUntil:0,tgt:null,retreat:false,guard:null,tpT:0});
+  dogs.push(d);DOG.mine=d;INFO.dog.t=name;DOG.warn=null;DOG.warnT=0;
+  dogEmit(d,'dogyip',.8);dogHearts(d,12);dogToast('NEW COMPANION',name,'Z  stay / follow  ·  E  pet / feed');feedMsg(name+' is your companion now');
+  tip('dog_tamed',name+' joined you',`${name} follows you, growls when enemies are near (an <b>amber arrow</b> around your crosshair points at them) and bites anything that attacks you or that you attack. <b>Z</b>: stay / follow. <b>E</b>: pet it, or feed it Cooked Meat to heal it. Now and then it sniffs out loot and barks at it.`);
+  if(typeof gainXP==='function')gainXP('survivor',15,'Tamed a dog');return d}
+function dogRemoveMine(toStray){const d=DOG.mine;if(!d)return;dogFree(d);dogs=dogs.filter(q=>q!==d);DOG.mine=null;DOG.hold=null;DOG.warn=null;dogFindEnd(null);if(NET.role)netSend({k:'c_dogoff'});
+  if(toStray){const o={c:d.coat,sc:d.sc,v:d.voice,nm:d.name,hx:d.home?d.home.x:d.x,hz:d.home?d.home.z:d.z};
+    if(NET.role==='client')hostSend(Object.assign({k:'c_runoff'},o));else dogStrayReturn({coat:o.c,sc:o.sc,voice:o.v,name:o.nm,hx:o.hx,hz:o.hz})}}
+
+// ---- my dog: owner-side simulation ----
+function dogTrailTick(){if(!P.alive)return;const T=DOG.trail,l=T[T.length-1];if(!l||dist2(l.x,l.z,P.x,P.z)>1.1){T.push({x:P.x,z:P.z});if(T.length>90)T.shift()}}
+function dogTrailPoint(d){const T=DOG.trail;let bi=-1,bd=1e9;for(let i=T.length-1;i>=0;i--){const q=dist2(T[i].x,T[i].z,d.x,d.z);if(q<bd){bd=q;bi=i}}return bi<0||bd>16?null:T[Math.min(T.length-1,bi+3)]}
+function dogSpotFree(x,z,y){if(!(groundH(x,z)>.3))return false;const f=supportH(x,z,(y===undefined?groundH(x,z):Math.max(y,groundH(x,z)))+.3,.3);
+  for(const b of nearBoxes(x,z,.45))if(x>b.minx-.35&&x<b.maxx+.35&&z>b.minz-.35&&z<b.maxz+.35&&b.maxy>f+.4&&b.miny<f+.9)return false;
+  for(const e of nearEnts(x,z,2))if(e.solid&&dist2(x,z,e.x,e.z)<(e.r||0)+.35)return false;
+  if(typeof vehicles!=='undefined'&&Array.isArray(vehicles))for(const v of vehicles)if(v&&isFinite(v.x)&&dist2(x,z,v.x,v.z)<(v.kind==='bike'?1:2.4))return false;return true}
+function dogTeleportBehind(d){const bx=Math.sin(P.yaw),bz=Math.cos(P.yaw);for(let k=0;k<16;k++){const rr=R(4,9),s=R(-4,4),x=P.x+bx*rr+bz*s,z=P.z+bz*rr-bx*s;if(dogSpotFree(x,z,P.y)){dogPlaceAt(d,x,z,P.y);return true}}return false}   // no dry land behind you (swimming): keep waiting
+function dogScan(d){const ax=d.mode==='stay'?d.stayX:P.x,az=d.mode==='stay'?d.stayZ:P.z;let best=null,bd=1e9;
+  for(const e of dogEnemies()){const q=Math.min(dist2(e.x,e.z,P.x,P.z),dist2(e.x,e.z,d.x,d.z));if(q<25&&q<bd){bd=q;best=e}}
+  if(best){const fresh=best!==DOG.warn||DOG.warnT<=0;if(fresh)DOG.warnNew=S.time;DOG.warn=best;DOG.warnT=Math.max(DOG.warnT,2.2);
+    if(fresh&&S.time-(d.growlT0||-99)>4||S.time-(d.growlT0||-99)>R(9,14)){d.growlT0=S.time;dogEmit(d,bd<14&&fresh?'dogbark':'doggrowl',fresh?undefined:.55);d.alertT=2.5;
+      if(P.alive)tip('dog_warn','Your dog senses danger',`When ${d.name} growls or barks, the <b>amber arrow</b> around your crosshair points at the threat — even through walls and trees.`)}}
+  let t=null;const lim=d.mode==='stay'?12:22;
+  if(DOG.aggro&&S.time-DOG.aggroT<12&&dogValid(DOG.aggro)&&dist2(DOG.aggro.x,DOG.aggro.z,ax,az)<lim)t=DOG.aggro;
+  else if(DOG.ptgt&&S.time-DOG.ptgtT<8&&dogValid(DOG.ptgt)&&dist2(DOG.ptgt.x,DOG.ptgt.z,ax,az)<lim)t=DOG.ptgt;
+  else if(best&&P.alive&&d.mode!=='stay'&&(best.t==='z'||best.t==='wolf')&&dist2(best.x,best.z,P.x,P.z)<4.5)t=best;    // something is right on top of you
+  if(t&&t!==d.tgt){d.tgt=t;d.biteCd=Math.min(d.biteCd||0,.3);dogEmit(d,'doggrowl',.8)}
+  if(d.tgt&&(!dogValid(d.tgt)||dist2(d.tgt.x,d.tgt.z,ax,az)>lim+8))d.tgt=null}
+function dogBite(d,t){if(!dogValid(t)||dist2(d.x,d.z,t.x,t.z)>2.2)return;const dmg=RI(15,20);let dx=t.x-d.x,dz=t.z-d.z;const l=Math.hypot(dx,dz)||1;dx/=l;dz/=l;
+  const pt=new V3(t.x-dx*.3,(t.y||0)+.75,t.z-dz*.3);DOG.biting=true;
+  try{damageAny(t,dmg,'player',{wname:'Dog bite',melee:true,dir:{x:dx,z:dz},point:pt});if(t.t!=='z')knockback(t,dx,dz,2.2)}finally{DOG.biting=false}
+  burst(pt,CHIP.flesh,9,2,1.5);sfx('flesh',.55,t);if(Math.random()<.5)dogEmit(d,'doggrowl',.6);d.earV+=2.5;noise(d.x,d.z,16);
+  if(dogValid(t)&&(t.t==='z'||ANIM[t.t])&&Math.random()<.3)dogHurt(d,RI(5,10),t)}     // it bites back
+function dogHurt(d,dmg,src){if(!d||!d.local||d.state==='downed'||d.state==='runoff'||d.hidden||!(dmg>0))return;d.hp-=dmg;d.lastHurtT=S.time;d.earV+=4;
+  burst(new V3(d.x,d.y+.55,d.z),CHIP.flesh,6,1.6,1.2);dogEmit(d,dmg>=8?'dogyelp':'dogwhimper',.7);
+  if(src&&typeof src==='object'&&dogValid(src)){DOG.aggro=src;DOG.aggroT=S.time}if(d.hp<=0)dogDown(d)}
+function dogDown(d){DOG.warn=null;DOG.warnT=0;d.state='downed';d.dead=true;d.hp=0;d.downT=60;d.tgt=null;d.retreat=false;d.whT=2;d.pose='down';d.hopT=0;d.jumpT=0;DOG.find&&dogFindEnd(d);
+  dogEmit(d,'dogyelp',.9);feedMsg(d.name+' is down! Hold E on it with a Bandage');
+  tip('dog_down',d.name+' is down',`Hold <b>E</b> on ${d.name} with a <b>Bandage</b> within 60 seconds, or it limps back to where you found it and you will have to win it back.`,true)}
+function dogRevive(d){d.state='follow';d.dead=false;d.hp=45;d.downT=0;d.jumpT=.55;d.moodT=1;d.lastHurtT=S.time;d.mode=d.mode||'follow';if(d.mode==='stay'){d.stayX=d.x;d.stayZ=d.z}
+  dogEmit(d,'dogyip',.7);dogHearts(d,10);feedMsg(d.name+' is back on its paws')}
+function dogRunoff(d){d.state='runoff';d.dead=false;d.hp=50;d.runT=0;d.tgt=null;DOG.hold=null;DOG.warn=null;dogEmit(d,'dogwhimper',.6);feedMsg(d.name+' ran off home — win it back with Cooked Meat');
+  tip('dog_runoff','It ran off','A downed dog that is not revived in time limps back to where you first found it. Feed it twice again to win it back.',true)}
+function dogFindLoot(){let best=null,bd=1e9;for(const e of nearEnts(P.x,P.z,38)){if(!DOG_LOOT.has(e.t)||DOG.pointed.has(e)||!dogLootable(e))continue;const q=dist2(e.x,e.z,P.x,P.z);if(q<7||q>38)continue;if(q<bd){bd=q;best=e}}return best}
+function dogLootable(e){return !!e&&DOG_LOOT.has(e.t)&&!e.looted&&!e.searched&&!e.empty&&!e.done&&!(e.hp!==undefined&&e.hp<=0)&&ents.includes(e)}
+function dogFindEnd(d){DOG.find=null;dogMarkHide();if(d)d.findT=R(60,120)}
+function dogMineTick(dt){const d=DOG.mine;if(!d)return;
+  if(d.state==='runoff'){d.runT+=dt;const h=d.home||{x:d.x+30,z:d.z};dogMoveTo(d,h.x,h.z,8.5,dt);d.pose='stand';d.moodT=-1;d.look=null;dogAnimate(d,dt);
+    if(d.runT>14||dist2(d.x,d.z,h.x,h.z)<3||(d.runT>3&&dist2(d.x,d.z,P.x,P.z)>40&&dogOutOfSight(d)))dogRemoveMine(true);return}
+  const drive=typeof isDriving==='function'&&!!isDriving();
+  if(drive&&d.state!=='downed'&&(d.mode==='follow'||d.hidden)){if(!d.hidden){d.hidden=true;d.tgt=null;DOG.warn=null;DOG.warnT=0;dogFindEnd(d);tip('dog_ride','Hop in!',d.name+' rides along while you drive and jumps out when you stop.')}
+    d.x=P.x;d.z=P.z;d.y=P.y;d.vy=d.y;d.lx=d.x;d.lz=d.z;d.vis=0;dogAnimate(d,dt);return}
+  if(d.hidden){d.hidden=false;let px=P.x,pz=P.z;const cands=[[Math.cos(P.yaw)*1.4,-Math.sin(P.yaw)*1.4],[-Math.cos(P.yaw)*1.4,Math.sin(P.yaw)*1.4],[Math.sin(P.yaw)*1.6,Math.cos(P.yaw)*1.6],[Math.sin(P.yaw)*2.6,Math.cos(P.yaw)*2.6]];
+    for(const c of cands)if(dogSpotFree(P.x+c[0],P.z+c[1],P.y)){px=P.x+c[0];pz=P.z+c[1];break}dogPlaceAt(d,px,pz,P.y);d.jumpT=.55;dogEmit(d,'dogyip',.5)}
+  if(d.state==='downed'){d.downT-=dt;d.speed=0;d.pose='down';d.moodT=-1;d.look=null;d.pant=false;d.whT-=dt;if(d.whT<=0){d.whT=R(3.5,5.5);dogEmit(d,'dogwhimper',.6)}
+    if(d.downT<=0)dogRunoff(d);dogAnimate(d,dt);return}
+  if(S.time-d.lastHurtT>6&&d.hp<d.maxHp)d.hp=Math.min(d.maxHp,d.hp+2*dt);
+  if(d.eatT>0)d.eatT-=dt;if(DOG.warnT>0)DOG.warnT-=dt;else DOG.warn=null;if(d.alertT>0)d.alertT-=dt;
+  d.scanT=(d.scanT||0)-dt;if(d.scanT<=0){d.scanT=.3;dogScan(d)}
+  if(d.hp<d.maxHp*.3&&!d.retreat){d.retreat=true;d.tgt=null;dogEmit(d,'dogwhimper',.6)}if(d.retreat&&d.hp>d.maxHp*.55)d.retreat=false;
+  const pd=dist2(d.x,d.z,P.x,P.z),sel=P.hot[P.sel];d.tiltT=0;
+  if(d.eatT>0){d.speed=0;d.pose='eat';d.moodT=1;d.look=null}
+  else if(d.tgt&&!d.retreat){const t=d.tgt,dd=dist2(d.x,d.z,t.x,t.z);d.fightUntil=S.time+3;d.look=t;d.idleT=0;d.act=null;d.moodT=-.1;
+    if(dd>1.3){dogMoveTo(d,t.x,t.z,dd>6?10.5:dd>2.2?8.5:4.5,dt);d.pose='stand'}else{d.speed=0;dogFace(d,t.x,t.z,dt*1.6);d.pose='growl'}
+    d.biteCd-=dt;if(d.biteAt){d.biteDelay-=dt;if(d.biteDelay<=0){const b=d.biteAt;d.biteAt=null;dogBite(d,b)}}
+    else if(dd<1.6&&d.biteCd<=0&&Math.abs((t.y||0)-d.y)<1.5){d.biteCd=R(.95,1.25);d.lungeT=.34;d.biteAt=t;d.biteDelay=.13}}
+  else if(d.retreat){const th=DOG.warn;let gx=P.x,gz=P.z;if(th){const a=Math.atan2(P.x-th.x,P.z-th.z);gx=P.x+Math.sin(a)*2.5;gz=P.z+Math.cos(a)*2.5}if(!P.alive){gx=d.x;gz=d.z}
+    const q=dist2(d.x,d.z,gx,gz);if(q>1)dogMoveTo(d,gx,gz,clamp(q*1.8,2,10),dt);else d.speed=0;d.pose=q>1?'stand':'crouch';d.moodT=-.8;d.look=th;
+    d.whT=(d.whT||0)-dt;if(d.whT<=0){d.whT=R(3,5);dogEmit(d,'dogwhimper',.5)}}
+  else if(DOG.find){const f=DOG.find,e=f.e;f.t+=dt;
+    if(!dogLootable(e)||f.t>40||!P.alive||DOG.warnT>0)dogFindEnd(d);
+    else{const q=dist2(d.x,d.z,e.x,e.z);
+      if(f.phase==='go'){if(q>1.5+(e.r||.4)){dogMoveTo(d,e.x,e.z,4.8,dt);d.pose=q<5?'sniff':'stand';d.look=null;d.moodT=.6}else{f.phase='smell';f.pt=0}}
+      else if(f.phase==='smell'){d.speed=0;d.pose='sniff';f.pt+=dt;if(f.pt>1.5){f.phase='bark';f.bt=0;feedMsg(d.name+' found something');dogMarkShow(e);
+        tip('dog_find','Good nose!',`${d.name} sniffed out something worth looting — follow the barking or the <b>paw marker</b>.`)}}
+      else{d.speed=0;d.pose='alert';d.look=e;d.moodT=1;dogFace(d,e.x,e.z,dt);f.bt-=dt;if(f.bt<=0){f.bt=1.4;dogEmit(d,'dogbark',.8)}
+        if(dist2(P.x,P.z,e.x,e.z)<4.5){d.jumpT=.55;dogHearts(d,6);dogFindEnd(d)}else if(f.t>34)dogFindEnd(d)}}}
+  else if(!P.alive){const g=d.guard||{x:d.x,z:d.z},q=dist2(d.x,d.z,g.x,g.z);if(q>2.2){dogMoveTo(d,g.x,g.z,clamp(q*1.4,1.5,8),dt);d.pose='stand';d.idleT=0}else{d.speed=0;d.pose='sit';d.moodT=-.6;d.look=null;
+    d.whT=(d.whT||0)-dt;if(d.whT<=0){d.whT=R(6,10);dogEmit(d,'dogwhimper',.45)}}}
+  else if(d.mode==='stay'){const q=dist2(d.x,d.z,d.stayX,d.stayZ);if(q>1.4){dogMoveTo(d,d.stayX,d.stayZ,clamp(q*1.5,1.5,8),dt);d.pose='stand';d.idleT=0;d.act=null}
+    else{d.speed=0;dogIdle(d,dt,true)}d.moodT=.2;d.look=d.lookP&&pd<25?P:null;
+    if(DOG.warnT>0&&DOG.warn&&q<=1.4){d.pose=dist2(DOG.warn.x,DOG.warn.z,d.x,d.z)<12?'growl':'alert';d.look=DOG.warn;dogFace(d,DOG.warn.x,DOG.warn.z,dt)}}
+  else{d.tpT-=dt;if(d.tpT<=0){d.tpT=.4;if((pd>70&&dogOutOfSight(d))||pd>180||(d.blockT>7&&pd>14&&dogOutOfSight(d))){dogTeleportBehind(d);d.cs=0}}
+    const pv=Math.hypot(P.vx,P.vz);
+    if(pv>1.2){const ux=P.vx/pv,uz=P.vz/pv;if(!d.side||Math.random()<dt*.05)d.side=d.side?-d.side:1;d.goal.x=P.x-ux*2.7+uz*d.side*1.1;d.goal.z=P.z-uz*2.7-ux*d.side*1.1}
+    else if(dist2(d.goal.x,d.goal.z,P.x,P.z)>4.2){const a=Math.atan2(d.x-P.x,d.z-P.z);d.goal.x=P.x+Math.sin(a)*2.6;d.goal.z=P.z+Math.cos(a)*2.6}
+    const gd=dist2(d.x,d.z,d.goal.x,d.goal.z);let tx=d.goal.x,tz=d.goal.z;
+    if(d.blockT>.5)d.trailT=3;if(d.trailT>0){d.trailT-=dt;if(pd>4){const c=dogTrailPoint(d);if(c){tx=c.x;tz=c.z}}}      // route along your footsteps around obstacles
+    const want=(pv>1.2||gd>1.1)?clamp(gd*1.5+(pv>1.2?pv*.85:0),0,10.5):0;d.cs+=clamp(want-d.cs,-16*dt,11*dt);
+    if(d.cs>.25&&gd>.35){dogMoveTo(d,tx,tz,d.cs,dt);d.pose='stand';d.idleT=0;d.act=null;d.look=pd<6?P:null;d.moodT=.45}
+    else{d.cs=0;d.speed=0;dogIdle(d,dt,false);d.moodT=.55;d.look=d.lookP?P:null;
+      if((sel==='cooked_meat'||sel==='bone_biscuit')&&pd<3.6){d.pose='beg';d.look=P;d.moodT=.9}
+      else if(P.crouch&&pd<3.2){d.look=P;d.moodT=1;d.tiltT=Math.sin(S.time*.8)>0?.32:-.32}
+      if(DOG.warnT>0&&DOG.warn){d.pose=dist2(DOG.warn.x,DOG.warn.z,d.x,d.z)<12?'growl':'alert';d.look=DOG.warn;dogFace(d,DOG.warn.x,DOG.warn.z,dt)}}
+    if(!DOG.find&&P.alive&&DOG.warnT<=0){d.findT-=dt;if(d.findT<=0){d.findT=R(60,120);const e=dogFindLoot();if(e){DOG.find={e,phase:'go',t:0};DOG.pointed.add(e);if(DOG.pointed.size>300)DOG.pointed.clear()}}}}
+  if(d.vis>6)d.runT=Math.min(12,(d.runT||0)+dt*1.5);else d.runT=Math.max(0,(d.runT||0)-dt*.5);
+  d.pant=(d.runT>2||(S.dayF>.6&&d.pose!=='rest'&&d.pose!=='lie'))&&d.pose!=='eat'&&d.pose!=='growl';
+  if(d.pant&&d.vis<1){d.pantT=(d.pantT||0)-dt;if(d.pantT<=0){d.pantT=R(2.4,3.6);if(pd<9)dogEmit(d,'dogpant',.22)}}
+  dogAnimate(d,dt)}
+// Z: stay / follow
+function dogToggleStay(){const d=myDog();if(!d){if(dogStrays.some(s=>dist2(s.x,s.z,P.x,P.z)<30))feedMsg('No companion yet — feed a stray dog twice to tame it');return}
+  if(d.state==='downed'){feedMsg(d.name+' is hurt and can\'t move');return}if(d.hidden)return;sfx('dogwhistle',.45);d.earV+=3;d.act=null;d.idleT=0;
+  if(d.mode!=='stay'){d.mode='stay';d.stayX=d.x;d.stayZ=d.z;d.act='sit';d.actT=R(8,14);d.tgt=null;dogFindEnd(d);feedMsg(d.name+': stay');tip('dog_stay','Stay','Your dog waits here and guards the spot. Press <b>Z</b> again to call it back.')}
+  else{d.mode='follow';d.jumpT=.45;d.cs=0;dogEmit(d,'dogyip',.5);feedMsg(d.name+': follow')}}
+function dogHoldTick(dt){const h=DOG.hold;if(!h)return;const d=DOG.mine;
+  if(!d||d.state!=='downed'||!keys.e||!P.alive||dist2(P.x,P.z,d.x,d.z)>3.4){DOG.hold=null;return}
+  h.t+=dt;if(h.t>=2.4){DOG.hold=null;if(!has('bandage')){feedMsg('You need a Bandage');return}take('bandage',1);dogRevive(d)}}
+function dogPet(d){if(DOG.iCd>0)return;DOG.iCd=1.2;d.jumpT=.55;d.moodT=1;d.mood=1;d.look=P;d.act=null;d.idleT=0;dogEmit(d,'dogyip',.6);dogHearts(d,7);
+  if(d.hp<d.maxHp&&S.time-(d.petHealT||-99)>8){d.petHealT=S.time;d.hp=Math.min(d.maxHp,d.hp+4)}}
+function dogFeedMine(d){if(DOG.iCd>0)return;const f=dogFood();if(!f)return;DOG.iCd=1.3;take(f,1);const before=d.hp;d.hp=Math.min(d.maxHp,d.hp+(f==='bone_biscuit'?d.maxHp:45));d.eatT=1.6;d.moodT=1;d.act=null;
+  sfx('dogeat',.5,d);burst(new V3(d.x,d.y+.35,d.z),['#8a4d2e','#c9a46a'],6,.7,1,9.8,.5);feedMsg(`${d.name} wolfs down the ${ITEMS[f].n} (+${Math.round(d.hp-before)} HP)`)}
+
+// ---- other players' dogs: mirrors ----
+function dogMirrorMsg(m){const o=m.from;if(!o||o===NET.myId||!Array.isArray(m.p))return;const p=m.p;if(!isFinite(p[0])||!isFinite(p[2]))return;let d=dogs.find(q=>!q.local&&q.owner===o);
+  if(!d){d=dogNew({id:'dog:'+o,t:'dog',owner:o,local:false,name:dogName(m.n)||'Dog',coat:m.c|0,sc:clamp(+m.sc||1,.85,1.12),voice:clamp(+m.v||1,.8,1.25),x:+p[0],y:+p[1]||0,z:+p[2],yaw:+p[3]||0,
+    hp:100,maxHp:100,dead:false,hostileToNpc:true,eyeH:.55,r:.35,fightUntil:0,tgtId:0});d.sndSeq=m.e;dogs.push(d);dogTag(d)}
+  d.lastMsg=performance.now();d.tx=+p[0];d.ty=+p[1]||0;d.tz=+p[2];d.tyaw=+p[3]||0;d.pose=DOG_POSES[m.s|0]||'stand';d.hpPct=clamp(m.h|0,0,100);d.mode=m.m?'stay':'follow';d.hidden=!!m.hd;
+  d.moodT=clamp((m.md|0)/10,-1,1);d.fightUntil=m.f?S.time+1:0;d.tgtId=m.tg||0;d.dead=d.pose==='down';if(m.l&&!(d.lungeT>0))d.lungeT=.34;
+  const nm=dogName(m.n);if(nm&&nm!==d.name){d.name=nm;dogTag(d)}if(m.e!==d.sndSeq){d.sndSeq=m.e;if(DOG_VOL[m.et])dogEmitLocal(d,m.et)}}
+function dogMirrorsTick(dt){const now=performance.now(),k=Math.min(1,dt*10);let gone=false;
+  for(const d of dogs){if(d.local)continue;if(now-d.lastMsg>4000){d.gone=true;gone=true;continue}
+    if(d.tx!==undefined){d.x=lerp(d.x,d.tx,k);d.y=lerp(d.y,d.ty,k);d.z=lerp(d.z,d.tz,k);d.yaw+=dogWrap(d.tyaw-d.yaw)*k}
+    d.pant=S.dayF>.6&&(d.pose==='stand'||d.pose==='sit')&&d.vis<.6;dogAnimate(d,dt)}
+  if(gone){for(const d of dogs)if(d.gone)dogFree(d);dogs=dogs.filter(d=>!d.gone)}}
+{const _dogRemovePeer=removePeer;removePeer=function(id){try{for(const d of dogs)if(!d.local&&d.owner===id){dogFree(d);d.gone=true}dogs=dogs.filter(d=>!d.gone);delete DOG.flags[id];delete DOG.rpos[id]}catch(e){}return _dogRemovePeer.apply(this,arguments)}}
+// host: a beast that is being bitten sometimes turns on the dog
+function dogAnimalAggro(dt){if(!dogs.length)return;for(const a of animals){if(a.dead||a.state!=='attack'||!a.foe)continue;
+  for(const d of dogs){if(d.dead||d.hidden||a.foe===d||!(d.fightUntil>S.time))continue;const biting=d.local?d.tgt===a:d.tgtId===a.id;if(biting&&dist2(d.x,d.z,a.x,a.z)<3&&Math.random()<dt*.6){a.foe=d;break}}}}
+
+// ---- damage, targeting and attribution hooks ----
+DMG_EXT.dog=(t,dmg,src)=>{if(!t||!(dmg>0))return;if(src==='player'||src===P)dmg*=.35;
+  if(t.local)return dogHurt(t,dmg,src);
+  if(NET.role==='host'&&t.owner&&!t.dead){sendTo(t.owner,{k:'c_dmg',d:Math.round(dmg),x:src&&isFinite(src.x)?+src.x:t.x,z:src&&isFinite(src.z)?+src.z:t.z});burst(new V3(t.x,t.y+.55,t.z),CHIP.flesh,5,1.5,1.2);sfx('flesh',.4,t)}};
+KNOCK_EXT.dog=(t,dx,dz,p)=>{if(t&&t.local&&t.state!=='downed'){const k=Math.min(p*.12,1.2);t.x+=dx*k;t.z+=dz*k}};
+FOE_EXT.push(n=>{if(!dogs.length)return null;let out=null;for(const d of dogs){if(d.dead||d.hidden||d.state==='runoff'||!(d.fightUntil>S.time))continue;if(dist2(d.x,d.z,n.x,n.z)<30)(out||(out=[])).push(d)}return out});
+PROJ_EXT.push((pr,o,dir,L,test)=>{if(!pr.owner||typeof pr.owner!=='object'||!dogs.length)return;for(const d of dogs){if(d.dead||d.hidden||d.state==='runoff')continue;if(Math.abs(d.x-o.x)>L+2||Math.abs(d.z-o.z)>L+2)continue;test(['dog',d],d,.38,d.y,d.y+.8)}});
+PROJ_HIT.dog=(pr,e,np,src)=>{burst(np,CHIP.flesh,6,1.5,1.2);DMG_EXT.dog(e,pr.dmg,src)};
+function dogNoteTarget(t){if(!S||!t||t===P||t.t==='dog'||t.t==='dogstray'||t.t==='rplayer'||DOG.biting)return;DOG.ptgt=t;DOG.ptgtT=S.time}
+function dogNoteAttacker(x,z){const e=dogEnemyNear(x,z,4.5);if(e){DOG.aggro=e;DOG.aggroT=S.time}}
+{const _f=damageAny;damageAny=function(t,dmg,src,opts){try{if((src===undefined||src==='player')&&!(opts&&opts.wname==='Dog bite'))dogNoteTarget(t)}catch(e){}return _f.apply(this,arguments)}}
+{const _f=damageNpc;damageNpc=function(n,dmg,att){try{if(att===undefined||att==='player')dogNoteTarget(n)}catch(e){}return _f.apply(this,arguments)}}
+{const _f=damageAnimal;damageAnimal=function(a,dmg,src){try{if(src===undefined||src==='player')dogNoteTarget(a)}catch(e){}return _f.apply(this,arguments)}}
+{const _f=hurt;hurt=function(dmg,cause,fx,fz){try{if(S&&P&&P.alive&&isFinite(fx)&&isFinite(fz)&&(cause==='npc'||cause==='animal'||cause==='infected'))dogNoteAttacker(fx,fz)}catch(e){}return _f.apply(this,arguments)}}
+function dogWrapZ(){if(typeof zmDamage==='function'&&!zmDamage._dogW){const zf=zmDamage;zmDamage=function(zb,dmg,src){try{if((src===undefined||src==='player')&&!DOG.biting)dogNoteTarget(zb)}catch(e){}return zf.apply(this,arguments)};Object.assign(zmDamage,zf);zmDamage._dogW=1}
+  const f=DMG_EXT.z;if(typeof f!=='function'||f._dogW)return;const g=function(t,dmg,src){try{if(src===undefined||src==='player')dogNoteTarget(t)}catch(e){}return f.apply(this,arguments)};Object.assign(g,f);g._dogW=1;DMG_EXT.z=g}
+
+// ---- look-at, interaction, melee pass-through ----
+AIM_EXT.push((o,d,maxT,consider)=>{if(maxT>4.5||!S||!P)return;const pd=P.pending;if(pd&&pd.m&&pd.done)return;     // your own swings pass through dogs
+  for(const g of dogs){if(g.hidden||g.gone)continue;if(Math.abs(g.x-o.x)>maxT+2||Math.abs(g.z-o.z)>maxT+2)continue;const dn=g.state==='downed'||g.pose==='down';
+    consider(rayCyl(o,d,g.x,g.z,dn?.5:.42,g.y-.05,g.y+(dn?.45:.85),maxT),{kind:g.local?'dog':'dogo',e:g})}
+  for(const s of dogStrays){if(Math.abs(s.x-o.x)>maxT+2||Math.abs(s.z-o.z)>maxT+2)continue;consider(rayCyl(o,d,s.x,s.z,.42,s.y-.05,s.y+.85,maxT),{kind:'dogstray',e:s})}});
+HIT_EXT.dog=HIT_EXT.dogo=HIT_EXT.dogstray=()=>false;
+INTERACT_EXT.push(a=>{if(!a||!a.e)return null;
+  if(a.kind==='dogstray'){if(myDog())return{kind:'dogfull',e:a.e};const f=dogFood();if(!f)return{kind:'dogcall',e:a.e};PROMPTS.dogfeed=`Feed ${ITEMS[f].n} (${DOG.fed[a.e.id]||0}/2)`;return{kind:'dogfeed',e:a.e}}
+  if(a.kind==='dog'){const d=a.e;if(d.state==='runoff')return null;
+    if(d.state==='downed'){if(DOG.hold)return null;PROMPTS.dogrevive=has('bandage')?`Hold to revive ${d.name} (Bandage)`:`Revive ${d.name} — needs a Bandage`;return{kind:'dogrevive',e:d}}
+    const f=dogFood();if(f&&d.hp<d.maxHp-1){PROMPTS.dogheal=`Feed ${d.name} ${ITEMS[f].n}`;return{kind:'dogheal',e:d}}PROMPTS.dogpet=`Pet ${d.name}`;return{kind:'dogpet',e:d}}
+  if(a.kind==='dogo'){PROMPTS.dogo=`Pet ${a.e.name}`;return{kind:'dogo',e:a.e}}return null});
+Object.assign(PROMPTS,{dogfeed:'Feed',dogcall:'Coax it closer',dogfull:'You already have a companion',dogpet:'Pet',dogheal:'Feed',dogrevive:'Hold to revive (Bandage)',dogo:'Pet'});
+Object.assign(INTERACT_DO,{
+ dogfeed:t=>dogFeedStray(t.e),
+ dogcall:t=>{if(DOG.iCd>0)return;DOG.iCd=1;sfx('dogwhistle',.45);feedMsg('It sniffs the air, hungry — bring Cooked Meat or a Bone Biscuit');if(NET.role==='client')hostSend({k:'c_call',id:t.e.id});else dogStrayCalled(t.e,NET.myId||'me')},
+ dogfull:()=>{if(DOG.iCd>0)return;DOG.iCd=1.5;const d=myDog();feedMsg('One companion at a time'+(d?' — '+d.name+' would be jealous':''))},
+ dogpet:t=>dogPet(t.e),
+ dogheal:t=>dogFeedMine(t.e),
+ dogrevive:t=>{if(!has('bandage')){if(DOG.iCd<=0){DOG.iCd=1.5;feedMsg('You need a Bandage to revive '+t.e.name)}return}if(!DOG.hold)DOG.hold={t:0}},
+ dogo:t=>{if(DOG.iCd>0)return;DOG.iCd=1.2;const d=t.e;if(NET.role)netSend({k:'c_pet',to:d.owner});d.jumpT=.55;dogHearts(d,6);sfx('dogyip',.5,d)}});
+Object.assign(INFO,{
+ dogstray:{k:'Animal',t:'Stray Dog',d:'Scruffy, hungry and wary. Crouch so it dares to come closer, then feed it two meals (E) to make it your companion.',rows:[['Taming','2 × Cooked Meat or Bone Biscuit'],['Careful','Sprinting at it scares it off']],g:'animals'},
+ dog:{k:'Your companion',t:'Your Dog',d:'Follows you, warns you about threats, fights by your side and sniffs out loot.',rows:[['Z','Stay / follow'],['E','Pet it · Cooked Meat heals it'],['Downed','Hold E with a Bandage within 60 s']],g:'animals'},
+ dogrevive:{k:'Your companion',t:'Downed!',d:'Hold E with a Bandage to get your dog back on its paws before it limps off home.',rows:[['Time','60 seconds']],g:'animals'},
+ dogo:{k:'Companion',t:'A Friend\'s Dog',d:'Another survivor\'s companion. Press E to give it a pat.',rows:[],g:'animals'}});
+INFO.dogfeed=INFO.dogcall=INFO.dogfull=INFO.dogstray;INFO.dogpet=INFO.dogheal=INFO.dog;
+
+// ---- multiplayer ----
+RELAY.add('c_dog');RELAY.add('c_dogoff');RELAY.add('c_pet');
+function dogNetTick(dt){
+  if(NET.role&&DOG.mine){DOG.netT-=dt;if(DOG.netT<=0){DOG.netT=.11;const d=DOG.mine,f=v=>Math.round(v*100)/100;
+    netSend({k:'c_dog',p:[f(d.x),f(d.y),f(d.z),f(d.yaw),f(d.vis||0)],s:DOG_PC[d.state==='downed'?'down':d.pose]|0,h:Math.round(100*Math.max(0,d.hp)/d.maxHp),n:d.name,c:d.coat,sc:f(d.sc),v:f(d.voice),
+      m:d.mode==='stay'?1:0,e:DOG.snd,et:DOG.sndT,l:d.lungeT>.2?1:0,hd:d.hidden?1:0,md:Math.round((d.mood||0)*10),f:d.fightUntil>S.time?1:0,tg:d.tgt&&d.tgt.id!==undefined?d.tgt.id:0})}}
+  if(NET.role==='client'&&dogStrays.length){DOG.plT-=dt;if(DOG.plT<=0){DOG.plT=.3;if(P.alive&&dogStrays.some(s=>dist2(s.x,s.z,P.x,P.z)<35)){const sel=P.hot[P.sel];hostSend({k:'c_pl',c:P.crouch?1:0,m:sel==='cooked_meat'||sel==='bone_biscuit'?1:0})}}}
+  if(DOG.pendingTame&&S.time-DOG.pendingTame.t>6){gain(DOG.pendingTame.food,1,true);feedMsg('The stray slipped away — try again');DOG.pendingTame=null}}
+onHook('netMsg',m=>{if(!m||typeof m.k!=='string'||m.k.slice(0,2)!=='c_'||!S)return;const host=NET.role==='host';
+  switch(m.k){
+   case 'c_dog':dogMirrorMsg(m);break;
+   case 'c_dogoff':for(const d of dogs)if(!d.local&&d.owner===m.from){dogFree(d);d.gone=true}dogs=dogs.filter(d=>!d.gone);break;
+   case 'c_pl':if(host&&m.from)DOG.flags[m.from]={c:m.c?1:0,m:m.m?1:0,t:S.time};break;
+   case 'c_feed':if(host){const s=dogStrays.find(q=>q.id===m.id);if(s)dogStrayFed(s,m.from)}break;
+   case 'c_call':if(host){const s=dogStrays.find(q=>q.id===m.id);if(s)dogStrayCalled(s,m.from)}break;
+   case 'c_tame':if(host&&m.from){const s=dogStrays.find(q=>q.id===m.id);if(!s){sendTo(m.from,{k:'c_tameno',id:m.id});break}dogStrayRemove(s);
+     sendTo(m.from,{k:'c_tameok',id:s.id,c:s.coat,sc:s.sc,v:s.voice,nm:s.name||'',hx:s.home.x,hz:s.home.z,p:[s.x,s.y,s.z,s.yaw]})}break;
+   case 'c_tameok':if(DOG.pendingTame&&DOG.pendingTame.id===m.id){DOG.pendingTame=null;const p=Array.isArray(m.p)&&isFinite(m.p[0])&&isFinite(m.p[2])?m.p:[P.x+1,P.y,P.z,0];
+     dogMakeMine({coat:m.c|0,sc:clamp(+m.sc||1,.85,1.12),voice:clamp(+m.v||1,.8,1.25),name:m.nm,x:+p[0],y:+p[1]||P.y,z:+p[2],yaw:+p[3]||0,home:{x:isFinite(m.hx)?+m.hx:+p[0],z:isFinite(m.hz)?+m.hz:+p[2]}})}
+     else if(!DOG.pendingTame||DOG.pendingTame.id!==m.id){const lf=!myDog()&&!DOG.pendingTame&&dogFood();   // late reply (after the 6 s timeout refunded the food)
+       if(lf&&P.alive){take(lf,1);const p=Array.isArray(m.p)&&isFinite(m.p[0])&&isFinite(m.p[2])?m.p:[P.x+1,P.y,P.z,0];dogMakeMine({coat:m.c|0,sc:clamp(+m.sc||1,.85,1.12),voice:clamp(+m.v||1,.8,1.25),name:m.nm,x:+p[0],y:+p[1]||P.y,z:+p[2],yaw:+p[3]||0,home:{x:isFinite(m.hx)?+m.hx:+p[0],z:isFinite(m.hz)?+m.hz:+p[2]}})}
+       else hostSend({k:'c_runoff',c:m.c|0,sc:+m.sc||1,v:+m.v||1,nm:m.nm||'',hx:+m.hx,hz:+m.hz})}break;
+   case 'c_tameno':if(DOG.pendingTame&&DOG.pendingTame.id===m.id){gain(DOG.pendingTame.food,1,true);feedMsg('Someone else won that dog over first');DOG.pendingTame=null}break;
+   case 'c_runoff':if(host)dogStrayReturn({coat:m.c|0,sc:+m.sc,voice:+m.v,name:m.nm,hx:+m.hx,hz:+m.hz});break;
+   case 'c_dmg':{const d=DOG.mine;if(d&&isFinite(m.d))dogHurt(d,clamp(+m.d,0,150),isFinite(m.x)&&isFinite(m.z)?dogEnemyNear(+m.x,+m.z,4):null);break}
+   case 'c_pet':if(m.to===NET.myId&&DOG.mine&&DOG.mine.state!=='downed'){const d=DOG.mine;d.jumpT=.55;d.moodT=1;dogEmit(d,'dogyip',.5);dogHearts(d,6);feedMsg(dogEsc(NET.names[m.from]||'A friend')+' gave '+d.name+' a pat')}break}});
+
+// ---- tick plumbing: playerTick (alive & active), worldTick / clientTick (host or client while paused/dead); once per frame ----
+function dogTickAll(dt){if(!S||!P||S.time===DOG.lastT)return;DOG.lastT=S.time;if(DOG.iCd>0)DOG.iCd-=dt;
+  if(NET.role==='client')dogStrayMirrorTick(dt);else{if(dogStrays.length){if((DOG.puT=(DOG.puT||0)-dt)<=0||!DOG.players.length){DOG.puT=.2;dogPlayersUpdate()}for(const s of dogStrays)dogStrayAI(s,dt)}dogAnimalAggro(dt)}
+  dogTrailTick();dogMineTick(dt);dogMirrorsTick(dt);dogNetTick(dt);dogMarkTick();
+  if((DOG.wrapT-=dt)<=0){DOG.wrapT=2;dogWrapZ()}
+  if((DOG.tipT-=dt)<=0){DOG.tipT=.5;if(P.alive&&!myDog()&&dogStrays.some(s=>dist2(s.x,s.z,P.x,P.z)<20))tip('dog_stray','A stray dog','Strays are wary: sprinting at one scares it off, <b>crouching</b> (C) lets it come to you. Feed it <b>Cooked Meat</b> (or a Bone Biscuit) twice — look at it and press <b>E</b> — and it becomes your companion.')}}
+onHook('playerTick',dt=>{if(keyPressed('z'))dogToggleStay();dogHoldTick(dt)});
+onHook('playerTick',dogTickAll);onHook('worldTick',dogTickAll);onHook('clientTick',dogTickAll);
+onHook('death',()=>{const d=myDog();if(d){d.guard={x:P.x,z:P.z};d.tgt=null}DOG.hold=null});
+onHook('respawn',()=>{const d=myDog();if(d)d.guard=null;DOG.trail=[]});
+
+// ---- HUD: status chip, threat arrow, revive bar, toast, paw marker, maps ----
+const dogUI=(()=>{const st=document.createElement('style');st.textContent=`
+#dogWarn{position:absolute;left:50%;top:50%;width:250px;height:250px;margin:-125px 0 0 -125px;opacity:0;pointer-events:none;transition:opacity .25s}
+#dogWarn i{position:absolute;left:50%;top:-4px;margin-left:-11px;width:0;height:0;border-left:11px solid transparent;border-right:11px solid transparent;border-bottom:16px solid #ffb43c;filter:drop-shadow(0 0 3px rgba(0,0,0,.9));animation:dogPulse .7s ease-in-out infinite alternate}
+@keyframes dogPulse{from{transform:translateY(0)}to{transform:translateY(-5px)}}
+#dogHold{position:absolute;left:50%;top:calc(50% + 64px);transform:translateX(-50%);min-width:170px;background:rgba(20,20,18,.78);padding:5px 10px 6px;font-size:12.5px;font-weight:700;text-align:center;opacity:0;transition:opacity .12s;white-space:nowrap}
+#dogHold i{display:block;height:4px;margin-top:5px;background:#a4c35a;width:0}
+#dogToast{position:absolute;left:50%;top:92px;transform:translate(-50%,-8px);background:var(--panel2);border-left:3px solid #e8a23a;padding:8px 20px 9px;text-align:center;opacity:0;transition:opacity .35s,transform .35s;box-shadow:0 8px 30px rgba(0,0,0,.45)}
+#dogToast.on{opacity:1;transform:translate(-50%,0)}
+#dogToast .k{color:#e8a23a;font-size:11px;letter-spacing:.2em;font-weight:700}#dogToast .t{font-size:24px;font-weight:700;letter-spacing:.04em}#dogToast .d{font-size:12px;color:var(--dim)}
+#status span.dogchip{display:inline-flex;align-items:center;gap:5px;color:#f2d7a6}
+#status span.dogchip svg{width:12px;height:12px;fill:currentColor}
+#status span.dogchip .hpb{display:inline-block;width:34px;height:5px;background:rgba(255,255,255,.14);position:relative;padding:0}
+#status span.dogchip .hpb i{position:absolute;left:0;top:0;bottom:0}
+#status span.dogchip .md{color:#9fc6e8;font-size:10.5px;letter-spacing:.06em;background:none;padding:0}
+#status span.dogchip.down{color:#ff8a6a}#status span.dogchip.down .md{color:#ff8a6a}`;document.head.appendChild(st);
+  const hud=$('#hud'),mk=(id,html)=>{const e=document.createElement('div');e.id=id;e.innerHTML=html;hud.appendChild(e);return e};
+  const u={warn:mk('dogWarn','<i></i>'),hold:mk('dogHold','<span></span><i></i>'),toast:mk('dogToast','<div class="k"></div><div class="t"></div><div class="d"></div>'),w:-1,h:-1,tOn:false};
+  u.holdTxt=u.hold.querySelector('span');u.holdBar=u.hold.querySelector('i');
+  const tb=document.querySelector('#pause table');if(tb){const tr=document.createElement('tr');tr.innerHTML='<td>Z</td><td>Dog companion: stay / follow</td>';(tb.tBodies&&tb.tBodies[0]||tb).appendChild(tr)}
+  return u})();
+function dogToast(k,t,dsc){const u=dogUI;u.toast.querySelector('.k').textContent=k;u.toast.querySelector('.t').textContent=t;u.toast.querySelector('.d').textContent=dsc||'';DOG.toastUntil=performance.now()+3800}
+onHook('hud',()=>{if(!S||!P)return;const u=dogUI;
+  let op=0;if(DOG.warn&&DOG.warnT>0&&P.alive&&S.active&&myDog()&&myDog().state!=='downed'&&!myDog().hidden){op=Math.min(1,DOG.warnT*1.5)*(S.time-(DOG.warnNew||-99)<3?1:.45);const ang=Math.atan2(DOG.warn.x-P.x,DOG.warn.z-P.z),hd=Math.atan2(-Math.sin(P.yaw),-Math.cos(P.yaw));u.warn.style.transform=`rotate(${(hd-ang).toFixed(3)}rad)`}
+  if(op!==u.w){u.w=op;u.warn.style.opacity=op}
+  const h=DOG.hold;if(h){const d=DOG.mine;const fc=freeCursor()&&S.active&&mouseX>=0;u.hold.style.left=fc?mouseX+'px':'50%';u.hold.style.top=fc?(mouseY+62)+'px':'calc(50% + 64px)';
+    u.holdTxt.textContent='Reviving '+(d?d.name:'')+'…';u.holdBar.style.width=Math.min(100,h.t/2.4*100).toFixed(1)+'%'}
+  const hv=h?1:0;if(hv!==u.h){u.h=hv;u.hold.style.opacity=hv}
+  const on=performance.now()<DOG.toastUntil;if(on!==u.tOn){u.tOn=on;u.toast.classList.toggle('on',on)}});
+onHook('status',o=>{const d=myDog();if(!d)return;const pct=Math.max(0,Math.round(100*d.hp/d.maxHp)),md=d.hidden?'IN VEHICLE':d.state==='downed'?`DOWN ${Math.max(0,Math.ceil(d.downT))}s`:d.mode==='stay'?'STAY':'FOLLOW';
+  o.push(`<span class="dogchip${d.state==='downed'?' down':''}">${DOG_PAW}${d.name}<span class="hpb"><i style="width:${pct}%;background:${pct>50?'#a4c35a':pct>25?'#e0b040':'#e0624d'}"></i></span><span class="md">${md}</span></span>`)});
+onHook('minimap',(m,s)=>{for(const st of dogStrays)if(dist2(st.x,st.z,P.x,P.z)<70){m.fillStyle='rgba(232,204,150,.9)';m.fillRect(st.x*s-1.5,st.z*s-1.5,3,3)}
+  const d=myDog();if(d&&!d.hidden){m.fillStyle=d.state==='downed'?'#ff6a4a':'#ffb84a';m.strokeStyle='#000';m.lineWidth=1;m.beginPath();m.arc(d.x*s,d.z*s,2.8,0,7);m.fill();m.stroke()}
+  if(DOG.find&&DOG.find.phase==='bark'){const e=DOG.find.e;m.strokeStyle='#ffb84a';m.lineWidth=1.5;m.beginPath();m.arc(e.x*s,e.z*s,4+Math.sin(S.time*6)*1.5,0,7);m.stroke()}});
+onHook('bigmap',(g,s)=>{const d=myDog();if(!d||d.hidden)return;g.fillStyle=d.state==='downed'?'#ff6a4a':'#ffb84a';g.strokeStyle='#000';g.lineWidth=1.5;g.beginPath();g.arc(d.x*s,d.z*s,5,0,7);g.fill();g.stroke();
+  g.font='bold 13px Roboto Condensed,Arial';g.fillStyle='rgba(0,0,0,.6)';g.fillText(d.name,d.x*s+8,d.z*s+5);g.fillStyle='#ffd9a0';g.fillText(d.name,d.x*s+7,d.z*s+4)});
+function dogMarkGet(){if(DOG.mark)return DOG.mark;const tex=canvasTex(128,(g,s)=>{g.clearRect(0,0,s,s);const gr=g.createRadialGradient(s/2,s/2,4,s/2,s/2,s/2);gr.addColorStop(0,'rgba(255,190,80,.55)');gr.addColorStop(1,'rgba(255,190,80,0)');g.fillStyle=gr;g.fillRect(0,0,s,s);
+    g.fillStyle='#ffc45a';g.strokeStyle='rgba(30,20,10,.85)';g.lineWidth=5;const el=(x,y,rx,ry)=>{g.beginPath();g.ellipse(x*s/24,y*s/24,rx*s/24,ry*s/24,0,0,7);g.stroke();g.fill()};
+    el(12,15.5,4.6,3.8);el(6.4,10.4,1.8,2.3);el(9.9,7.2,1.8,2.4);el(14.1,7.2,1.8,2.4);el(17.6,10.4,1.8,2.3)},1,true);tex.repeat.set(1,1);
+  const m=new THREE.Sprite(new THREE.SpriteMaterial({map:tex,transparent:true,depthWrite:false,fog:false}));m.scale.set(.9,.9,1);m.visible=false;m.renderOrder=6;scene.add(m);DOG.mark=m;return m}
+function dogMarkShow(e){DOG.markE=e;dogMarkGet().visible=true}
+function dogMarkHide(){DOG.markE=null;if(DOG.mark)DOG.mark.visible=false}
+function dogMarkTick(){const e=DOG.markE;if(!e||!DOG.mark)return;if(!DOG.find){dogMarkHide();return}const s=.85+.12*Math.sin(S.time*5);DOG.mark.position.set(e.x,(e.y!==undefined?e.y:groundH(e.x,e.z))+(e.ph||1)+.9+Math.sin(S.time*3)*.12,e.z);DOG.mark.scale.set(s,s,1)}
+
+// ---- companion item: Bone Biscuit ----
+ITEMS.bone_biscuit={n:'Bone Biscuit',c:'#cfae78',cat:'Companion',d:'A rock-hard biscuit baked from ground bone and animal fat. Humans shouldn\'t. Dogs absolutely should.',f:'Craft: 10 Bone Fragments + 4 Animal Fat → 2.',u:'Look at a stray or your dog and press E. Counts as a taming meal and fully heals your dog.'};
+{const i=RECIPES.findIndex(r=>r.wb);RECIPES.splice(i<0?RECIPES.length:i,0,{id:'bone_biscuit',cost:{bone:10,animal_fat:4},out:2,time:10,cat:'Companion'})}
+
 /* ================= RENDER ================= */
 const tmpC=new THREE.Color(),tmpC2=new THREE.Color();
 const SKY={dayTop:new THREE.Color('#4a82c4'),dayBot:new THREE.Color('#bcd2de'),setTop:new THREE.Color('#3b4f7a'),setBot:new THREE.Color('#e8a26a'),nightTop:new THREE.Color('#03050b'),nightBot:new THREE.Color('#080b12'),
