@@ -9503,6 +9503,202 @@ function phmDiscover(){const now=performance.now();if(now-PHM.discT<2000)return;
   const p=dayP();if(!((p>.005&&p<.06)||(p>.595&&p<.655)))return;const t=$('#tip');if(!t||!t.classList.contains('hidden'))return;
   tip('photo_hint','Golden hour','The light is beautiful right now. Press <b>P</b> for <b>photo mode</b>: fly a free camera around you, pick a filter and save a screenshot.')}
 
+/* ================= POLISH ================= */
+// polish module: animation feel + graphics polish layered on top of the anim and gfx modules (wraps only, no patches).
+// Viewmodel: weapon-weighted anticipation / follow-through, melee hit-stop with camera kick, lower-then-raise item switching,
+//   sprint arm pumping, hurt jolt. Camera: smooth (noise-based) shake instead of white-noise jitter, smoothed revolver recoil climb,
+//   directional damage punch, landing dip, turn lean, idle handheld sway. Rigs: head-leads-turn / torso lag secondary motion,
+//   turn-in-place stepping, idle gestures. Graphics: travelling wind gusts + per-instance tint + sun back-lighting on all
+//   windify foliage, wet darker/glossier ground and building materials in rain, shadow window pushed ahead of the view,
+//   stronger dawn/dusk light shafts, soft round particles, one pooled spark light for hard melee impacts.
+// Quality: POSTFX low/off/failed disables foliage back-lighting, the spark light and ray boost, and shrinks the rig radius.
+const PLSH=(()=>{
+const TAU=Math.PI*2,SENT=1e5;
+const wrapA=a=>{a=(a+Math.PI)%TAU;if(a<0)a+=TAU;return a-Math.PI};
+const eIn=t=>t*t,eOut=t=>1-(1-t)*(1-t),eIO=t=>t*t*(3-2*t);
+const st={t:0,sh:0,hs:0,hsA:new Float32Array(6),mh:0,hm:0,hp:null,hc:null,hpv:{x:0,y:0,z:0},rcP:0,rcY:0,land:0,py:null,yl:0,scan:1,scanT:0,
+  sw:{on:false,t:0,from:null,to:null},avL:[]};
+const LOWD=.1;
+function low(){return typeof POSTFX!=='undefined'&&!!POSTFX&&(POSTFX.quality==='low'||!POSTFX.enabled||!!POSTFX.failed)}
+/* ---- underdamped springs for camera kicks (semi-implicit Euler, sub-stepped) ---- */
+const CK={p:{x:0,v:0},y:{x:0,v:0},r:{x:0,v:0}};
+function spr(s,k,c,dt){const n=dt>.016?Math.min(6,Math.ceil(dt/.016)):1,h=dt/n;for(let i=0;i<n;i++){s.v+=(-k*s.x-c*s.v)*h;s.x+=s.v*h}
+  if(!isFinite(s.x)||!isFinite(s.v)){s.x=0;s.v=0}}
+function kick(s,a){if(isFinite(a))s.v+=a*24}
+/* ---- weapon weights (0 light & quick .. 1 heavy & committed) ---- */
+const WW={rock:.55,torch:.2,stone_hatchet:.6,stone_pickaxe:.75,spear:.45,lead_pipe:.6,machete:.15,baseball_bat:.55,fire_axe:.85,katana:.1,sledgehammer:1};
+const BLADE={machete:1,katana:1};
+function baseId(id){const it=id&&ITEMS[id];return(it&&it.ixBase)||id}
+function wOf(id){const b=baseId(id);const w=WW[b];return w===undefined?.5:w}
+
+/* =============== viewmodel =============== */
+function hitStop(d){if(!(d>0)||!P||!P.alive||!vm)return;if(st.hs<d){if(st.hs<=0){const a=st.hsA,p=vm.position,r=vm.rotation;a[0]=p.x;a[1]=p.y;a[2]=p.z;a[3]=r.x;a[4]=r.y;a[5]=r.z}st.hs=Math.min(.09,d)}}
+function vmLayer(dt){if(!P.alive)return;const p=vm.position,r=vm.rotation,A=P.anim,id=vmId;
+  // weapon-specific anticipation and follow-through over the core swing/thrust curves
+  if(A&&(A.type==='swing'||A.type==='thrust')){const t=Math.min(1,A.t||0),w=wOf(id),bl=BLADE[baseId(id)]?1:0;
+    const a=t<.32?eOut(t/.32):t<.44?1-eIn((t-.32)/.12):0,f=t<.4?0:t<.55?eOut((t-.4)/.15):1-eIO((t-.55)/.45);
+    if(A.type==='swing'){const hv=A.ixHeavy?1.4:1;r.x+=(.22*w*a-(.12+.22*w)*f)*hv;r.y+=bl?(.14*a-.3*f):(.03*a-.08*f);r.z+=.1*w*a-(bl?.22:.12)*f;p.z+=.03*w*a;p.x-=(bl?.04:.02)*f;p.y-=.03*w*f;
+      if(w>.7&&t>.2&&t<.32){p.x+=Math.sin(t*170)*.0018*w;p.y+=Math.cos(t*150)*.0015*w}}
+    else{p.z+=.05*a-.06*f;r.y+=.05*a;r.x-=.05*f;p.y+=.01*a}}
+  // sprint: arms pump with the stride
+  const sk=P.sprintK||0;if(sk>.01&&!A&&!P.drawing){const b=P.bob||0;r.x+=.09*Math.sin(b)*sk;r.y+=.05*Math.cos(b)*sk;p.y+=.014*Math.cos(2*b)*sk;p.x+=.012*Math.sin(b)*sk}
+  // item switch: lower the old item, then the new one rises with a small flourish
+  const sw=st.sw;if(sw.on){const e=eIn(Math.min(1,sw.t/LOWD));p.y-=.3*e;r.x-=.6*e;p.x+=.03*e}
+  else if((P.equipT||0)<1){const u=Math.max(0,P.equipT||0),s=Math.sin(u*Math.PI)*(1-u)*1.5;r.z+=.2*s;r.y-=.1*s}
+  // camera punches drag the weapon a little behind the view
+  r.x-=CK.p.x*.6;r.z-=CK.r.x*.5;p.x-=CK.y.x*.05}
+const _uvm=updateVM;
+updateVM=function(dt){if(!P||typeof vm==='undefined'||!vm)return _uvm.apply(this,arguments);
+  if(st.hs>0&&P.alive&&P.anim){st.hs-=dt;const a=st.hsA,tr=.0035;vm.position.set(a[0]+R(-tr,tr),a[1]+R(-tr,tr),a[2]);vm.rotation.set(a[3],a[4],a[5]);return}
+  st.hs=0;const sw=st.sw,want=P.alive?P.hot[P.sel]:null;
+  if(sw.on){if(!P.alive||want===sw.from)sw.on=false;else sw.to=want}
+  else if(P.alive&&want!==vmId&&vmId&&vmCur&&dt<.2&&S&&S.active){sw.on=true;sw.t=0;sw.from=vmId;sw.to=want}
+  if(sw.on){sw.t+=dt;if(sw.t>=LOWD)sw.on=false}
+  let swapped=false,saved;if(sw.on&&P.hot&&P.sel>=0){saved=P.hot[P.sel];P.hot[P.sel]=sw.from;swapped=true}
+  try{_uvm.apply(this,arguments)}finally{if(swapped)P.hot[P.sel]=saved}
+  try{vmLayer(dt)}catch(e){}};
+/* ---- melee impact detection: hit-stop + kick, spark light on hard surfaces ---- */
+const _hitmark=hitmark;hitmark=function(){if(st.mh)st.hm=1;return _hitmark.apply(this,arguments)};
+const _burst=burst;burst=function(p,cols){if(st.mh&&p&&!st.hp&&isFinite(+p.x)){st.hpv.x=+p.x;st.hpv.y=+p.y;st.hpv.z=+p.z;st.hp=st.hpv;st.hc=cols}return _burst.apply(this,arguments)};
+function hardChip(c){return !!c&&typeof CHIP!=='undefined'&&(c===CHIP.stone||c===CHIP.metal||c===CHIP.sulfur||c===CHIP.boulder||c===CHIP.build)}
+function onMelee(m,id){const w=wOf(id),hv=(m&&m.heavy)||(P.anim&&P.anim.ixHeavy)?1:0;
+  if(st.hm){hitStop(.042+.022*w+.018*hv);kick(CK.p,-(.007+.012*w)*(1+.5*hv));kick(CK.r,R(-.005,.005))}
+  else if(hardChip(st.hc)){hitStop(.026+.014*w);kick(CK.p,-.005*(1+w));if(st.hp)flash(st.hp,2.4,.13)}
+  else if(typeof CHIP!=='undefined'&&st.hc===CHIP.tree){hitStop(.022+.01*w);kick(CK.p,-.004*(1+w))}}
+const _mh=meleeHit;meleeHit=function(m,id){st.mh=1;st.hm=0;st.hp=null;st.hc=null;let r;try{r=_mh.apply(this,arguments)}finally{st.mh=0}
+  if(r)try{if(P&&P.alive)onMelee(m,id)}catch(e){}return r};
+/* ---- smoothed revolver recoil climb (same total climb, spread over ~80 ms) + visual kick ---- */
+if(typeof fireRevolver==='function'){const _fr=fireRevolver;fireRevolver=function(){const p0=P.pitch,y0=P.yaw;const r=_fr.apply(this,arguments);
+  try{const dp=P.pitch-p0,dy=P.yaw-y0;if(isFinite(dp)&&isFinite(dy)&&Math.abs(dp)<.2&&Math.abs(dy)<.2){P.pitch=p0;P.yaw=y0;st.rcP+=dp;st.rcY+=dy;kick(CK.p,.014);kick(CK.r,R(-.004,.004))}}catch(e){}return r}}
+/* ---- directional damage punch ---- */
+const QUIET={bleed:1,starve:1,thirst:1,cold:1,rad:1,poison:1,drown:1,heat:1,hunger:1};
+const _hurt=hurt;hurt=function(dmg,cause,fx,fz){const was=!!(P&&P.alive);const r=_hurt.apply(this,arguments);try{if(was&&dmg>0)punch(dmg,cause,fx,fz)}catch(e){}return r};
+function punch(dmg,cause,fx,fz){if(QUIET[cause]&&dmg<6)return;const k=clamp(dmg/25,.2,1);
+  if(cause==='fall'){kick(CK.p,-.05*k);return}
+  if(fx!==undefined&&isFinite(+fx)&&isFinite(+fz)){const dx=fx-P.x,dz=fz-P.z,l=Math.hypot(dx,dz);if(l>.05){const sy=Math.sin(P.yaw),cy=Math.cos(P.yaw);
+    const f=(-dx*sy-dz*cy)/l,s=(dx*cy-dz*sy)/l;kick(CK.p,.045*k*f);kick(CK.r,.05*k*s);kick(CK.y,.03*k*s);return}}
+  kick(CK.p,.03*k);kick(CK.r,R(-.02,.02)*k)}
+
+/* =============== camera =============== */
+const _render=render;
+render=function(dt){if(!P)return _render.apply(this,arguments);
+  if(st.rcP||st.rcY){const k=Math.min(1,(+dt||0)*28),a=st.rcP*k,b=st.rcY*k;P.pitch=clamp(P.pitch+a,-1.5,1.5);P.yaw+=b;st.rcP-=a;st.rcY-=b;if(Math.abs(st.rcP)<1e-5&&Math.abs(st.rcY)<1e-5)st.rcP=st.rcY=0}
+  const sh=+P.camShake||0;st.sh=sh;P.camShake=0;
+  try{return _render.apply(this,arguments)}finally{P.camShake=Math.max(+P.camShake||0,sh-(+dt||0)*1.6);st.sh=0}};
+function camFX(dt){st.t+=dt;const t=st.t,c=camera;
+  spr(CK.p,240,13,dt);spr(CK.y,200,14,dt);spr(CK.r,220,12,dt);
+  const sh=st.sh;if(sh>0){const n1=Math.sin(t*37.1)*.6+Math.sin(t*23.7+1.7)*.4,n2=Math.sin(t*31.3+.5)*.6+Math.sin(t*19.1+2.1)*.4,n3=Math.sin(t*27.9+2.6)*.6+Math.sin(t*41.3+.9)*.4,n4=Math.sin(t*33.7+4.1)*.55+Math.sin(t*21.9+3.3)*.45;
+    c.position.x+=n1*sh*.03;c.position.z+=n4*sh*.03;c.rotation.x+=n2*sh*.017;c.rotation.z+=n3*sh*.011}
+  if(!P.alive){st.py=null;st.land=0;return}
+  if((P.landT||0)>st.land+.05)kick(CK.p,-.03*Math.min(1,P.landT));st.land=P.landT||0;
+  c.rotation.x+=CK.p.x;c.rotation.y+=CK.y.x;c.rotation.z+=CK.r.x;
+  // lean into fast turns while running
+  const spd=Math.hypot(P.vx||0,P.vz||0);let yr=0;if(st.py!==null&&dt>0)yr=wrapA(P.yaw-st.py)/dt;st.py=P.yaw;
+  const tl=P.onGround&&spd>3.5?clamp(yr*spd*.0011,-.022,.022):0;st.yl+=(tl-st.yl)*Math.min(1,dt*5);c.rotation.z+=st.yl;
+  // handheld sway when standing still (slightly stronger while holding a drawn bow)
+  const still=clamp(1-(P.bobAmp||0)*1.5,0,1)*(S&&S.active?1:0),a=.0016*still*(1+(P.drawVis||0)*.8);
+  if(a>1e-5){c.rotation.x+=a*(Math.sin(t*.71)+.6*Math.sin(t*1.37+2));c.rotation.y+=a*(Math.sin(t*.53+1)+.5*Math.sin(t*1.19))*.8;c.rotation.z+=a*.4*Math.sin(t*.43+.7)}}
+
+/* =============== rig secondary motion =============== */
+const lowR=()=>low()?22:45;
+function rigPre(r){const b=r&&r.bones&&r.bones[5];if(!b)return null;const y=b.rotation.y;b.rotation.y=SENT;return y}
+function rigPost(r,py,info,dt){const h=r.bones[5].rotation;const ps=r._pl||(r._pl={acc:0,init:0,yaw:0,x:0,z:0,v:0,hl:0,cl:0,tw:0,tp:0,gT:R(4,12),g:-1,gd:2,gs:1,gk:0,ge:0});ps.acc+=(+dt||0);
+  if(h.y===SENT){h.y=py;return}const d=Math.min(ps.acc,.5);ps.acc=0;if(!(d>0))return;try{rigSec(r,ps,info||{},d)}catch(e){}}
+function rigSec(r,ps,info,dt){if((+info.dead||0)>0||!r.g||!r.g.matrixWorld){ps.init=0;return}const e=r.g.matrixWorld.elements,x=e[12],z=e[14],yaw=Math.atan2(e[8],e[10]);
+  if(!ps.init){ps.init=1;ps.yaw=yaw;ps.x=x;ps.z=z;ps.v=0;return}
+  const dc=Math.hypot(camera.position.x-x,camera.position.z-z);if(dc>lowR()){ps.yaw=yaw;ps.x=x;ps.z=z;ps.hl=ps.cl=ps.tw=ps.ge=0;return}
+  const w=clamp(wrapA(yaw-ps.yaw)/dt,-8,8);ps.yaw=yaw;const sp=Math.min(15,Math.hypot(x-ps.x,z-ps.z)/dt);ps.x=x;ps.z=z;const ac=clamp((sp-ps.v)/dt,-30,30);ps.v+=(sp-ps.v)*Math.min(1,dt*10);
+  const B=r.bones,k=Math.min(1,dt*8);
+  // head leads a turn, chest lags; upper body pitches against acceleration
+  ps.hl+=(clamp(w*.09,-.4,.4)-ps.hl)*k;ps.cl+=(clamp(-ac*.01,-.1,.1)-ps.cl)*Math.min(1,dt*6);
+  B[5].rotation.y+=ps.hl*.6;B[4].rotation.y+=ps.hl*.3;B[3].rotation.y-=ps.hl*.18;B[3].rotation.x+=ps.cl;B[5].rotation.x-=ps.cl*.6;
+  // turning on the spot: small alternating steps instead of sliding feet
+  const spd=+info.speed||0,aw=Math.abs(w);const tw=smooth(.5,2.5,aw)*(1-smooth(.2,.5,spd));ps.tw+=(tw-ps.tw)*Math.min(1,dt*10);
+  if(ps.tw>.01&&dc<30){ps.tp=(ps.tp+dt*(5+aw*1.5))%TAU;const l=Math.max(0,Math.sin(ps.tp))*ps.tw,rr=Math.max(0,-Math.sin(ps.tp))*ps.tw,sg=w>0?1:-1;
+    B[12].rotation.x+=.32*l;B[13].rotation.x=Math.min(0,B[13].rotation.x-.65*l);B[14].rotation.x+=.3*l;B[12].rotation.y+=sg*.18*l;
+    B[15].rotation.x+=.32*rr;B[16].rotation.x=Math.min(0,B[16].rotation.x-.65*rr);B[17].rotation.x+=.3*rr;B[15].rotation.y+=sg*.18*rr;B[1].rotation.y+=sg*.06*ps.tw}
+  // occasional idle gestures (people only)
+  const idle=!r.infected&&!!info.idle&&spd<.15&&dc<(low()?14:28);ps.ge+=((idle?1:0)-ps.ge)*Math.min(1,dt*4);
+  if(idle&&ps.g<0){ps.gT-=dt;if(ps.gT<=0){ps.g=0;ps.gk=RI(0,2);ps.gd=R(1.6,2.6);ps.gs=Math.random()<.5?-1:1}}
+  if(ps.g>=0){ps.g+=dt/ps.gd;const env=Math.sin(Math.PI*Math.min(1,ps.g))*ps.ge,s=ps.gs;
+    if(ps.gk===0){B[5].rotation.y+=.7*s*env;B[4].rotation.y+=.35*s*env;B[3].rotation.y+=.15*s*env}
+    else if(ps.gk===1){B[3].rotation.x-=.12*env;B[5].rotation.x-=.25*env;B[6].rotation.z-=.18*env;B[9].rotation.z+=.18*env}
+    else{B[5].rotation.x+=.35*env;B[4].rotation.x+=.15*env;B[3].rotation.y+=.1*s*env}
+    if(ps.g>=1||ps.ge<.02&&!idle){ps.g=-1;ps.gT=R(7,16)}}}
+if(typeof animateRig==='function'){const _ar=animateRig;animateRig=function(r,s,dt){const py=rigPre(r);try{return _ar.apply(this,arguments)}finally{if(py!==null)rigPost(r,py,s,dt)}}}
+const NI={speed:0,idle:false,dead:0};
+if(typeof animateNpc==='function'){const _an=animateNpc;animateNpc=function(n,dt){const r=n&&n.m&&n.m.rig;const py=r?rigPre(r):null;
+  try{return _an.apply(this,arguments)}finally{if(py!==null){NI.speed=n.speed||0;NI.idle=NI.speed<.2&&n.state!=='chase'&&n.state!=='camp';NI.dead=n.dead?1:0;rigPost(r,py,NI,dt)}}}}
+if(typeof animateAvatars==='function'){const _aa=animateAvatars;animateAvatars=function(dt){const L=st.avL;L.length=0;
+  try{if(typeof avatars!=='undefined')for(const id in avatars){const a=avatars[id],r=a&&a.rig;if(!r)continue;const py=rigPre(r);if(py!==null)L.push(a,r,py)}}catch(e){}
+  try{return _aa.apply(this,arguments)}finally{for(let i=0;i<L.length;i+=3)rigPost(L[i+1],L[i+2],L[i].s,dt);L.length=0}}}
+
+/* =============== foliage: gust waves, tint variation, back-lighting =============== */
+const FU={uPlWD:{value:new THREE.Vector2(.8,.6)},uPlGS:{value:1.3},uPlGA:{value:.4},uPlDry:{value:1},uPlSunV:{value:new V3(0,1,0)},uPlSunC:{value:new THREE.Color(0,0,0)},uPlTr:{value:0}};
+const W_A='float wh=max(position.y-uMinH,0.);',W_B='transformed.z+=cos(uTime*1.1+ip.x*.17+ip.y*.19)*wh*uWind*.6;';
+function folShader(sh,kind){let vs=sh.vertexShader,fs=sh.fragmentShader;
+  if(typeof vs!=='string'||typeof fs!=='string'||vs.indexOf('#include <common>')<0||vs.indexOf('#include <project_vertex>')<0||fs.indexOf('#include <common>')<0||fs.indexOf('#include <emissivemap_fragment>')<0)return;
+  const gust=vs.indexOf(W_A)>=0&&vs.indexOf(W_B)>=0&&vs.indexOf('uniform float uTime;')>=0;
+  let decl='\nuniform vec2 uPlWD;uniform float uPlGS;uniform float uPlGA;uniform float uPlDry;\nvarying vec3 vPlV;\n';
+  if(gust)decl+='float plGust(vec2 p){float w=dot(p,uPlWD)*.045-uTime*uPlGS;float g=sin(w)*.5+.5;g=g*g*g;float n=sin(dot(p,vec2(-uPlWD.y,uPlWD.x))*.03+uTime*.13)*.5+.5;return g*(.55+.45*n);}\n';
+  vs=vs.replace('#include <common>','#include <common>'+decl);
+  if(gust)vs=vs.replace(W_A,W_A+'float plG=plGust(ip);wh*=1.+plG*uPlGA*.9;').replace(W_B,W_B+'\n#ifdef USE_INSTANCING\nvec3 plL=vec3(uPlWD.x,0.,uPlWD.y)*mat3(instanceMatrix);\n#else\nvec3 plL=vec3(uPlWD.x,0.,uPlWD.y)*mat3(modelMatrix);\n#endif\nplL.xz/=max(length(plL.xz),1e-4);\ntransformed.xz+=plL.xz*(wh*uWind*plG*uPlGA*1.6);\n');
+  if(vs.indexOf('#include <color_vertex>')>=0)vs=vs.replace('#include <color_vertex>','#include <color_vertex>\n#if defined(USE_COLOR)||defined(USE_INSTANCING_COLOR)\n#ifdef USE_INSTANCING\nvec2 plI=vec2(instanceMatrix[3][0],instanceMatrix[3][2]);\n#else\nvec2 plI=vec2(modelMatrix[3][0],modelMatrix[3][2]);\n#endif\n'+
+    'float plH=fract(sin(dot(plI,vec2(12.9898,78.233)))*43758.5453);float plH2=fract(plH*17.13+.31);\nvColor.rgb*=vec3(1.+(plH-.5)*.16,1.+(plH2-.5)*.1,1.-(plH-.5)*.12);\n'+
+    (kind==='g'?'float plP=sin(plI.x*.031+plI.y*.017)*sin(plI.x*.013-plI.y*.027);\nvColor.rgb*=mix(vec3(1.),vec3(1.13,1.05,.72),smoothstep(.15,.75,plP)*uPlDry);\n':'')+'#endif\n');
+  vs=vs.replace('#include <project_vertex>','#include <project_vertex>\nvPlV=mvPosition.xyz;');
+  fs=fs.replace('#include <common>','#include <common>\nvarying vec3 vPlV;uniform vec3 uPlSunV;uniform vec3 uPlSunC;uniform float uPlTr;\n')
+    .replace('#include <emissivemap_fragment>','#include <emissivemap_fragment>\n{float plLf=clamp((diffuseColor.g-diffuseColor.r*.85)*12.,0.,1.);float plB=pow(max(dot(normalize(vPlV),uPlSunV),0.),6.);totalEmissiveRadiance+=diffuseColor.rgb*uPlSunC*(plB*plLf*uPlTr*'+(kind==='g'?'.8':'1.')+');}\n');
+  for(const k in FU)sh.uniforms[k]=FU[k];sh.vertexShader=vs;sh.fragmentShader=fs}
+function folPatch(m){if(!m||!m.isMaterial||!m.userData||m.userData.plFol)return;const prev=m.onBeforeCompile;if(typeof prev!=='function'||String(prev).indexOf('uMinH')<0)return;
+  m.userData.plFol=1;const kind=m.isMeshLambertMaterial?'g':'l';let pk='';try{pk=String(m.customProgramCacheKey())}catch(e){}
+  m.onBeforeCompile=function(sh,rr){prev.call(this,sh,rr);try{folShader(sh,kind)}catch(e){}};m.customProgramCacheKey=()=>'plFol1|'+kind+'|'+pk;m.needsUpdate=true}
+function folScan(){try{if(typeof MAT!=='undefined'){folPatch(MAT.tree);folPatch(MAT.bush)}
+  scene.traverse(o=>{const m=o.material;if(!m)return;if(Array.isArray(m)){for(const x of m)folPatch(x)}else folPatch(m)})}catch(e){console.warn('[polish] foliage',e)}}
+try{if(typeof MAT!=='undefined'){folPatch(MAT.tree);folPatch(MAT.bush)}}catch(e){}
+
+/* =============== particles, spark light, wet surfaces =============== */
+try{const pm=ptsMesh&&ptsMesh.material;if(pm){pm.map=(typeof GFX!=='undefined'&&GFX&&GFX.dot)||canvasTex(32,(g,s)=>{const gr=g.createRadialGradient(s/2,s/2,0,s/2,s/2,s/2);gr.addColorStop(0,'rgba(255,255,255,1)');gr.addColorStop(.45,'rgba(255,255,255,.7)');gr.addColorStop(1,'rgba(255,255,255,0)');g.clearRect(0,0,s,s);g.fillStyle=gr;g.fillRect(0,0,s,s)});
+  pm.transparent=true;pm.alphaTest=.02;pm.size=.09;pm.needsUpdate=true;
+  if(typeof moteMat!=='undefined'&&moteMat&&!moteMat.map){moteMat.map=pm.map;moteMat.size=.075;moteMat.needsUpdate=true}}}catch(e){}
+const SL={L:null,t:0,max:.1,i:0};
+try{SL.L=new THREE.PointLight(0xffb060,0,7,2);SL.L.position.set(0,-500,0);scene.add(SL.L)}catch(e){SL.L=null}
+function flash(p,i,dur){if(!SL.L||low()||!p)return;SL.L.position.set(p.x,p.y+.05,p.z);SL.i=i;SL.t=SL.max=dur}
+function lightTick(dt){if(!SL.L)return;if(SL.t>0){SL.t-=dt;const f=Math.max(0,SL.t/SL.max);SL.L.intensity=SL.i*f*f}else if(SL.L.intensity){SL.L.intensity=0;SL.L.position.set(0,-500,0)}}
+const WET={w:0,last:-1,mats:null};
+function wetTick(dt){if(!S)return;const rn=S.rain||0;WET.w=rn>.05?Math.min(1,WET.w+dt*rn/25):Math.max(0,WET.w-dt/100);
+  if(!WET.mats){if(typeof terrain==='undefined'||!terrain||!terrain.material)return;WET.mats=[];const add=(m,dk,rg,r0)=>{if(m&&m.color&&typeof m.roughness==='number'&&!WET.mats.some(q=>q.m===m))WET.mats.push({m,c:m.color.clone(),r:r0===undefined?m.roughness:r0,dk,rg})};
+    add(terrain.material,.3,.45,.95);if(typeof MAT!=='undefined'){add(MAT.concrete,.2,.35);if(MAT.tier){add(MAT.tier.wood,.22,.3);add(MAT.tier.stone,.15,.35);add(MAT.tier.twig,.2,.2)}}}
+  const w=Math.round(WET.w*200)/200;if(w===WET.last&&w===0)return;WET.last=w;const ws=w*w*(3-2*w);
+  for(const q of WET.mats){q.m.color.copy(q.c).multiplyScalar(1-q.dk*ws);q.m.roughness=Math.max(.05,q.r-q.rg*ws)}}
+
+/* =============== per-frame render hook =============== */
+const SV=new V3();
+function sunSet(){if(typeof GFX!=='undefined'&&GFX&&GFX.st&&GFX.st.p!==undefined)return GFX.st;const p=dayP();let D=0,sunT=-1;if(p<.66){sunT=p/.66;D=smooth(0,.1,sunT)*smooth(0,.1,1-sunT)}
+  return{sunT,D,set:sunT>=0?clamp(1-D,0,1)*smooth(0,.03,sunT)*smooth(0,.03,1-sunT):0,el:sunT>=0?Math.sin(sunT*Math.PI):-.3}}
+function frameFX(dt){if(!S||!P)return;dt=Math.min(.1,Math.max(0,+dt||0));const lo=low(),ss=sunSet(),rn=S.rain||0;
+  if(st.scan>0){st.scanT-=dt;if(st.scanT<=0){st.scan--;st.scanT=.5;folScan()}}
+  // shadow window pushed ahead of where the player looks (re-snapped to texels by the gfx module)
+  if(typeof gfxSnapShadow==='function'&&sun&&sun.shadow&&sun.shadow.camera&&P.alive){const e=+sun.shadow.camera.right||40,look=clamp(1+Math.min(0,P.pitch||0)*1.1,.25,1),d=e*.4*look;
+    const fx=-Math.sin(P.yaw)*d,fz=-Math.cos(P.yaw)*d;if(isFinite(fx)&&isFinite(fz)){sun.position.x+=fx;sun.position.z+=fz;sun.target.position.x+=fx;sun.target.position.z+=fz;try{gfxSnapShadow()}catch(err){}}}
+  // longer light shafts at dawn and dusk
+  if(!lo&&typeof GFX!=='undefined'&&GFX&&typeof GFX.rayI==='number')GFX.rayI*=1+1.3*(ss.set||0);
+  // wind gusts: slowly varying strength and direction, stronger in rain
+  const t=S.time||0,ga=.28+.32*(.5+.5*Math.sin(t*.11)*Math.sin(t*.047+1))+.55*rn,an=.6+.5*Math.sin(t*.013);
+  FU.uPlGA.value+=(ga-FU.uPlGA.value)*Math.min(1,dt*.5);FU.uPlGS.value=1.25+.6*rn;FU.uPlWD.value.set(Math.cos(an),Math.sin(an));
+  wetTick(dt);lightTick(dt);
+  try{camFX(dt)}catch(e){}
+  camera.updateMatrixWorld();
+  // sun back-lighting of leaves and grass (strongest at low sun)
+  const tr=lo||ss.sunT<0?0:(.25+1.6*(ss.set||0))*(1-.8*rn)*clamp((ss.el||0)*6,0,1);FU.uPlTr.value=tr;
+  if(tr>0&&typeof skyU!=='undefined'&&skyU.sunDir){SV.copy(skyU.sunDir.value).transformDirection(camera.matrixWorldInverse);FU.uPlSunV.value.copy(SV);
+    if(skyU.uSunC&&skyU.uSunC.value)FU.uPlSunC.value.copy(skyU.uSunC.value);else FU.uPlSunC.value.copy(sun.color)}}
+onHook('render',frameFX);
+onHook('newGame',()=>{st.scan=2;st.scanT=.2;st.hs=0;st.sw.on=false;st.rcP=st.rcY=0;st.py=null;st.land=0;st.yl=0;for(const k in CK){CK[k].x=0;CK[k].v=0}SL.t=0;WET.w=0;WET.last=-1});
+onHook('respawn',()=>{st.hs=0;st.sw.on=false;st.rcP=st.rcY=0;for(const k in CK){CK[k].x=0;CK[k].v=0}});
+onHook('death',()=>{st.hs=0;st.sw.on=false;st.rcP=st.rcY=0});
+return{hitStop,kick:(p,y,r)=>{kick(CK.p,+p||0);kick(CK.y,+y||0);kick(CK.r,+r||0)},flash,folScan,low}})();
+
 /* ================= RENDER ================= */
 const tmpC=new THREE.Color(),tmpC2=new THREE.Color();
 const SKY={dayTop:new THREE.Color('#4a82c4'),dayBot:new THREE.Color('#bcd2de'),setTop:new THREE.Color('#3b4f7a'),setBot:new THREE.Color('#e8a26a'),nightTop:new THREE.Color('#03050b'),nightBot:new THREE.Color('#080b12'),
