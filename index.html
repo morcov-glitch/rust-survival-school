@@ -9070,6 +9070,439 @@ onHook('bigmap',(g,s)=>{if(!ZIPLINES.length)return;g.save();g.lineWidth=2.2;g.st
   for(const Z of ZIPLINES)if(Z.kind!=='town')lab((Z.a.x+Z.b.x)/2*s+5,(Z.a.z+Z.b.z)/2*s-4,'Zipline');
   const tw=ZIPLINES.filter(Z=>Z.kind==='town');if(tw.length){let x=0,z=0;for(const Z of tw){x+=Z.a.x;z+=Z.a.z}lab(x/tw.length*s-30,z/tw.length*s-10,'Rooftop ziplines')}g.restore()});
 
+/* ================= PHOTO MODE ================= */
+// P opens a photo mode: a free camera (WASD / Space / C / Shift, mouse or arrow keys, Q/E tilt, wheel zoom) that roams up to
+// 30 m around the player, colour filters, vignette, a rule-of-thirds grid, a time-of-day preview and PNG capture.
+// Solo games freeze while it is open (only render() runs, with dt=0); multiplayer games keep running ("Live").
+// Integration is wrap-only (frame, look, freeCursor, pause, updateScreenFX, sfx) plus render/hud hooks. The camera, the
+// first-person attachments (viewmodel, camera-held lights) and the build ghost are only borrowed for the draw call
+// (phmPre/phmPost render hooks) and put back right after it (first 'hud' hook), so game logic always sees the normal
+// first-person state. Sends no network messages.
+const PHM_RANGE=30;
+const PHM_FILTERS=[
+  {n:'None',css:''},
+  {n:'Warm',css:'saturate(1.12) contrast(1.04) brightness(1.03)',tint:['#ff9442','soft-light',.42]},
+  {n:'Cool',css:'saturate(.9) contrast(1.06) brightness(1.02)',tint:['#3f86ff','soft-light',.42]},
+  {n:'Noir',css:'grayscale(1) contrast(1.42) brightness(.94)'},
+  {n:'Sepia',css:'sepia(.82) contrast(1.06) saturate(1.15) brightness(1.02)'},
+  {n:'Vivid',css:'saturate(1.6) contrast(1.15) brightness(1.03)'},
+  {n:'Faded',css:'contrast(.8) saturate(.68) brightness(1.06)',tint:['#3d352c','screen',.55]}];
+const PHM={on:false,S:null,frozen:false,pos:new V3(),vel:new V3(),yaw:0,pitch:0,roll:0,rollT:0,fov:75,fovT:75,fov0:75,
+  keys:{},drag:false,lastNow:0,unlockT:0,t0:0,dayF0:1,light0:1,tSaved:false,timeMin:-1,filter:0,vig:-1,grid:false,hide:false,
+  showMe:true,shot:0,tipTimer:0,msgTimer:0,uiT:0,lockSt:0,discT:0,edge:false,baseFilter:'',body:null,held:{},ui:null,
+  gfxIdx:-1,hudIdx:-1,gfxSave:null,mp:new THREE.Matrix4(),mi:new THREE.Matrix4(),tm:new THREE.Matrix4(),tS:new V3(),
+  moonDir:new V3(-.4,.7,-.5).normalize(),sv:{saved:false,pos:new V3(),quat:new THREE.Quaternion(),fov:75,under:false},
+  hid:[],shown:[],comp:[],compN:0,tgts:[],fogN:0,fogF:0,fogC:new THREE.Color(),fogOK:false};
+try{const o=JSON.parse(localStorage.getItem('rss-photo')||'null');if(o&&typeof o==='object'){if(o.f>=0&&o.f<PHM_FILTERS.length)PHM.filter=o.f|0;if(o.v>=0&&o.v<=1)PHM.vig=+o.v;PHM.grid=!!o.g;if(o.m===false)PHM.showMe=false}}catch(e){}
+function phmSavePrefs(){try{localStorage.setItem('rss-photo',JSON.stringify({f:PHM.filter,v:PHM.vig,g:PHM.grid,m:PHM.showMe}))}catch(e){}}
+const phmFrozen=()=>PHM.on&&PHM.frozen&&!NET.role;
+const phmFmt=m=>{m=((Math.round(m)%1440)+1440)%1440;return String(Math.floor(m/60)).padStart(2,'0')+':'+String(m%60).padStart(2,'0')};
+function phmClockMin(t){const L=S.dayLen||600,p=(((t%L)+L)%L)/L;return((6+p*24)%24)*60}
+
+/* ---- sounds (synth, wrapped into sfx) ---- */
+{const _phmSfx=sfx;sfx=function(type,vol,pos){if(typeof type!=='string'||type.slice(0,4)!=='phm_')return _phmSfx.apply(this,arguments);
+  if(muted||!ac())return;if(AC.state==='suspended')AC.resume();const t=AC.currentTime+.005,v=vol===undefined?1:vol;
+  if(type==='phm_shutter'){const d=bus(null,v,.12);nz(t,.03,'highpass',3400,.8,.85,.001,.028,d);tn(t,'square',260,90,.12,.001,.045,d);
+    nz(t+.062,.05,'bandpass',1900,1.6,.7,.002,.05,d);nz(t+.064,.12,'lowpass',700,.7,.22,.004,.1,d);nz(t+.13,.2,'bandpass',2600,3,.08,.03,.16,d,1400)}
+  else if(type==='phm_in'){const d=bus(null,v,.05);tn(t,'sine',520,880,.16,.01,.16,d);tn(t+.07,'sine',780,1320,.09,.01,.15,d);nz(t,.2,'bandpass',3000,1.2,.05,.03,.16,d,6000)}
+  else if(type==='phm_out'){const d=bus(null,v,.05);tn(t,'sine',900,500,.15,.01,.17,d);nz(t,.18,'bandpass',4200,1.2,.04,.02,.14,d,1600)}
+  else{const d=bus(null,v,0);tn(t,'triangle',1500,1150,.07,.002,.035,d)}}}
+
+/* ---- DOM: style, overlays (tint / vignette / grid / flash), panel, tip, toast ---- */
+function phmBuildUI(){
+  // HUD and every screen-space overlay that cannot be part of the saved PNG (game + known module overlays outside #hud)
+  const css=`body.phm-on #hud,body.phm-on #vig,body.phm-on #glare,body.phm-on #uw,body.phm-on #dmg,body.phm-on .edge,body.phm-on #sklRing,body.phm-on #sklSense,body.phm-on #evFlash,body.phm-on #evVig,body.phm-on #evToast{display:none!important}
+body.phm-on #cv{cursor:grab}body.phm-on.phm-drag #cv{cursor:grabbing}
+#phmTint,#phmVig,#phmGrid,#phmFlash{position:fixed;inset:0;pointer-events:none;display:none}
+body.phm-on #phmTint,body.phm-on #phmVig,body.phm-on #phmFlash{display:block}body.phm-on.phm-grid #phmGrid{display:block}
+#phmTint{z-index:2;opacity:0}#phmVig{z-index:3}#phmGrid{z-index:4}#phmFlash{z-index:14;background:#fff;opacity:0}
+#phmGrid i{position:absolute;background:rgba(255,255,255,.42);box-shadow:0 0 2px rgba(0,0,0,.55)}
+#phmGrid b{position:absolute;left:50%;top:50%;width:14px;height:14px;margin:-7px 0 0 -7px;border:1px solid rgba(255,255,255,.5);border-radius:50%}
+#phmPanel{position:fixed;left:16px;bottom:16px;width:322px;max-width:calc(100vw - 32px);max-height:calc(100vh - 32px);overflow:auto;z-index:12;display:none;pointer-events:auto;
+  background:var(--panel2);border-left:3px solid var(--red);box-shadow:0 10px 34px rgba(0,0,0,.5);padding:10px 12px;font-size:13px;color:var(--text)}
+body.phm-on #phmPanel{display:block;animation:phmIn .22s ease-out}
+body.phm-on.phm-hide #phmPanel,body.phm-on.phm-hide #phmTip{display:none}
+@keyframes phmIn{from{opacity:0;transform:translateY(14px)}}
+#phmPanel .hd{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px}
+#phmPanel .ttl{color:var(--red);font-weight:700;font-size:12px;letter-spacing:.2em;display:flex;align-items:center;gap:8px}
+#phmPanel .cam{width:17px;height:12px;border:2px solid currentColor;border-radius:2px;position:relative;display:inline-block}
+#phmPanel .cam:before{content:'';position:absolute;left:3.5px;top:1.5px;width:6px;height:6px;border-radius:50%;border:1.5px solid currentColor;box-sizing:border-box}
+#phmPanel .cam:after{content:'';position:absolute;left:2px;top:-5px;width:5px;height:3px;background:currentColor}
+#phmSt{font-size:10.5px;font-weight:700;letter-spacing:.12em;padding:2px 7px;background:rgba(63,135,191,.3);color:#a9cdee;white-space:nowrap}
+#phmSt.live{background:rgba(113,134,58,.32);color:#bfd884}
+#phmPanel .x{background:none;border:0;color:var(--dim);font-size:18px;line-height:1;cursor:pointer;padding:0 2px;margin-left:4px}#phmPanel .x:hover{color:#fff}
+#phmPanel .lab{color:var(--dim);font-size:10.5px;letter-spacing:.13em;text-transform:uppercase;font-weight:700}
+#phmFl{display:grid;grid-template-columns:repeat(4,1fr);gap:4px;margin:5px 0 8px}
+#phmFl button{background:var(--slot);border:2px solid transparent;color:#ddd;padding:3px 3px 3px;cursor:pointer;font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.04em;display:flex;flex-direction:column;gap:3px}
+#phmFl button:hover{background:#5b564c}#phmFl button.on{border-color:var(--red);background:rgba(205,65,43,.24);color:#fff}
+#phmFl .sw{height:20px;position:relative;overflow:hidden;display:block;background:linear-gradient(180deg,#6fa7dd 0,#b8d5ee 40%,#f2c77e 45%,#86a84a 52%,#557e2d 74%,#7a5e3c 100%)}
+#phmFl .sw b{position:absolute;inset:0;opacity:0}#phmFl .sw em{position:absolute;right:3px;top:1px;font-style:normal;font-size:9px;color:#fff;text-shadow:0 1px 2px #000}
+#phmPanel .row{display:grid;grid-template-columns:84px 1fr 44px;align-items:center;gap:8px;margin:6px 0 2px}
+#phmPanel .row b{font-size:12px;text-align:right}#phmPanel .row input{width:100%;margin:0;accent-color:var(--red);cursor:pointer}
+#phmPanel .row input:disabled{opacity:.35;cursor:not-allowed}
+#phmTimeN{font-size:10.5px;color:var(--dim);margin:0 0 4px 92px;line-height:1.3}
+#phmPanel .tg{display:grid;grid-template-columns:repeat(4,1fr);gap:4px;margin:8px 0 6px}
+#phmPanel .tg button{background:#575247;border:0;color:#eee;font-weight:700;font-size:10.5px;padding:5px 2px;cursor:pointer;text-transform:uppercase;letter-spacing:.04em;white-space:nowrap}
+#phmPanel .tg button:hover{background:#6b655a}#phmPanel .tg button.on{background:var(--blue)}#phmPanel .tg button:disabled{background:#3a3731;color:#7d776c;cursor:not-allowed}
+#phmPanel kbd,#phmTip kbd{background:rgba(227,220,207,.92);color:#111;padding:0 4px;font-family:inherit;font-size:10px;font-weight:700;margin:0 1px}
+#phmPanel .ro{display:flex;justify-content:space-between;align-items:center;gap:8px;font-size:11px;color:#cfc7b8;letter-spacing:.05em;margin:2px 0 7px}
+#phmPanel .ro i{display:block;flex:0 0 64px;height:4px;background:rgba(255,255,255,.13);position:relative}#phmPanel .ro i b{position:absolute;left:0;top:0;bottom:0;width:0;background:var(--yellow)}
+#phmPanel .ro.edge span{color:#ff9a7a}#phmPanel .ro.edge i b{background:var(--red)}
+#phmPanel .save{width:100%;background:var(--green);color:#fff;border:0;font-weight:700;font-size:14px;padding:8px;cursor:pointer;text-transform:uppercase;letter-spacing:.08em;display:flex;align-items:center;justify-content:center;gap:8px}
+#phmPanel .save:hover{background:#86a046}
+#phmPanel .keys{margin-top:8px;font-size:10.5px;line-height:1.85;color:var(--dim)}
+#phmLock{margin-top:6px;font-size:12px;font-weight:700;color:var(--yellow);text-align:center;letter-spacing:.03em}
+#phmTip{position:fixed;left:50%;top:62px;transform:translateX(-50%);width:460px;max-width:calc(100vw - 32px);z-index:12;display:none;pointer-events:none;background:var(--panel2);
+  border:1px solid rgba(205,65,43,.55);padding:9px 13px;box-shadow:0 8px 30px rgba(0,0,0,.45)}
+body.phm-on #phmTip.on{display:block;animation:phmIn .25s ease-out}
+#phmTip .k{color:var(--red);font-size:11px;letter-spacing:.2em;font-weight:700}#phmTip .t{font-weight:700;font-size:16px;margin:2px 0}#phmTip .d{font-size:13.5px;line-height:1.45;color:#d5cdbf}
+#phmMsg{position:fixed;left:50%;top:22px;transform:translateX(-50%);z-index:13;pointer-events:none;background:rgba(20,20,18,.78);padding:5px 12px;font-size:13px;font-weight:700;letter-spacing:.04em;opacity:0;transition:opacity .25s;white-space:nowrap}
+#phmMsg.on{opacity:1}
+#phmToast{position:fixed;left:50%;bottom:22px;transform:translateX(-50%);z-index:13;pointer-events:none;display:none;align-items:center;gap:10px;background:var(--panel2);border-left:3px solid var(--green);padding:7px 12px 7px 7px;box-shadow:0 10px 30px rgba(0,0,0,.5)}
+#phmToast.on{display:flex;animation:phmToast 3.6s ease forwards}#phmToast.bad{border-left-color:var(--red)}
+#phmToast img{width:104px;display:block;border:2px solid #e3dccf}#phmToast .t{font-weight:700;font-size:13px;letter-spacing:.06em;text-transform:uppercase}#phmToast .f{font-size:11.5px;color:var(--dim)}
+@keyframes phmToast{0%{opacity:0;transform:translate(-50%,12px)}7%{opacity:1;transform:translate(-50%,0)}82%{opacity:1}100%{opacity:0}}`;
+  const st=document.createElement('style');st.textContent=css;(document.head||document.body).appendChild(st);
+  const dyn=document.createElement('style');(document.head||document.body).appendChild(dyn);
+  const mk=(id,html)=>{const d=document.createElement('div');d.id=id;if(html)d.innerHTML=html;document.body.appendChild(d);return d};
+  const tint=mk('phmTint'),vig=mk('phmVig');
+  mk('phmGrid','<i style="left:33.333%;top:0;bottom:0;width:1px"></i><i style="left:66.667%;top:0;bottom:0;width:1px"></i><i style="top:33.333%;left:0;right:0;height:1px"></i><i style="top:66.667%;left:0;right:0;height:1px"></i><b></b>');
+  const flash=mk('phmFlash');
+  const fl=PHM_FILTERS.map((f,i)=>`<button data-f="${i}" title="${f.n} filter (${i+1})"><span class="sw"><b></b><em>${i+1}</em></span>${f.n}</button>`).join('');
+  const panel=mk('phmPanel',`<div class="hd"><span class="ttl"><i class="cam"></i>PHOTO MODE</span><span style="display:flex;align-items:center"><span id="phmSt">FROZEN</span><button class="x" data-a="exit" title="Leave photo mode (P / Esc)">&times;</button></span></div>
+<div class="lab">Filter</div><div id="phmFl">${fl}</div>
+<div class="row"><span class="lab">Vignette</span><input type="range" id="phmVigR" min="0" max="100" step="1" value="0"><b id="phmVigV">0%</b></div>
+<div class="row"><span class="lab">Time of day</span><input type="range" id="phmTimeR" min="0" max="1435" step="5" value="720"><b id="phmTimeV">12:00</b></div>
+<div id="phmTimeN"></div>
+<div class="tg"><button data-a="freeze" title="Freeze or run the world (F)">Freeze <kbd>F</kbd></button><button data-a="grid" title="Rule-of-thirds grid (G)">Grid <kbd>G</kbd></button><button data-a="me" title="Show or hide your character (B)">Me <kbd>B</kbd></button><button data-a="hide" title="Hide this panel (H)">Hide <kbd>H</kbd></button></div>
+<div class="ro"><span id="phmRo">FOV 75&deg;</span><i><b id="phmRng"></b></i></div>
+<button class="save" data-a="save">Save photo <kbd>Enter</kbd></button>
+<div class="keys"><kbd>WASD</kbd> fly &middot; <kbd>Shift</kbd> faster &middot; <kbd>Space</kbd>/<kbd>C</kbd> up/down &middot; <kbd>Mouse</kbd>/<kbd>Arrows</kbd> look &middot; <kbd>Q</kbd>/<kbd>E</kbd> tilt &middot; <kbd>Wheel</kbd> zoom &middot; <kbd>R</kbd> reset tilt &amp; zoom &middot; <kbd>1</kbd>-<kbd>7</kbd> filters &middot; <kbd>P</kbd>/<kbd>Esc</kbd> exit</div>
+<div id="phmLock"></div>`);
+  const tip=mk('phmTip'),toast=mk('phmToast'),msg=mk('phmMsg');
+  const q=s=>panel.querySelector(s);
+  const u=PHM.ui={dyn,tint,vig,flash,panel,tip,toast,msg,st:q('#phmSt'),fl:[...panel.querySelectorAll('[data-f]')],vigR:q('#phmVigR'),vigV:q('#phmVigV'),timeR:q('#phmTimeR'),timeV:q('#phmTimeV'),
+    timeN:q('#phmTimeN'),ro:q('#phmRo'),roBox:q('.ro'),rng:q('#phmRng'),lock:q('#phmLock'),bFreeze:q('[data-a="freeze"]'),bGrid:q('[data-a="grid"]'),bMe:q('[data-a="me"]'),bHide:q('[data-a="hide"]'),bSave:q('[data-a="save"]')};
+  // filter chips preview their own look on a tiny landscape swatch
+  u.fl.forEach((b,i)=>{const f=PHM_FILTERS[i],sw=b.querySelector('.sw'),t=b.querySelector('.sw b');if(sw&&f.css)sw.style.filter=f.css;if(t&&f.tint){t.style.background=f.tint[0];t.style.mixBlendMode=f.tint[1];t.style.opacity=f.tint[2]}});
+  panel.addEventListener('mousedown',e=>{e.stopPropagation();const t=e.target;if(!(t&&t.tagName==='INPUT'))e.preventDefault()});// keep keyboard focus off the buttons; never let a panel press reach the game's fire/secondary listener
+  panel.addEventListener('contextmenu',e=>{e.preventDefault();e.stopPropagation()});
+  panel.addEventListener('click',e=>{if(!PHM.on)return;const t=e.target&&e.target.closest?e.target.closest('[data-f],[data-a]'):null;if(!t)return;
+    const f=t.getAttribute('data-f');if(f!==null)phmSetFilter(+f);else phmAction(t.getAttribute('data-a'))});
+  u.vigR.addEventListener('input',()=>{if(!PHM.on)return;PHM.vig=clamp((+u.vigR.value||0)/100,0,1);u.vigV.textContent=Math.round(PHM.vig*100)+'%';phmApplyLook()});
+  u.vigR.addEventListener('change',()=>{phmSavePrefs();u.vigR.blur()});
+  u.timeR.addEventListener('input',()=>{if(PHM.on)phmSetTime(+u.timeR.value||0)});
+  u.timeR.addEventListener('change',()=>u.timeR.blur());
+  // the pause screen lists the key
+  try{const tb=document.querySelector('#pause table tbody')||document.querySelector('#pause table');if(tb)tb.insertAdjacentHTML('beforeend','<tr><td>P</td><td>Photo mode: free camera, filters &amp; screenshots</td></tr>')}catch(e){}
+}
+phmBuildUI();
+
+/* ---- look: CSS filter on #cv (on top of the game's own grade), tint blend, vignette, grid ---- */
+function phmCss(){const F=PHM_FILTERS[PHM.filter]||PHM_FILTERS[0];return(PHM.baseFilter+' '+F.css).trim()}
+function phmVigP(){const s=clamp(+PHM.vig||0,0,1);return{a:Math.min(.92,s),i:clamp(.55-Math.max(0,s-.5)*.5,.25,.55)}}
+function phmApplyLook(){const u=PHM.ui;if(!u)return;const css=phmCss(),F=PHM_FILTERS[PHM.filter]||PHM_FILTERS[0];
+  u.dyn.textContent=`body.phm-on #cv{filter:${css||'none'}!important}`;
+  const t=u.tint.style;if(F.tint){t.background=F.tint[0];t.mixBlendMode=F.tint[1];t.opacity=F.tint[2]}else t.opacity=0;
+  const v=phmVigP();u.vig.style.background=v.a>0?`radial-gradient(ellipse at center,rgba(0,0,0,0) ${(v.i*100).toFixed(1)}%,rgba(0,0,0,${v.a.toFixed(3)}) 100%)`:'none';
+  document.body.classList.toggle('phm-grid',!!PHM.grid);document.body.classList.toggle('phm-hide',!!PHM.hide)}
+function phmBaseFilter(){try{if(typeof getComputedStyle!=='function')return'';const f=String(getComputedStyle(cv).filter||'');return f==='none'?'':f}catch(e){return''}}
+// default vignette = the game's own DOM vignette when it is showing (post-processing draws its own inside the frame)
+function phmGameVig(){try{const v=$('#vig');if(!v||typeof getComputedStyle!=='function')return .42;const c=getComputedStyle(v);return c.display!=='none'&&c.visibility!=='hidden'&&+c.opacity>0?.42:0}catch(e){return .42}}
+
+/* ---- UI state ---- */
+function phmSync(){const u=PHM.ui;if(!u)return;const mp=!!NET.role,fr=phmFrozen();
+  u.st.textContent=mp?'LIVE (MULTIPLAYER)':fr?'FROZEN':'LIVE';u.st.classList.toggle('live',!fr);
+  u.fl.forEach((b,i)=>b.classList.toggle('on',i===PHM.filter));
+  const vp=Math.round(clamp(+PHM.vig||0,0,1)*100);u.vigR.value=String(vp);u.vigV.textContent=vp+'%';
+  u.timeR.disabled=!fr;u.timeN.textContent=mp?'Multiplayer keeps the world running: time follows the server.':fr?'Preview only: the real clock comes back when you leave.':'Freeze the world (F) to change the time.';
+  u.bFreeze.disabled=mp;u.bFreeze.innerHTML=mp?'Live':'Freeze <kbd>F</kbd>';u.bFreeze.classList.toggle('on',fr);
+  u.bGrid.classList.toggle('on',!!PHM.grid);u.bMe.classList.toggle('on',!!PHM.showMe);u.bHide.classList.toggle('on',!!PHM.hide);
+  phmLockHint(true);phmTimeUI(true)}
+function phmLockHint(force){const u=PHM.ui;if(!u)return;const s=locked?1:noLock?2:3;if(!force&&s===PHM.lockSt)return;PHM.lockSt=s;
+  u.lock.innerHTML=s===1?'Press <kbd>Tab</kbd> to use the panel':s===2?'Drag on the view to look around':'Click the view (or press <kbd>Tab</kbd>) to look with the mouse'}
+function phmTimeUI(force){const u=PHM.ui;if(!u||!S)return;const fr=phmFrozen(),m=fr&&PHM.timeMin>=0?PHM.timeMin:phmClockMin(S.time),txt=phmFmt(m);
+  if(force||u.timeV.textContent!==txt){u.timeV.textContent=txt;if(force||!fr)u.timeR.value=String(Math.round(m/5)*5%1440)}}
+function phmTickUI(dt){const u=PHM.ui;if(!u)return;PHM.uiT-=dt;if(PHM.uiT>0)return;PHM.uiT=.1;
+  const d=Math.hypot(PHM.pos.x-P.x,PHM.pos.y-(P.y+(P.eye||1.62)),PHM.pos.z-P.z),tilt=Math.round(-PHM.roll*57.2958);
+  const s=`FOV ${Math.round(PHM.fov)}° · TILT ${tilt}° · ${d.toFixed(1)} / ${PHM_RANGE} m`;if(u.ro.textContent!==s)u.ro.textContent=s;
+  u.rng.style.width=Math.min(100,d/PHM_RANGE*100).toFixed(1)+'%';u.roBox.classList.toggle('edge',!!PHM.edge);
+  phmLockHint();phmTimeUI()}
+function phmMsg(t){const u=PHM.ui;if(!u)return;u.msg.textContent=t;u.msg.classList.add('on');clearTimeout(PHM.msgTimer);PHM.msgTimer=setTimeout(()=>u.msg.classList.remove('on'),1500)}
+function phmShowTip(){const u=PHM.ui;if(!u)return;const mp=!!NET.role;
+  u.tip.innerHTML=`<div class="k">HINT</div><div class="t">Photo mode</div><div class="d">${mp?'In multiplayer the world <b>keeps running</b>, so find a safe spot first.':'The world is <b>frozen</b> while you frame your shot (<kbd>F</kbd> lets it run).'} Fly with <kbd>WASD</kbd>, <kbd>Space</kbd>/<kbd>C</kbd> and <kbd>Shift</kbd>, look with the mouse, tilt with <kbd>Q</kbd>/<kbd>E</kbd> and zoom with the wheel. <kbd>Enter</kbd> saves a PNG; <kbd>P</kbd> or <kbd>Esc</kbd> brings you back.</div>`;
+  u.tip.classList.add('on');clearTimeout(PHM.tipTimer);PHM.tipTimer=setTimeout(()=>u.tip.classList.remove('on'),14000)}
+
+/* ---- actions ---- */
+function phmSetFilter(i){if(!(i>=0&&i<PHM_FILTERS.length))return;PHM.filter=i|0;phmApplyLook();phmSavePrefs();phmSync();sfx('phm_tick',.4);if(PHM.hide)phmMsg('Filter: '+PHM_FILTERS[PHM.filter].n)}
+function phmAction(a){
+  if(a==='exit'){phmExit('p');return}
+  if(a==='save'){phmShoot();return}
+  if(a==='freeze')phmToggleFreeze();
+  else if(a==='grid'){PHM.grid=!PHM.grid;phmApplyLook();phmSavePrefs();if(PHM.hide)phmMsg(PHM.grid?'Grid on':'Grid off')}
+  else if(a==='me'){PHM.showMe=!PHM.showMe;phmSavePrefs();phmMsg(PHM.showMe?'Your character is in the shot':'Your character is hidden')}
+  else if(a==='hide'){PHM.hide=!PHM.hide;phmApplyLook();if(PHM.hide)phmMsg('Panel hidden · H brings it back')}
+  else if(a==='reset'){PHM.rollT=0;PHM.fovT=PHM.fov0;phmMsg('Tilt and zoom reset')}
+  else return;
+  sfx('phm_tick',.4);phmSync()}
+function phmSaveTime(){PHM.t0=S.time;PHM.dayF0=S.dayF;PHM.light0=S.light;PHM.tSaved=true;PHM.timeMin=-1}
+function phmRestoreTime(){if(PHM.tSaved&&S&&PHM.S===S){S.time=PHM.t0;S.dayF=PHM.dayF0;S.light=PHM.light0}PHM.tSaved=false;PHM.timeMin=-1}
+function phmToggleFreeze(){if(NET.role){phmMsg('Multiplayer games can\'t be frozen');return}
+  if(PHM.frozen){phmRestoreTime();PHM.frozen=false;phmMsg('World running: you can still get hurt')}else{phmSaveTime();PHM.frozen=true;phmMsg('World frozen')}}
+// time-of-day preview: only while frozen in a solo game; S.time is restored on unfreeze / exit
+function phmSetTime(min){if(!phmFrozen()||!PHM.tSaved)return;min=clamp(min,0,1439);PHM.timeMin=min;const L=S.dayLen||600;
+  let t=PHM.t0+(min-phmClockMin(PHM.t0))/1440*L;if(t<0)t+=L;S.time=t;if(PHM.ui)PHM.ui.timeV.textContent=phmFmt(min)}
+
+/* ---- enter / exit ---- */
+function phmCanEnter(){return!!(S&&P&&P.alive&&S.active&&inGame()&&!anyOpen())}
+function phmEnter(){if(PHM.on||!phmCanEnter())return;
+  if(mouseL||P.drawing){feedMsg('Let go of the mouse button to open photo mode');return}
+  PHM.baseFilter=phmBaseFilter();if(!(PHM.vig>=0))PHM.vig=phmGameVig();
+  PHM.on=true;PHM.S=S;PHM.lastNow=performance.now();PHM.hide=false;PHM.shot=0;PHM.uiT=0;PHM.lockSt=0;PHM.edge=false;PHM.unlockT=0;
+  for(const k in keys)keys[k]=false;for(const k in PHM.keys)PHM.keys[k]=false;mouseL=false;mouseR=false;PHM.drag=false;
+  camera.updateMatrixWorld();PHM.pos.copy(camera.position);PHM.vel.set(0,0,0);
+  // start exactly on the current view (any lean/sway tilt settles back to level)
+  PHM.yaw=+camera.rotation.y||0;PHM.pitch=clamp(+camera.rotation.x||0,-1.55,1.55);PHM.roll=clamp(+camera.rotation.z||0,-1.2,1.2);PHM.rollT=0;PHM.fov0=PHM.fov=PHM.fovT=clamp(+camera.fov||75,15,110);
+  PHM.frozen=!NET.role;if(PHM.frozen)phmSaveTime();
+  const b=PHM.showMe?phmBody():null;if(b&&b.m){b.phase=(+P.bob||0)*1.15;b.cr=P.crouch?1:0;b.air=!P.onGround&&!P.swim?1:0}
+  phmHooksOn();document.body.classList.add('phm-on');updateCursorMode();phmApplyLook();phmSync();sfx('phm_in',.45);
+  if(!S.shown.photo){S.shown.photo=1;phmShowTip()}}
+// why: 'p' / 'esc' (player), 'lock' (pointer lock lost), 'hurt', 'death', 'auto' (overlay, menu, new game...)
+function phmExit(why){if(!PHM.on)return;
+  if(PHM.sv.saved)phmRestore();
+  PHM.on=false;PHM.shot=0;
+  if(PHM.frozen)phmRestoreTime();PHM.frozen=false;phmHooksOff();
+  for(const k in PHM.keys)PHM.keys[k]=false;PHM.drag=false;for(const k in keys)keys[k]=false;mouseL=false;mouseR=false;
+  document.body.classList.remove('phm-on');document.body.classList.remove('phm-drag');
+  if(PHM.ui){PHM.ui.tip.classList.remove('on');PHM.ui.msg.classList.remove('on')}
+  const ae=document.activeElement;if(phmIsMine(ae)&&ae.blur)ae.blur();// a focused slider would swallow the game's keys
+  if(PHM.body)PHM.body.g.visible=false;
+  updateCursorMode();sfx('phm_out',.4);
+  // the camera was not mouse-locked (Tab released it): ask for the lock again from P (a user gesture), pause on Esc / damage
+  if((why==='p'||why==='esc'||why==='hurt')&&S&&S.active&&P&&P.alive&&inGame()&&!anyOpen()&&!noLock&&!locked){if(why==='p')resume();else pause()}}// same as the core on lock loss: a click on the pause screen re-locks (unlocked+active would fire on click without a lock)
+
+/* ---- hook order: phmPre right before the post-processing hook (so sun rays/glare follow the photo camera while
+   every gameplay render hook still sees the player's camera), phmPost last; 'hud' restore first ---- */
+function phmHooksOn(){phmHooksOff();const R=HOOKS.render||(HOOKS.render=[]);
+  const gi=typeof gfxFrame==='function'?R.indexOf(gfxFrame):-1;
+  if(gi>=0){PHM.gfxIdx=gi;R.splice(gi,1);R.push(phmPre,gfxFrame,phmPost)}else R.push(phmPre,phmPost);
+  const H=HOOKS.hud||(HOOKS.hud=[]);const i=H.indexOf(phmHud);if(i>=0){PHM.hudIdx=i;H.splice(i,1)}H.unshift(phmHud)}
+function phmHooksOff(){const R=HOOKS.render;if(!R)return;for(const f of[phmPre,phmPost]){const i=R.indexOf(f);if(i>=0)R.splice(i,1)}
+  if(PHM.gfxIdx>=0&&typeof gfxFrame==='function'){const i=R.indexOf(gfxFrame);if(i>=0){R.splice(i,1);R.splice(Math.min(PHM.gfxIdx,R.length),0,gfxFrame)}}PHM.gfxIdx=-1;
+  const H=HOOKS.hud;if(H&&PHM.hudIdx>=0){const j=H.indexOf(phmHud);if(j>=0){H.splice(j,1);H.splice(Math.min(PHM.hudIdx,H.length),0,phmHud)}}PHM.hudIdx=-1}
+onHook('hud',phmHud);
+
+/* ---- camera borrow ---- */
+function phmSetCam(){const cam=camera;cam.position.copy(PHM.pos);cam.rotation.set(PHM.pitch,PHM.yaw,PHM.roll,'YXZ');
+  if(cam.fov!==PHM.fov){cam.fov=PHM.fov;cam.updateProjectionMatrix()}cam.updateMatrixWorld();
+  sky.position.copy(cam.position);stars.position.copy(cam.position);moonMesh.position.copy(cam.position).addScaledVector(PHM.moonDir,900)}
+function phmPre(){if(!PHM.on||PHM.sv.saved)return;const cam=camera,sv=PHM.sv;
+  cam.updateMatrixWorld();PHM.mp.copy(cam.matrixWorld);sv.pos.copy(cam.position);sv.quat.copy(cam.quaternion);sv.fov=cam.fov;sv.under=cam.position.y<-.02;sv.saved=true;
+  phmSetCam();
+  // the player's head is under water but the photo camera is not: undo the underwater fog the core applied
+  if(sv.under&&PHM.pos.y>=-.02&&PHM.fogOK&&scene.fog){scene.fog.near=PHM.fogN;scene.fog.far=PHM.fogF;scene.fog.color.copy(PHM.fogC)}}
+function phmPost(dt){if(!PHM.on||!PHM.sv.saved)return;const cam=camera;
+  phmSetCam();PHM.mi.copy(cam.matrixWorld).invert();
+  // first-person attachments: hide everything drawn, keep camera-held lights (and spot targets) where the player's view is
+  PHM.tgts.length=0;const ch=cam.children;// (compN is only reset by phmRestore: a repeated pass must not re-record moved lights)
+  for(let i=0;i<ch.length;i++){if(phmScan(ch[i]))phmComp(ch[i])}
+  for(let i=0;i<PHM.tgts.length;i++)phmComp(PHM.tgts[i]);
+  if(typeof ghost!=='undefined'&&ghost&&ghost.visible){ghost.visible=false;PHM.hid.push(ghost)}
+  // driving in first person hides your seated rider model: show it for the shot (vehicles module)
+  const vh=P.vehicle,rd=vh&&vh.rider;if(PHM.showMe&&rd&&rd.isObject3D&&!rd.visible&&!vh.dead){rd.visible=true;PHM.shown.push(rd)}
+  phmGfxClean(true);phmBodyFrame(+dt||0)}
+function phmScan(o){let L=!!o.isLight;
+  if(L&&o.target&&o.target.parent){let t=o.target;while(t.parent&&t.parent!==camera)t=t.parent;if(t.parent===camera&&PHM.tgts.indexOf(t)<0)PHM.tgts.push(t)}
+  if((o.isMesh||o.isSprite||o.isPoints||o.isLine)&&o.visible){o.visible=false;PHM.hid.push(o)}
+  const c=o.children;if(c)for(let i=0;i<c.length;i++)if(phmScan(c[i]))L=true;return L}
+function phmComp(o){for(let i=0;i<PHM.compN;i++)if(PHM.comp[i].o===o)return;
+  let r=PHM.comp[PHM.compN];if(!r)r=PHM.comp[PHM.compN]={o:null,p:new V3(),q:new THREE.Quaternion()};PHM.compN++;
+  r.o=o;r.p.copy(o.position);r.q.copy(o.quaternion);
+  PHM.tm.multiplyMatrices(PHM.mp,o.matrix).premultiply(PHM.mi).decompose(o.position,o.quaternion,PHM.tS)}
+function phmRestore(){const sv=PHM.sv;if(!sv.saved)return;sv.saved=false;
+  for(let i=0;i<PHM.hid.length;i++)PHM.hid[i].visible=true;PHM.hid.length=0;
+  for(let i=0;i<PHM.shown.length;i++)PHM.shown[i].visible=false;PHM.shown.length=0;
+  for(let i=0;i<PHM.compN;i++){const r=PHM.comp[i];r.o.position.copy(r.p);r.o.quaternion.copy(r.q);r.o=null}PHM.compN=0;
+  const cam=camera;cam.position.copy(sv.pos);cam.quaternion.copy(sv.quat);if(cam.fov!==sv.fov){cam.fov=sv.fov;cam.updateProjectionMatrix()}cam.updateMatrixWorld();
+  phmGfxClean(false);if(PHM.body)PHM.body.g.visible=false}
+// post-processing (gfx module) adds low-health / chase pulses to the frame: keep them out of photos
+function phmGfxClean(on){try{if(typeof GFX==='undefined'||!GFX||!GFX.U||!GFX.U.co)return;const U=GFX.U.co;if(!U.uLowHP||!U.uPulse||!U.uChase)return;
+  if(on){PHM.gfxSave=[U.uLowHP.value,U.uPulse.value,U.uChase.value];U.uLowHP.value=0;U.uPulse.value=0;U.uChase.value=0}
+  else if(PHM.gfxSave){U.uLowHP.value=PHM.gfxSave[0];U.uPulse.value=PHM.gfxSave[1];U.uChase.value=PHM.gfxSave[2];PHM.gfxSave=null}}catch(e){PHM.gfxSave=null}}
+function phmHud(){if(PHM.sv.saved){if(PHM.shot)phmCapture();phmRestore()}else if(!PHM.on)phmDiscover()}
+
+/* ---- your own character in the shot (the game is first person, so build a body like the one friends see) ---- */
+function phmBody(){const key=String(NET.myId||NET.name||'me');
+  if(PHM.body&&PHM.body.key!==key&&!PHM.body.g.visible){scene.remove(PHM.body.g);PHM.body=null}// new session id: new palette
+  if(PHM.body!==null)return PHM.body;PHM.body=false;
+  try{let b=null;
+    if(typeof makeRig==='function'&&typeof animateRig==='function'){
+      // same per-player palette the animation module gives your avatar on friends' screens (FNV-1a of your peer id)
+      let h=2166136261;const id=key;for(let i=0;i<id.length;i++){h^=id.charCodeAt(i);h=Math.imul(h,16777619)}h>>>=0;
+      const SH=['#4d6a8a','#7a4a3a','#5d6b3f','#8a7a5a','#3f5f5a','#6b4f6f','#9a6a3a'],PA=['#3e4a5a','#4a3f33','#3d3d3d','#5a5040'],HT=[null,'#a33d2d','#2d4d6a',null,'#5a5a3a'];
+      const r=makeRig({shirt:SH[h%SH.length],pants:PA[(h>>4)%PA.length],hat:HT[(h>>8)%HT.length],hair:['#3a2a1c','#6a4a2a','#1a1612','#8a6a3a'][(h>>12)&3],backpack:true});
+      if(r&&r.g&&r.handR){const hand=new THREE.Group();r.handR.add(hand);b={rig:r,g:r.g,hand,s:{}}}}
+    if(!b){const m=makeHuman('spear');const hand=new THREE.Group();
+      if(m.rig&&m.rig.handR&&typeof animateRig==='function'){if(m.weapon&&m.weapon.parent)m.weapon.parent.remove(m.weapon);m.rig.handR.add(hand);b={rig:m.rig,g:m.g,hand,s:{}}}// rig-based human
+      else{if(m.aR&&m.aR.children.length)m.aR.remove(m.aR.children[m.aR.children.length-1]);hand.position.set(0,-.62,0);m.aR.add(hand);b={m,g:m.g,hand}}}// core human: drop the spear
+    b.key=key;b.phase=0;b.cr=0;b.air=0;b.item=undefined;b.itemObj=null;b.g.visible=false;scene.add(b.g);PHM.body=b}catch(e){console.warn('[photo] body',e)}
+  return PHM.body}
+function phmHeld(id){let g=PHM.held[id];if(g)return g;
+  try{if(id==='torch'){g=new THREE.Group();g.add(box(.04,.04,.45,M('#7a5a35'),0,0,-.2));const f=flameSprite(.3);f.position.set(0,0,-.45);g.add(f)}else g=heldMesh(id);
+    const L=[];g.traverse(o=>{if(o.isLight)L.push(o)});for(const o of L)if(o.parent)o.parent.remove(o);// never add lights after start
+    shadowAll(g)}catch(e){g=new THREE.Group()}
+  return PHM.held[id]=g}
+function phmBodyFrame(dt){if(!PHM.showMe)return;const b=phmBody();if(!b)return;
+  if((typeof isDriving==='function'&&isDriving())||P.vehicle)return;
+  const dx=PHM.pos.x-P.x,dy=PHM.pos.y-(P.y+1.5),dz=PHM.pos.z-P.z;if(dx*dx+dy*dy+dz*dz<.7)return;// camera is inside the head
+  b.g.visible=true;try{phmPose(b,dt)}catch(e){b.g.visible=false;console.warn('[photo] pose',e);PHM.showMe=false}}
+function phmPose(b,dt){const g=b.g,spd=Math.hypot(+P.vx||0,+P.vz||0),id=P.alive?P.hot[P.sel]||null:null;
+  if(b.hand&&b.item!==id){if(b.itemObj)b.hand.remove(b.itemObj);b.itemObj=id?phmHeld(id):null;if(b.itemObj)b.hand.add(b.itemObj);b.item=id}
+  g.position.set(P.x,P.y,P.z);
+  if(b.rig){g.rotation.set(0,P.yaw,0);const s=b.s,it=id&&ITEMS[id];
+    s.speed=spd;s.run=undefined;s.crouch=P.crouch?1:0;s.swim=!!P.swim;s.lookPitch=(+P.pitch||0)*.8;s.lookYaw=0;s.lean=0;s.idle=spd<.2;s.attack=0;s.attackStyle='swing';s.recoil=0;
+    s.aim=0;s.aimL=0;s.twoHand=false;s.carry=0;s.wristR=0;s.draw=0;s.dead=0;s.deadDir=1;s.armsForward=P.onZip||P.gliding?1:0;
+    if(it){if(id==='bow'){if((P.draw||0)>.02){s.aim=1;s.draw=P.draw}}else if(it.ranged){s.aim=.35;s.twoHand=id==='crossbow'}else if(id==='spear'){s.carry=1;s.wristR=.15;s.twoHand=true}
+      else if(it.melee||id==='torch'){s.carry=.8;s.wristR=.9}else{s.carry=.6;s.wristR=.5}}
+    animateRig(b.rig,s,dt);return}
+  const m=b.m,k=Math.min(1,spd/2.5),kk=Math.min(1,dt*10),hang=!!(P.onZip||P.gliding);g.rotation.y=P.yaw;
+  b.phase+=dt*spd*1.9;b.cr=lerp(b.cr,P.crouch?1:0,kk);b.air=lerp(b.air,!P.onGround&&!P.swim&&!hang?1:0,kk);
+  const sw=Math.sin(b.phase)*.75*k*(1-b.air),cr=b.cr,air=b.air;
+  m.lL.position.y=m.lR.position.y=.92-.22*cr;m.lL.rotation.x=sw-.7*cr-.45*air;m.lR.rotation.x=-sw+.7*cr+.3*air;
+  m.torso.position.y=.92-.22*cr+Math.abs(Math.cos(b.phase))*.05*k;m.torso.rotation.x=-.12*Math.min(1,spd/6)-.22*cr;
+  m.aR.rotation.x=hang?2.9:id?.45+sw*.2:sw*.7;m.aL.rotation.x=hang?2.9:-sw*.7+.4*air;m.head.rotation.x=clamp((+P.pitch||0)*.7,-.6,.6)}
+
+/* ---- free camera ---- */
+function phmLook(dx,dy){const s=SENS*clamp(PHM.fov/75,.25,1.4);PHM.yaw-=(+dx||0)*s;PHM.pitch=clamp(PHM.pitch-(+dy||0)*s,-1.55,1.55)}
+function phmFly(dt){const K=PHM.keys,zf=clamp(PHM.fov/75,.25,1.4),e=1-Math.exp(-dt*10);
+  PHM.yaw+=((K.arrowleft?1:0)-(K.arrowright?1:0))*1.8*dt*zf;PHM.pitch=clamp(PHM.pitch+((K.arrowup?1:0)-(K.arrowdown?1:0))*1.3*dt*zf,-1.55,1.55);
+  PHM.rollT=clamp(PHM.rollT+((K.q?1:0)-(K.e?1:0))*1.1*dt,-1.2,1.2);PHM.roll+=(PHM.rollT-PHM.roll)*e;PHM.fov+=(PHM.fovT-PHM.fov)*e;
+  const fw=(K.w?1:0)-(K.s?1:0),st=(K.d?1:0)-(K.a?1:0),up=(K[' ']?1:0)-(K.c?1:0),sp=K.shift?13:4.5;
+  const cy=Math.cos(PHM.yaw),sy=Math.sin(PHM.yaw),cp=Math.cos(PHM.pitch),spp=Math.sin(PHM.pitch);
+  let tx=-sy*cp*fw+cy*st,ty=spp*fw+up,tz=-cy*cp*fw-sy*st;const l=Math.hypot(tx,ty,tz);if(l>1){tx/=l;ty/=l;tz/=l}
+  const k=1-Math.exp(-dt*7),v=PHM.vel,p=PHM.pos;v.x+=(tx*sp-v.x)*k;v.y+=(ty*sp-v.y)*k;v.z+=(tz*sp-v.z)*k;
+  p.x+=v.x*dt;p.y+=v.y*dt;p.z+=v.z*dt;
+  // stay within range of the player's head, above the ground and the water, inside the map
+  const hx=P.x,hy=P.y+(P.eye||1.62),hz=P.z,ox=p.x-hx,oy=p.y-hy,oz=p.z-hz,d=Math.hypot(ox,oy,oz);PHM.edge=d>PHM_RANGE-.05;
+  if(d>PHM_RANGE){const s=PHM_RANGE/d;p.x=hx+ox*s;p.y=hy+oy*s;p.z=hz+oz*s;const vn=(v.x*ox+v.y*oy+v.z*oz)/d;if(vn>0){v.x-=ox/d*vn;v.y-=oy/d*vn;v.z-=oz/d*vn}}
+  p.x=clamp(p.x,1,WS-1);p.z=clamp(p.z,1,WS-1);const minY=Math.max(groundH(p.x,p.z)+.3,.15);if(p.y<minY){p.y=minY;if(v.y<0)v.y=0}
+  if(!isFinite(p.x+p.y+p.z)){p.set(hx,hy,hz);v.set(0,0,0)}}
+
+/* ---- capture: compose exactly what is on screen (canvas + CSS filter + tint + vignette) and download a PNG ---- */
+// Runs inside the key / click handler: render(0) draws one frame and the first 'hud' hook (right after the draw call, same
+// task, so the drawing buffer is still valid with preserveDrawingBuffer=false) reads it back with toDataURL.
+function phmShoot(){if(!PHM.on||PHM.shot)return;if(PHM.sv.saved)phmRestore();PHM.shot=1;
+  try{render(0)}catch(e){console.warn('[photo] render',e)}
+  if(PHM.shot){PHM.shot=0;if(PHM.sv.saved)phmRestore();phmToast('Couldn\'t save the photo','The frame could not be drawn',null,true)}}
+function phmCapture(){PHM.shot=0;const u=PHM.ui;
+  let url='',thumb='';const name='rust-survival-'+phmStamp()+'.png';
+  try{const c=phmCompose(cv);if(c){url=c.toDataURL('image/png');const t=document.createElement('canvas');t.width=208;t.height=Math.max(1,Math.round(208*c.height/c.width));
+    const g=t.getContext('2d');if(g){g.drawImage(c,0,0,t.width,t.height);thumb=t.toDataURL('image/jpeg',.82)}}}catch(e){console.warn('[photo] capture',e)}
+  if(typeof url!=='string'||url.length<64){phmToast('Couldn\'t save the photo','Your browser blocked reading the picture',null,true);return}
+  phmDownload(url,name);sfx('phm_shutter',.7);
+  if(u){const f=u.flash;if(f.animate)f.animate([{opacity:.85},{opacity:0}],{duration:460,easing:'ease-out'})}
+  phmToast('Photo saved',name,thumb,false)}
+function phmStamp(){const d=new Date(),z=n=>String(n).padStart(2,'0');return`${d.getFullYear()}${z(d.getMonth()+1)}${z(d.getDate())}-${z(d.getHours())}${z(d.getMinutes())}${z(d.getSeconds())}`}
+function phmCompose(src){const w=+src.width|0,h=+src.height|0;if(!(w>0&&h>0))return null;
+  const c=document.createElement('canvas');c.width=w;c.height=h;const g=c.getContext('2d');if(!g)return null;
+  const css=phmCss(),F=PHM_FILTERS[PHM.filter]||PHM_FILTERS[0];
+  if(css&&typeof g.filter==='string'){g.filter=css;g.drawImage(src,0,0);g.filter='none'}else{g.drawImage(src,0,0);if(css)phmPixels(g,w,h,phmMatrix(css))}
+  if(F.tint){g.globalCompositeOperation=F.tint[1];g.globalAlpha=F.tint[2];g.fillStyle=F.tint[0];g.fillRect(0,0,w,h);g.globalCompositeOperation='source-over';g.globalAlpha=1}
+  const v=phmVigP();if(v.a>0){g.save();g.translate(w/2,h/2);g.scale(1,h/w);const gr=g.createRadialGradient(0,0,0,0,0,w/Math.SQRT2);// CSS "ellipse farthest-corner"
+    gr.addColorStop(v.i,'rgba(0,0,0,0)');gr.addColorStop(1,`rgba(0,0,0,${v.a.toFixed(3)})`);g.fillStyle=gr;g.fillRect(-w/2,-w/2,w,w);g.restore()}
+  return c}
+// fallback for browsers without CanvasRenderingContext2D.filter: the CSS filter list as one affine colour matrix (sRGB)
+function phmMatrix(css){let M=[1,0,0,0,0,1,0,0,0,0,1,0];const re=/([a-z-]+)\(([^)]*)\)/g;let m;
+  while((m=re.exec(css))){const f=m[1];let v=parseFloat(m[2]);if(!isFinite(v))continue;if(m[2].indexOf('%')>=0)v/=100;let A=null;
+    if(f==='brightness')A=[v,0,0,0,0,v,0,0,0,0,v,0];
+    else if(f==='contrast'){const o=.5-.5*v;A=[v,0,0,o,0,v,0,o,0,0,v,o]}
+    else if(f==='saturate')A=[.213+.787*v,.715-.715*v,.072-.072*v,0,.213-.213*v,.715+.285*v,.072-.072*v,0,.213-.213*v,.715-.715*v,.072+.928*v,0];
+    else if(f==='grayscale'){const s=1-Math.min(1,v);A=[.2126+.7874*s,.7152-.7152*s,.0722-.0722*s,0,.2126-.2126*s,.7152+.2848*s,.0722-.0722*s,0,.2126-.2126*s,.7152-.7152*s,.0722+.9278*s,0]}
+    else if(f==='sepia'){const s=1-Math.min(1,v);A=[.393+.607*s,.769-.769*s,.189-.189*s,0,.349-.349*s,.686+.314*s,.168-.168*s,0,.272-.272*s,.534-.534*s,.131+.869*s,0]}
+    else if(f==='hue-rotate'){const a=(m[2].indexOf('rad')>=0?v:v*Math.PI/180),c=Math.cos(a),s=Math.sin(a);
+      A=[.213+.787*c-.213*s,.715-.715*c-.715*s,.072-.072*c+.928*s,0,.213-.213*c+.143*s,.715+.285*c+.140*s,.072-.072*c-.283*s,0,.213-.213*c-.787*s,.715-.715*c+.715*s,.072+.928*c+.072*s,0]}
+    else if(f==='invert'){const s=Math.min(1,v);A=[1-2*s,0,0,s,0,1-2*s,0,s,0,0,1-2*s,s]}
+    if(!A)continue;const N=new Array(12);
+    for(let r=0;r<3;r++){for(let c=0;c<3;c++)N[r*4+c]=A[r*4]*M[c]+A[r*4+1]*M[4+c]+A[r*4+2]*M[8+c];N[r*4+3]=A[r*4]*M[3]+A[r*4+1]*M[7]+A[r*4+2]*M[11]+A[r*4+3]}M=N}
+  return M}
+function phmPixels(g,w,h,M){const img=g.getImageData(0,0,w,h),d=img.data,o0=M[3]*255,o1=M[7]*255,o2=M[11]*255;
+  for(let i=0;i<d.length;i+=4){const r=d[i],gg=d[i+1],b=d[i+2];d[i]=M[0]*r+M[1]*gg+M[2]*b+o0;d[i+1]=M[4]*r+M[5]*gg+M[6]*b+o1;d[i+2]=M[8]*r+M[9]*gg+M[10]*b+o2}
+  g.putImageData(img,0,0)}
+function phmDownload(url,name){let href=url,obj=null;
+  try{if(typeof Blob==='function'&&typeof URL!=='undefined'&&URL.createObjectURL&&typeof atob==='function'){const bin=atob(url.slice(url.indexOf(',')+1)),n=bin.length,a=new Uint8Array(n);
+    for(let i=0;i<n;i++)a[i]=bin.charCodeAt(i);obj=href=URL.createObjectURL(new Blob([a],{type:'image/png'}))}}catch(e){href=url;obj=null}
+  try{const a=document.createElement('a');a.href=href;a.download=name;a.style.display='none';document.body.appendChild(a);a.click();
+    setTimeout(()=>{try{a.remove();if(obj)URL.revokeObjectURL(obj)}catch(e){}},5000)}catch(e){console.warn('[photo] download',e)}}
+function phmToast(title,sub,thumb,bad){const u=PHM.ui;if(!u)return;const el=u.toast;
+  el.innerHTML=(thumb?`<img src="${thumb}" alt="">`:'')+`<div><div class="t">${title}</div><div class="f">${sub||''}</div></div>`;
+  el.classList.toggle('bad',!!bad);el.classList.remove('on');void el.offsetWidth;el.classList.add('on')}
+
+/* ---- wrapped core functions ---- */
+{const _phmFrame=frame;frame=function(now,hidden){
+  if(PHM.on){try{
+      if(PHM.sv.saved)phmRestore();// a previous frame threw between its draw hooks: put the camera back first
+      if(!phmCanStay())phmExit('auto');
+      else{if(PHM.frozen&&NET.role){phmRestoreTime();PHM.frozen=false;phmSync()}
+        const dt=Math.min(.1,Math.max(0,(now-PHM.lastNow)/1000));PHM.lastNow=now;
+        mouseL=false;mouseR=false;// safety net: nothing fires while the photo camera is out
+        if(!hidden){phmFly(dt);phmTickUI(dt)}
+        if(phmFrozen()){last=now;if(!hidden)render(0);return}}// frozen: nothing simulates, only the picture is drawn
+    }catch(err){console.error('[photo] frame',err);try{phmExit('auto')}catch(e2){PHM.on=false}}}
+  return _phmFrame.apply(this,arguments)}}
+function phmCanStay(){return S===PHM.S&&phmCanEnter()}
+{const _phmLook=look;look=function(dx,dy){if(PHM.on){phmLook(dx,dy);return}return _phmLook.apply(this,arguments)}}
+{const _phmFree=freeCursor;freeCursor=function(){return PHM.on?false:_phmFree.apply(this,arguments)}}
+// losing the pointer lock while in photo mode: Tab released it on purpose (keep going), otherwise (Esc, alt-tab) leave and pause
+{const _phmPause=pause;pause=function(){if(PHM.on){if(PHM.unlockT&&performance.now()-PHM.unlockT<1500){PHM.unlockT=0;updateCursorMode();phmLockHint(true);return}phmExit('lock')}
+  return _phmPause.apply(this,arguments)}}
+{const _phmSFX=updateScreenFX;updateScreenFX=function(){if(PHM.on&&scene.fog){PHM.fogN=scene.fog.near;PHM.fogF=scene.fog.far;PHM.fogC.copy(scene.fog.color);PHM.fogOK=true}return _phmSFX.apply(this,arguments)}}
+onHook('death',()=>{if(PHM.on)phmExit('death')});
+onHook('newGame',()=>{if(PHM.on)phmExit('auto')});
+onHook('hurt',(dmg,cause)=>{if(PHM.on&&dmg>0&&!/^(starve|cold|rad|poison|bleed|drown)$/.test(String(cause))){phmExit('hurt');feedMsg('Photo mode closed: you are under attack')}});
+
+/* ---- input (capture phase on window, so photo mode sees keys / clicks / wheel before the game and other modules) ---- */
+const PHM_PREVENT=new Set(['tab',' ','arrowup','arrowdown','arrowleft','arrowright','enter','escape']);
+function phmIsMine(t){const u=PHM.ui;return!!(u&&t&&t.nodeType===1&&u.panel.contains(t))}
+function phmKeyDown(e){const t=e.target,tag=t&&t.tagName,mine=phmIsMine(t);
+  if((tag==='INPUT'||tag==='TEXTAREA'||tag==='SELECT'||(t&&t.isContentEditable))&&!mine)return;// chat, name fields...
+  const k=(e.key||'').toLowerCase();
+  if(!PHM.on){if(k==='p'&&!e.repeat&&!e.ctrlKey&&!e.metaKey&&!e.altKey&&inGame()&&!anyOpen()&&S&&S.active){e.preventDefault();e.stopImmediatePropagation();phmEnter()}return}
+  e.stopImmediatePropagation();// nothing in the game reacts to keys while the photo camera is out
+  if(mine&&document.activeElement&&document.activeElement.blur)document.activeElement.blur();
+  if(e.ctrlKey||e.metaKey||e.altKey)return;
+  if(PHM_PREVENT.has(k))e.preventDefault();
+  if(k>='1'&&k<='7'&&k.length===1){if(!e.repeat)phmSetFilter(+k-1);return}
+  switch(k){
+    case'p':if(!e.repeat)phmExit('p');return;
+    case'escape':phmExit('esc');return;
+    case'tab':if(e.repeat)return;if(locked)phmUnlock();else if(!noLock)phmLock();else phmMsg('Drag on the view to look around');return;
+    case'enter':if(!e.repeat)phmShoot();return;
+    case'f':if(!e.repeat)phmAction('freeze');return;
+    case'g':if(!e.repeat)phmAction('grid');return;
+    case'b':if(!e.repeat)phmAction('me');return;
+    case'h':if(!e.repeat)phmAction('hide');return;
+    case'r':if(!e.repeat)phmAction('reset');return}
+  PHM.keys[k]=true}
+function phmKeyUp(e){if(PHM.on)PHM.keys[(e.key||'').toLowerCase()]=false}
+function phmLock(){if(noLock||locked)return;try{const r=cv.requestPointerLock();if(r&&r.catch)r.catch(()=>{})}catch(e){}}
+function phmUnlock(){if(!document.pointerLockElement)return;PHM.unlockT=performance.now();document.exitPointerLock()}
+function phmMouseDown(e){if(!PHM.on)return;if(e.target!==cv)return;// panel presses stop at the panel (bubble phase), so its own controls still worke.stopImmediatePropagation();e.preventDefault();if(locked)return;
+  if(!noLock)phmLock();PHM.drag=true;document.body.classList.add('phm-drag')}
+function phmMouseUp(){if(PHM.drag){PHM.drag=false;document.body.classList.remove('phm-drag')}}
+function phmMouseMove(e){if(!PHM.on||!PHM.drag||locked)return;if(e.buttons===0){phmMouseUp();return}phmLook(e.movementX,e.movementY)}
+function phmWheel(e){if(!PHM.on)return;e.stopImmediatePropagation();if(phmIsMine(e.target))return;e.preventDefault();
+  const d=clamp((+e.deltaY||0)*(e.deltaMode===1?33:e.deltaMode===2?400:1),-160,160);PHM.fovT=clamp(PHM.fovT+d/100*4,15,110)}
+addEventListener('keydown',phmKeyDown,true);addEventListener('keyup',phmKeyUp,true);
+addEventListener('mousedown',phmMouseDown,true);addEventListener('mouseup',phmMouseUp,true);addEventListener('mousemove',phmMouseMove);
+addEventListener('wheel',phmWheel,{passive:false,capture:true});
+addEventListener('blur',()=>{for(const k in PHM.keys)PHM.keys[k]=false;phmMouseUp()});
+
+/* ---- discovery: one hint at the first golden hour ---- */
+function phmDiscover(){const now=performance.now();if(now-PHM.discT<2000)return;PHM.discT=now;
+  if(!S||!P||!P.alive||!S.active||!S.shown||S.shown.photo||S.shown.photo_hint||S.time<200||anyOpen()||!inGame())return;
+  const p=dayP();if(!((p>.005&&p<.06)||(p>.595&&p<.655)))return;const t=$('#tip');if(!t||!t.classList.contains('hidden'))return;
+  tip('photo_hint','Golden hour','The light is beautiful right now. Press <b>P</b> for <b>photo mode</b>: fly a free camera around you, pick a filter and save a screenshot.')}
+
 /* ================= RENDER ================= */
 const tmpC=new THREE.Color(),tmpC2=new THREE.Color();
 const SKY={dayTop:new THREE.Color('#4a82c4'),dayBot:new THREE.Color('#bcd2de'),setTop:new THREE.Color('#3b4f7a'),setBot:new THREE.Color('#e8a26a'),nightTop:new THREE.Color('#03050b'),nightBot:new THREE.Color('#080b12'),
