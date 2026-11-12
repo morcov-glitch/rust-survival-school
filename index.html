@@ -849,15 +849,14 @@ const keys={};let mouseL=false,mouseR=false;
 let locked=false,noLock=false,mouseX=-1,mouseY=-1,mouseIn=false;const SENS=.0022;
 function anyOpen(){return['#inv','#panel','#guide','#raid','#mapov','#skills'].some(s=>!$(s).classList.contains('hidden'))}
 function inGame(){return S&&!$('#hud').classList.contains('hidden')}
-function freeCursor(){return noLock&&!locked}
+function freeCursor(){return false}
 function updateCursorMode(){document.body.classList.toggle('freecur',!!(S&&S.active&&freeCursor()))}
-function lockFailed(){if(noLock)return;noLock=true;if(S&&inGame()&&!anyOpen()&&P.alive){S.active=true;$('#pause').classList.add('hidden')}updateCursorMode();
-  if(S)tip('freecursor','Free-cursor aiming','This page isn\'t allowed to capture your mouse, so the game uses <b>free-cursor aiming</b>: the crosshair follows your mouse, and pushing it toward the <b>screen edges turns you</b>. Hold <b>right mouse</b> and drag to turn precisely. <b>R</b> does the right-click actions.',true)}
+function lockFailed(){if(!S||!inGame()||anyOpen()||!P.alive)return;if(!lockFailed.retry){lockFailed.retry=1;clearTimeout(lockFailed._t);lockFailed._t=setTimeout(()=>{if(S&&S.active&&!document.pointerLockElement){try{const r=cv.requestPointerLock();if(r&&r.catch)r.catch(()=>{lockFailed.retry=2;pause()})}catch(e){pause()}}},1100);return}pause()}
 function resume(){if(!inGame()||anyOpen()||!P.alive)return;$('#pause').classList.add('hidden');S.active=true;
-  if(!noLock){try{const r=cv.requestPointerLock();if(r&&r.catch)r.catch(()=>lockFailed())}catch(e){lockFailed()}clearTimeout(resume._t);resume._t=setTimeout(()=>{if(S&&S.active&&!document.pointerLockElement)lockFailed()},700)}
+  lockFailed.retry=0;try{const r=cv.requestPointerLock();if(r&&r.catch)r.catch(()=>lockFailed())}catch(e){lockFailed()}clearTimeout(resume._t);resume._t=setTimeout(()=>{if(S&&S.active&&!document.pointerLockElement)lockFailed()},2600)
   updateCursorMode()}
 function pause(){if(!S)return;S.active=false;mouseL=false;mouseR=false;if(document.pointerLockElement)document.exitPointerLock();if(inGame()&&!anyOpen()&&P.alive)$('#pause').classList.remove('hidden');updateCursorMode()}
-document.addEventListener('pointerlockchange',()=>{locked=document.pointerLockElement===cv;if(locked)clearTimeout(resume._t);if(!locked&&S&&S.active&&!noLock)pause();updateCursorMode()});
+document.addEventListener('pointerlockchange',()=>{locked=document.pointerLockElement===cv;if(locked)clearTimeout(resume._t);if(!locked&&S&&S.active)pause();updateCursorMode()});
 document.addEventListener('pointerlockerror',()=>lockFailed());
 $('#pause').addEventListener('click',e=>{if(e.target.id==='pMenu')return;resume()});
 $('#pMenu').onclick=()=>{$('#pause').classList.add('hidden');showMenu()};
