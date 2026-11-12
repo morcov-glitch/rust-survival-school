@@ -3457,7 +3457,7 @@ const PKV=(()=>{const fs={flatShading:true};
 const _pv1=new V3(),_pv2=new V3(),_pv3=new V3(),_pvY=new V3(0,1,0),_pvZ=new V3(0,0,1);
 function pkPlaceArm(arm,wx,wy,wz,k,side){if(!(k>.001)){arm.visible=false;return}arm.visible=true;
   _pv1.set(wx,wy,wz);camera.worldToLocal(_pv1);const e=k*k*(3-2*k),x=lerp(side*.27,_pv1.x,e),y=lerp(-.66,_pv1.y,e),z=lerp(-.2,_pv1.z,e);arm.position.set(x,y,z);
-  _pv2.set(side*.2-x,-.3-y,.14-z);const L=_pv2.length();if(L>1e-4){_pv2.multiplyScalar(1/L);arm.quaternion.setFromUnitVectors(_pvZ,_pv2);arm.scale.set(1,1,clamp(L/.56,.8,1.6))}}
+  const qx=side*.2-x,qy=-.3-y,qz=.14-z,L=Math.hypot(qx,qy,qz);if(L>1e-4){_pv2.set(qx/L,qy/L,qz/L);arm.quaternion.setFromUnitVectors(_pvZ,_pv2);arm.scale.set(1,1,clamp(L/.56,.8,1.6))}}
 function pkHeadPos(G,out){if(G.phase==='fly')return out.set(G.ox+G.dx*G.trav,G.oy+G.dy*G.trav,G.oz+G.dz*G.trav);if(G.phase==='pull')return out.set(G.ax,G.ay,G.az);
   const e=G.rt*G.rt;return out.set(lerp(G.hx,_pv1.x,e),lerp(G.hy,_pv1.y,e),lerp(G.hz,_pv1.z,e))}
 function pkRender(){if(!P)return;const A=PK.act,V=PKV;let shownL=false,shownR=false;
@@ -3922,9 +3922,9 @@ function sklPulse(now){const rad=sklPulseR();sklRevEnd();
   const L=sklCollect(rad);L.forEach((m,i)=>{m.tr=1.3*(1-Math.cbrt(Math.max(0,1-m.d/rad)));m.p=sklUI.pool[i];m.p.el.className='mk '+m.cat;m.p.b.textContent=''});sklRev.list=L;
   const r=sklUI.ring;r.classList.remove('go');void r.offsetWidth;r.classList.add('go');sklUI.sense.classList.add('on');sklBump(sklUI.q,'go');
   sklSfx('ping');gainXP('survivor',1,'Sense pulse');S.shown.skl_pulse=1}
-function sklRevValidate(){let es=null;const zs=typeof zombies!=='undefined'&&Array.isArray(zombies)?zombies:null;
+function sklRevValidate(){const zs=typeof zombies!=='undefined'&&Array.isArray(zombies)?zombies:null;
   for(const m of sklRev.list){const o=m.o;
-    if(m.src==='ent'){if(!es)es=new Set(ents);m.ok=es.has(o)&&!(o.obj&&!o.obj.parent)&&!sklSearched(o)}
+    if(m.src==='ent'){m.ok=!sklSearched(o)&&!(o.amt!==undefined&&o.amt<=0)&&(o.obj?!!o.obj.parent:ents.includes(o))}
     else if(m.src==='bag')m.ok=S.lootbags.includes(o);
     else if(m.src==='z')m.ok=(!zs||zs.includes(o))&&(m.cat==='loot'?sklZSearchable(o):!o.dead);
     else if(m.src==='npc')m.ok=!o.dead&&npcs.includes(o);
@@ -3954,7 +3954,8 @@ const sklWaveMat=new THREE.MeshBasicMaterial({map:sklWaveTex,color:col('#ffcf7a'
 const sklWaveGeo=new THREE.CylinderGeometry(1,1,1,96,1,true),sklWavePos=sklWaveGeo.attributes.position,sklWaveU=[];
 for(let i=0;i<sklWavePos.count;i++)sklWaveU.push(sklWavePos.getX(i),sklWavePos.getZ(i),sklWavePos.getY(i)>0?1:0);
 const sklWave=new THREE.Mesh(sklWaveGeo,sklWaveMat);sklWave.visible=false;sklWave.frustumCulled=false;sklWave.renderOrder=5;scene.add(sklWave);
-onHook('render',()=>{const rv=sklRev,k=(sklNow()-rv.t0)/1.4;if(!rv.on||k<0||k>=1){if(sklWave.visible)sklWave.visible=false;return}
+let sklWaveWarm=0;/* pre-compile the wave shader on the first frames instead of on the first Q press */
+onHook('render',()=>{if(sklWaveWarm<2&&P){sklWaveWarm++;if(!sklRev.on){sklWaveMat.opacity=0;sklWave.position.set(P.x,0,P.z);sklWave.visible=sklWaveWarm<2;return}}const rv=sklRev,k=(sklNow()-rv.t0)/1.4;if(!rv.on||k<0||k>=1){if(sklWave.visible)sklWave.visible=false;return}
   const r=Math.max(.6,rv.R*(1-Math.pow(1-k,3))),hh=4.5+2.5*k;
   for(let i=0,n=sklWaveU.length/3;i<n;i++){const ux=sklWaveU[i*3]*r,uz=sklWaveU[i*3+1]*r,g=Math.max(groundH(rv.ox+ux,rv.oz+uz),0);sklWavePos.setXYZ(i,ux,sklWaveU[i*3+2]?g+hh-.4:g-.4,uz)}
   sklWavePos.needsUpdate=true;sklWave.position.set(rv.ox,0,rv.oz);sklWave.visible=true;sklWaveMat.opacity=.8*Math.pow(1-k,1.25)*Math.min(1,k*9)});
@@ -3985,6 +3986,416 @@ onHook('status',o=>{if(sklAnyBuy())o.push('<span class="sklchip">SKILL POINT · 
 onHook('newGame',()=>{sklRevEnd();for(const n of sklNotes)if(n.el)n.el.remove();sklNotes.length=0;sklToastQ.length=0;sklUI.toastEnd=0;sklUI.toast.classList.remove('on');
   sklTipQ.length=0;sklPulseReady=0;sklUI.qRdy=null;sklUI.qArmed=false;sklHits.clear();sklWrapZ();const s=sklS();if(s)s.dirty=true;sklUI.panelDirty=true;if(sklUI.ov)sklUI.ov.classList.add('hidden')});
 onHook('death',()=>sklRevEnd());
+
+/* ================= GRAPHICS AND POST PROCESSING ================= */
+// gfx module. Provides POSTFX {enabled,quality} and decal(pos,type,size). Owns the frame's draw call via gfxRender().
+// HDR pipeline: scene -> half-float target (MSAA x4 on WebGL2) -> bright pass + separable gaussian bloom at 1/2 and 1/4 res
+// -> god rays (radial blur of the bright sky around the sun) -> composite: ACES filmic (same exposure as the old renderer),
+// sRGB, grading (warm days, blue nights, grey rain), vignette, grain, edge chromatic aberration, low-health / chase /
+// underwater effects. Anything unsupported or failing falls back to the original direct render.
+// Also: new sky (sun disc + halo, dawn/dusk glow, two cloud layers, moon glow, faint galaxy band), twinkling stars that hide
+// behind clouds, texel-snapped 4096 sun shadows, ground decals, dawn/night mist, fire embers & smoke, material polish.
+var POSTFX={enabled:true,quality:'high',manual:false,failed:false,reason:'',exposure:+renderer.toneMappingExposure||1.1};
+try{const v=localStorage.getItem('rss_gfx');if(v==='off'){POSTFX.enabled=false;POSTFX.manual=true}else if(v==='low'){POSTFX.quality='low';POSTFX.manual=true}else if(v==='high')POSTFX.manual=true}catch(e){}
+const GFX={ready:false,tried:false,active:false,ms:false,w:0,h:0,scale:1,t:0,v2:new THREE.Vector2(),sunV:new V3(),fwd:new V3(),
+  ftAvg:16,slowT:0,warm:0,lastNow:0,lowHP:0,chase:0,under:0,dead:0,rayI:0,shRes:0,shadowHi:(renderer.capabilities.maxTextureSize|0)>=4096?4096:2048,
+  c1:new THREE.Color(),c2:new THREE.Color(),c3:new THREE.Color(),c4:new THREE.Color(),sx:new V3(),sy:new V3(),sz:new V3(),up:new V3(0,1,0),
+  wSky:{value:new THREE.Color(.3,.4,.5)},hemiNight:new THREE.Color(.34,.45,.92),hemiG0:hemi.groundColor.clone(),hemiGN:new THREE.Color(.025,.03,.055),
+  mistNight:new THREE.Color(.014,.018,.03),st:{p:0,sunT:-1,D:0,set:0,night:1,el:-.3}};
+
+/* ---- ACES helpers (same curve as three.js r128 ACESFilmicToneMapping, incl. the 1/0.6 exposure scale) ---- */
+const GFX_OMI=[[.643038,.311187,.045775],[.059269,.931436,.009295],[.005962,.063929,.930118]];
+const GFX_IMI=[[1.764741,-.675778,-.088963],[-.147028,1.160252,-.013224],[-.036337,-.162436,1.198773]];
+// scene-linear colour -> display sRGB through the same tone mapper (used for the legacy path)
+function gfxTone(c,out){const K=POSTFX.exposure/.6,r=c.r*K,g=c.g*K,b=c.b*K,f=v=>(v*(v+.0245786)-.000090537)/(v*(.983729*v+.432951)+.238081),s=v=>{v=clamp(v,0,1);return v<=.0031308?v*12.92:1.055*Math.pow(v,1/2.4)-.055};
+  const a=f(.59719*r+.35458*g+.04823*b),d=f(.076*r+.90834*g+.01566*b),e=f(.0284*r+.13383*g+.83777*b);return out.setRGB(s(1.60475*a-.53108*d-.07367*e),s(-.10208*a+1.10813*d-.00605*e),s(-.00327*a-.07276*d+1.07602*e))}
+function gfxIFit(y){y=Math.min(Math.max(y,0),.985);const A=1-.983729*y,B=.0245786-.432951*y,C=-.000090537-.238081*y;return(-B+Math.sqrt(Math.max(B*B-4*A*C,0)))/(2*A)}
+// linear display colour -> scene-linear colour that our tone mapper (exposure POSTFX.exposure) maps back onto it
+function gfxInvTone(c,out){const K=POSTFX.exposure/.6,M=GFX_OMI,N=GFX_IMI,r=c.r,g=c.g,b=c.b;
+  const v0=gfxIFit(M[0][0]*r+M[0][1]*g+M[0][2]*b),v1=gfxIFit(M[1][0]*r+M[1][1]*g+M[1][2]*b),v2=gfxIFit(M[2][0]*r+M[2][1]*g+M[2][2]*b);
+  out.setRGB(Math.max(0,N[0][0]*v0+N[0][1]*v1+N[0][2]*v2)/K,Math.max(0,N[1][0]*v0+N[1][1]*v1+N[1][2]*v2)/K,Math.max(0,N[2][0]*v0+N[2][1]*v1+N[2][2]*v2)/K);return out}
+const GFX_GLSL_ACES=`
+vec3 gfxFit(vec3 v){vec3 a=v*(v+.0245786)-.000090537;vec3 b=v*(.983729*v+.432951)+.238081;return a/b;}
+vec3 gfxAces(vec3 c){c=mat3(.59719,.076,.0284,.35458,.90834,.13383,.04823,.01566,.83777)*c;c=gfxFit(c);
+ c=mat3(1.60475,-.10208,-.00327,-.53108,1.10813,-.07276,-.07367,-.00605,1.07602)*c;return clamp(c,0.,1.);}
+vec3 gfxEnc(vec3 c){return mix(pow(max(c,vec3(0.)),vec3(.41666))*1.055-.055,c*12.92,step(c,vec3(.0031308)));}`;
+const GFX_GLSL_INV=`
+vec3 gfxIFit(vec3 y){y=clamp(y,0.,.985);vec3 A=1.-.983729*y;vec3 B=.0245786-.432951*y;vec3 C=-.000090537-.238081*y;return(-B+sqrt(max(B*B-4.*A*C,vec3(0.))))/(2.*A);}
+vec3 gfxLin(vec3 c){return mix(pow(c*.9478672986+.0521327014,vec3(2.4)),c*.0773993808,step(c,vec3(.04045)));}
+vec3 gfxInvTone(vec3 disp,float k){vec3 L=gfxLin(clamp(disp,0.,1.));
+ vec3 v=gfxIFit(mat3(.643038,.059269,.005962,.311187,.931436,.063929,.045775,.009295,.930118)*L);
+ return max(mat3(1.764741,-.147028,-.036337,-.675778,1.160252,-.162436,-.088963,-.013224,1.198773)*v,vec3(0.))/k;}`;
+const GFX_GLSL_HASH=`
+float gfxH12(vec2 p){vec3 q=fract(vec3(p.xyx)*.1031);q+=dot(q,q.yzx+33.33);return fract((q.x+q.y)*q.z);}`;
+const GFX_GLSL_NOISE=`
+float hs(vec2 p){return fract(sin(dot(p,vec2(127.1,311.7)))*43758.5453);}
+float ns(vec2 p){vec2 i=floor(p),f=fract(p);f=f*f*(3.-2.*f);return mix(mix(hs(i),hs(i+vec2(1.,0.)),f.x),mix(hs(i+vec2(0.,1.)),hs(i+vec2(1.,1.)),f.x),f.y);}
+float fb(vec2 p){float v=0.,a=.5;for(int i=0;i<5;i++){v+=a*ns(p);p=p*2.03+vec2(1.7,9.2);a*=.5;}return v;}
+float fb3(vec2 p){float v=0.,a=.5;for(int i=0;i<3;i++){v+=a*ns(p);p=p*2.03+vec2(1.7,9.2);a*=.5;}return v*1.142857;}`;
+
+/* ---- sky: replaces the old sky material (kept for fallback); same skyU uniforms, plus HDR output ---- */
+Object.assign(skyU,{uHDR:{value:0},uExpoK:{value:POSTFX.exposure/.6},uMoonDir:{value:new V3(-.4,.7,-.5).normalize()},uNight:{value:0},uSet:{value:0},uDay:{value:1},uSunC:{value:new THREE.Color(0,0,0)},uUW:{value:new THREE.Color(.04,.2,.25)},uUnder:{value:0}});
+GFX.oldSky=sky.material;
+sky.material=new THREE.ShaderMaterial({uniforms:skyU,side:THREE.BackSide,depthWrite:false,fog:false,toneMapped:false,
+  vertexShader:'varying vec3 vP;void main(){vP=normalize(position);gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.);}',
+  fragmentShader:`uniform vec3 top;uniform vec3 bot;uniform vec3 sunDir;uniform vec3 cloudCol;uniform vec3 cloudShade;uniform vec3 uMoonDir;uniform vec3 uSunC;uniform vec3 uUW;uniform float uUnder;
+uniform float uTime;uniform float uCover;uniform float uHDR;uniform float uExpoK;uniform float uNight;uniform float uSet;uniform float uDay;
+varying vec3 vP;${GFX_GLSL_NOISE}${GFX_GLSL_INV}
+void main(){
+ vec3 d=normalize(vP);
+ float h=clamp(d.y*1.8+.08,0.,1.);
+ vec3 c=mix(bot,top,pow(h,.7));
+ float s=max(dot(d,sunDir),0.);
+ vec2 hd=normalize(d.xz+vec2(1e-5,0.));
+ vec2 hsn=normalize(sunDir.xz+vec2(1e-5,0.));
+ float tw=dot(hd,hsn)*.5+.5;
+ float hz=pow(1.-min(abs(d.y),1.),7.);
+ c+=vec3(1.,.42,.16)*hz*tw*tw*tw*uSet*.55;
+ c+=vec3(.42,.27,.4)*pow(1.-min(abs(d.y-.08)*2.5,1.),2.)*(1.-tw)*uSet*.16;
+ c*=mix(vec3(1.),vec3(.88,.92,1.),smoothstep(.3,1.,d.y)*uDay*(1.-uCover)*.5);
+ c+=uSunC*(pow(s,12.)*.22+pow(s,3.)*.045*(1.+uSet*2.5))*(1.-uCover*.5);
+ float mo=max(dot(d,uMoonDir),0.);
+ c+=vec3(.42,.52,.78)*(pow(mo,80.)*.16+pow(mo,9.)*.035)*uNight*(1.-uCover*.6);
+ if(uNight>.02&&d.y>0.){float dm=dot(d,normalize(vec3(.35,.3,.89)));float mw=exp(-dm*dm*14.)*smoothstep(.35,.85,fb3(d.xz/(d.y+.4)*2.6+vec2(4.,9.)));
+  c+=vec3(.3,.33,.45)*mw*.07*uNight*(1.-uCover)*smoothstep(0.,.3,d.y);}
+ float disc=smoothstep(.99955,.99978,s);
+ float occ=1.;
+ if(d.y>0.){
+  vec2 uv2=d.xz/(d.y+.06)*.3+vec2(uTime*.0085,uTime*.0032);
+  float ci=fb3(vec2(uv2.x*.7+uv2.y*.35,uv2.y*2.6));
+  float cia=smoothstep(.55,.88,ci)*smoothstep(.03,.4,d.y)*.4*(1.-uCover*.75);
+  c=mix(c,mix(cloudShade,cloudCol,.85)+uSunC*(pow(s,5.)*.3+uSet*.12),cia);
+  vec2 uv=d.xz/(d.y+.15)*.9+vec2(uTime*.004,uTime*.0015);
+  float n=fb(uv);
+  float cl=smoothstep(.5-uCover*.34,.8-uCover*.28,n)*smoothstep(0.,.22,d.y);
+  float lit=clamp(.6+(n-fb3(uv+hsn*.06))*3.,0.,1.);
+  vec3 cc=mix(cloudShade,cloudCol,lit)*(1.-uCover*.4);
+  cc+=uSunC*(pow(s,6.)*.35*(1.-uCover)+pow(s,16.)*(1.-cl)*.45)+vec3(.3,.36,.5)*pow(mo,14.)*uNight*.1;
+  c=mix(c,cc,cl*.9);
+  occ=max(0.,1.-cl*.92-cia*.35);
+ }
+ vec3 o;
+ if(uHDR>.5)o=gfxInvTone(min(c,vec3(.94)),uExpoK)+uSunC*(disc*30.+pow(s,1200.)*5.+pow(s,200.)*.6)*occ;
+ else o=c+uSunC*(disc*2.5+pow(s,1200.)*.8)*occ;
+ gl_FragColor=vec4(mix(o,uUW,uUnder),1.);
+}`});
+/* ---- twinkling stars (hidden behind the same clouds the sky draws) ---- */
+{const pa=starGeo.attributes&&starGeo.attributes.position;let n=(pa&&pa.count)|0;if(n<1)n=1200;const a=new Float32Array(n*2);for(let i=0;i<n*2;i++)a[i]=Math.random();
+  starGeo.setAttribute('aR',new THREE.BufferAttribute(a,2));GFX.starU={uOp:{value:0},uT:{value:0},uPR:{value:1},uTime:skyU.uTime,uCover:skyU.uCover};GFX.oldStars=stars.material;
+  stars.material=new THREE.ShaderMaterial({uniforms:GFX.starU,transparent:true,depthWrite:false,blending:THREE.AdditiveBlending,fog:false,toneMapped:false,
+    vertexShader:`attribute vec2 aR;uniform float uT;uniform float uPR;uniform float uTime;uniform float uCover;varying float vB;varying vec3 vC;${GFX_GLSL_NOISE}
+void main(){gl_Position=projectionMatrix*(modelViewMatrix*vec4(position,1.));vec3 d=normalize(position);
+ float tw=.62+.38*sin(uT*(1.5+aR.x*4.)+aR.x*93.)*sin(uT*(.7+aR.y*2.3)+aR.y*41.);float cl=0.;
+ if(d.y>0.){vec2 uv=d.xz/(d.y+.15)*.9+vec2(uTime*.004,uTime*.0015);cl=smoothstep(.5-uCover*.34,.8-uCover*.28,fb(uv))*smoothstep(0.,.22,d.y);}
+ vB=mix(.25,1.,aR.y*aR.y)*tw*smoothstep(.02,.25,d.y)*(1.-cl*.96);vC=mix(vec3(1.,.8,.62),vec3(.72,.82,1.),fract(aR.x*7.31));gl_PointSize=mix(1.,2.7,aR.y*aR.y)*uPR;}`,
+    fragmentShader:'uniform float uOp;varying float vB;varying vec3 vC;void main(){vec2 p=gl_PointCoord-.5;float a=1.-smoothstep(.12,.5,length(p));gl_FragColor=vec4(vC*(vB*a*uOp),1.);}'})}
+/* ---- moon with soft maria, a little brighter (it blooms gently); bluer, brighter moonlight ---- */
+try{moonMesh.material.map=canvasTex(128,(g,s)=>{g.fillStyle='#f3f5fb';g.fillRect(0,0,s,s);for(let i=0;i<10;i++){g.fillStyle='rgba(118,126,150,.2)';g.beginPath();g.ellipse(R(0,s),R(s*.2,s*.8),R(8,26),R(6,16),R(0,3),0,7);g.fill()}
+  g.strokeStyle='rgba(96,102,128,.22)';g.lineWidth=1.2;for(let i=0;i<28;i++){g.beginPath();g.arc(R(0,s),R(0,s),R(1.5,5.5),0,7);g.stroke()}});moonMesh.material.color.setRGB(1.3,1.37,1.55);moonMesh.material.needsUpdate=true;
+  moon.color.setRGB(.5,.64,1)}catch(e){console.warn('[gfx] moon',e)}
+
+/* ---- post-processing passes ---- */
+const GFX_VS='varying vec2 vUv;void main(){vUv=uv;gl_Position=vec4(position.xy,0.,1.);}';
+const GFX_FS={
+ br:`uniform sampler2D tSrc;uniform vec2 uTexel;uniform float uSpread;uniform float uExpo;uniform float uThr;uniform float uKnee;varying vec2 vUv;
+void main(){vec2 o=uTexel*uSpread;
+ vec3 c=texture2D(tSrc,vUv-o).rgb+texture2D(tSrc,vUv+vec2(o.x,-o.y)).rgb+texture2D(tSrc,vUv+vec2(-o.x,o.y)).rgb+texture2D(tSrc,vUv+o).rgb;
+ c=clamp(c*(.25*uExpo),0.,64.);float br=max(c.r,max(c.g,c.b));
+ float sq=clamp(br-uThr+uKnee,0.,2.*uKnee);sq=sq*sq/(4.*uKnee+.0001);
+ gl_FragColor=vec4(c*(max(sq,br-uThr)/max(br,.0001)),1.);}`,
+ dn:`uniform sampler2D tSrc;uniform vec2 uTexel;varying vec2 vUv;
+void main(){vec2 o=uTexel;gl_FragColor=vec4((texture2D(tSrc,vUv-o).rgb+texture2D(tSrc,vUv+vec2(o.x,-o.y)).rgb+texture2D(tSrc,vUv+vec2(-o.x,o.y)).rgb+texture2D(tSrc,vUv+o).rgb)*.25,1.);}`,
+ bl:`uniform sampler2D tSrc;uniform vec2 uDir;varying vec2 vUv;
+void main(){vec2 o1=uDir*1.4117647,o2=uDir*3.2941176,o3=uDir*5.1764706;vec3 c=texture2D(tSrc,vUv).rgb*.19648255;
+ c+=(texture2D(tSrc,vUv+o1).rgb+texture2D(tSrc,vUv-o1).rgb)*.29690696;
+ c+=(texture2D(tSrc,vUv+o2).rgb+texture2D(tSrc,vUv-o2).rgb)*.0944704;
+ c+=(texture2D(tSrc,vUv+o3).rgb+texture2D(tSrc,vUv-o3).rgb)*.01038136;
+ gl_FragColor=vec4(c,1.);}`,
+ mk:`uniform sampler2D tSrc;uniform vec2 uTexel;uniform vec2 uSun;uniform float uExpo;uniform float uThr;uniform float uAspect;varying vec2 vUv;
+void main(){vec2 o=uTexel*1.5;
+ vec3 c=(texture2D(tSrc,vUv-o).rgb+texture2D(tSrc,vUv+vec2(o.x,-o.y)).rgb+texture2D(tSrc,vUv+vec2(-o.x,o.y)).rgb+texture2D(tSrc,vUv+o).rgb)*(.25*uExpo);
+ float br=max(c.r,max(c.g,c.b));
+ float m=smoothstep(uThr,uThr*3.,br)*(1.-smoothstep(.02,.45,length((vUv-uSun)*vec2(uAspect,1.))));
+ gl_FragColor=vec4(m,m,m,1.);}`,
+ ry:`uniform sampler2D tSrc;uniform vec2 uSun;uniform float uDensity;uniform float uDecay;uniform float uWeight;uniform float uJit;varying vec2 vUv;${GFX_GLSL_HASH}
+void main(){vec2 dl=(vUv-uSun)*(uDensity/32.);vec2 tc=vUv-dl*gfxH12(gl_FragCoord.xy+uJit);float il=1.,acc=0.;
+ for(int i=0;i<32;i++){tc-=dl;acc+=texture2D(tSrc,tc).r*il;il*=uDecay;}
+ gl_FragColor=vec4(vec3(acc*uWeight),1.);}`,
+ co:`uniform sampler2D tScene;uniform sampler2D tB1;uniform sampler2D tB2;uniform sampler2D tRays;
+uniform vec2 uSun;uniform vec3 uRayCol;uniform vec3 uGain;uniform vec3 uLift;
+uniform float uTime;uniform float uExpo;uniform float uB1;uniform float uB2;uniform float uRay;uniform float uGlare;uniform float uCA;uniform float uVig;uniform float uGrain;
+uniform float uSat;uniform float uCon;uniform float uLowHP;uniform float uPulse;uniform float uChase;uniform float uUnder;uniform float uAspect;uniform float uDead;
+varying vec2 vUv;${GFX_GLSL_ACES}${GFX_GLSL_HASH}
+void main(){
+ vec2 uv=vUv;
+ if(uUnder>.001)uv+=uUnder*vec2(sin(uv.y*23.+uTime*2.3),cos(uv.x*19.+uTime*1.9))*.0035;
+ vec2 dc=uv-.5;vec3 c;
+ if(uCA>0.){vec2 off=dc*dot(dc,dc)*uCA;c=vec3(texture2D(tScene,uv+off).r,texture2D(tScene,uv).g,texture2D(tScene,uv-off).b);}
+ else c=texture2D(tScene,uv).rgb;
+ c=c*uExpo+texture2D(tB1,uv).rgb*uB1+texture2D(tB2,uv).rgb*uB2;
+ vec2 sd=(uv-uSun)*vec2(uAspect,1.);
+ c+=uRayCol*(texture2D(tRays,uv).r*uRay*(1.-smoothstep(.25,1.2,length(sd)))+exp(-dot(sd,sd)*7.)*uGlare);
+ vec3 d=gfxEnc(gfxAces(c));
+ d=(d-.5)*uCon+.5;
+ d=mix(vec3(dot(d,vec3(.2126,.7152,.0722))),d,uSat);
+ d=d*uGain+uLift;
+ float e=length(dc*2.)*.7071;float vg=smoothstep(.42,1.08,e);
+ if(uUnder>.001)d=mix(d,mix(vec3(.08,.35,.43),vec3(.02,.12,.16),e),(.22+.32*e)*uUnder);
+ float red=clamp(uLowHP*(.45+.55*uPulse)+uChase,0.,1.);
+ d=mix(d,vec3(d.r*.6+.16,d.g*.18,d.b*.16),clamp(vg*1.5,0.,1.)*red*.85);
+ d*=1.-vg*(uVig+.35*uDead);
+ d+=(gfxH12(gl_FragCoord.xy+fract(uTime*7.31)*vec2(131.7,271.3))-.5)*uGrain;
+ gl_FragColor=vec4(clamp(d,0.,1.),1.);}`};
+function gfxBuildPasses(){const V2=()=>({value:new THREE.Vector2()}),T=()=>({value:null}),F=v=>({value:v});
+  const U=GFX.U={br:{tSrc:T(),uTexel:V2(),uSpread:F(1),uExpo:F(1),uThr:F(3.2),uKnee:F(1.2)},dn:{tSrc:T(),uTexel:V2()},bl:{tSrc:T(),uDir:V2()},
+    mk:{tSrc:T(),uTexel:V2(),uSun:V2(),uExpo:F(1),uThr:F(3),uAspect:F(1)},ry:{tSrc:T(),uSun:V2(),uDensity:F(.9),uDecay:F(.93),uWeight:F(.078),uJit:F(0)},
+    co:{tScene:T(),tB1:T(),tB2:T(),tRays:T(),uSun:V2(),uRayCol:F(new THREE.Color(1,.9,.75)),uGain:F(new V3(1,1,1)),uLift:F(new V3(0,0,0)),uTime:F(0),uExpo:F(1),uB1:F(.28),uB2:F(.42),
+      uRay:F(0),uGlare:F(0),uCA:F(.012),uVig:F(.3),uGrain:F(.028),uSat:F(1.08),uCon:F(1.05),uLowHP:F(0),uPulse:F(0),uChase:F(0),uUnder:F(0),uAspect:F(1),uDead:F(0)}};
+  GFX.m={};for(const k in GFX_FS)GFX.m[k]=new THREE.ShaderMaterial({uniforms:U[k],vertexShader:GFX_VS,fragmentShader:GFX_FS[k],depthTest:false,depthWrite:false,toneMapped:false});
+  const q=GFX.q={scene:new THREE.Scene(),cam:new THREE.OrthographicCamera(-1,1,1,-1,0,1),mesh:new THREE.Mesh(new THREE.PlaneGeometry(2,2),GFX.m.co)};q.mesh.frustumCulled=false;q.scene.add(q.mesh)}
+gfxBuildPasses();
+function gfxRT(w,h,ms,depth){const o={minFilter:THREE.LinearFilter,magFilter:THREE.LinearFilter,format:THREE.RGBAFormat,type:THREE.HalfFloatType,encoding:THREE.LinearEncoding,depthBuffer:!!depth,stencilBuffer:false,generateMipmaps:false};
+  if(ms){const t=new THREE.WebGLMultisampleRenderTarget(w,h,o);t.samples=4;return t}return new THREE.WebGLRenderTarget(w,h,o)}
+const GFX_RTS=['rt','bA','bB','cA','cB','mask','rays'];
+function gfxAlloc(){renderer.getDrawingBufferSize(GFX.v2);const pr=+renderer.getPixelRatio()||1,sc=POSTFX.quality==='low'&&pr>1.05?Math.max(.5,1/pr):1;
+  const w=Math.max(1,Math.round(GFX.v2.x*sc)),h=Math.max(1,Math.round(GFX.v2.y*sc));if(GFX.rt&&w===GFX.w&&h===GFX.h)return;GFX.w=w;GFX.h=h;GFX.scale=sc;
+  const hw=Math.max(1,w>>1),hh=Math.max(1,h>>1),qw=Math.max(1,w>>2),qh=Math.max(1,h>>2);
+  if(!GFX.rt){GFX.rt=gfxRT(w,h,GFX.ms,true);GFX.bA=gfxRT(hw,hh);GFX.bB=gfxRT(hw,hh);GFX.cA=gfxRT(qw,qh);GFX.cB=gfxRT(qw,qh);GFX.mask=gfxRT(qw,qh);GFX.rays=gfxRT(qw,qh)}
+  else{GFX.rt.setSize(w,h);GFX.bA.setSize(hw,hh);GFX.bB.setSize(hw,hh);for(const k of['cA','cB','mask','rays'])GFX[k].setSize(qw,qh)}}
+function gfxFboOK(rt){renderer.setRenderTarget(rt);const gl=GFX.gl,st=gl.checkFramebufferStatus(gl.FRAMEBUFFER);return typeof st!=='number'||st===gl.FRAMEBUFFER_COMPLETE}
+function gfxInit(){GFX.tried=true;
+  try{const gl=GFX.gl=renderer.getContext(),gl2=!!renderer.capabilities.isWebGL2;const ext=n=>{try{return gl.getExtension(n)}catch(e){return null}};
+    if(!THREE.HalfFloatType||typeof THREE.WebGLRenderTarget!=='function')throw new Error('render targets unavailable');
+    if(gl2){if(!ext('EXT_color_buffer_float')&&!ext('EXT_color_buffer_half_float'))throw new Error('float colour buffers unsupported')}
+    else if(!ext('OES_texture_half_float')||!ext('OES_texture_half_float_linear')||!(ext('EXT_color_buffer_half_float')||ext('WEBGL_color_buffer_float')))throw new Error('half-float render targets unsupported');
+    GFX.ms=gl2&&typeof THREE.WebGLMultisampleRenderTarget==='function';gfxAlloc();
+    if(!gfxFboOK(GFX.rt)){if(!GFX.ms)throw new Error('scene target incomplete');GFX.ms=false;GFX.rt.dispose();GFX.rt=gfxRT(GFX.w,GFX.h,false,true);if(!gfxFboOK(GFX.rt))throw new Error('scene target incomplete')}
+    if(!gfxFboOK(GFX.bA))throw new Error('bloom target incomplete');
+    renderer.setRenderTarget(null);GFX.ready=true}
+  catch(e){POSTFX.failed=true;POSTFX.reason=String(e&&e.message||e);try{renderer.setRenderTarget(null)}catch(_){}console.warn('[gfx] post-processing unavailable ('+POSTFX.reason+'); using direct rendering');gfxUpdateBtn()}}
+// force every material to rebuild its program (tone mapping / output encoding differ between the two paths)
+function gfxRecompile(){const f=o=>{const m=o.material;if(!m)return;if(Array.isArray(m)){for(const x of m)if(x)x.needsUpdate=true}else m.needsUpdate=true};
+  scene.traverse(f);if(typeof vmCache!=='undefined')for(const k in vmCache){const r=vmCache[k];if(r&&r.traverse)r.traverse(f)}}
+function gfxSwitch(on){GFX.active=on;skyU.uHDR.value=on?1:0;try{document.body.classList.toggle('gfxpp',on)}catch(e){}gfxRecompile();
+  if(!on&&GFX.rt)for(const k of GFX_RTS)if(GFX[k])GFX[k].dispose()}
+function gfxPass(mat,target){const q=GFX.q;q.mesh.material=mat;mat.uniformsNeedUpdate=true;renderer.setRenderTarget(target);renderer.render(q.scene,q.cam)}
+function gfxBlur(a,b,sp){const u=GFX.U.bl;u.tSrc.value=a.texture;u.uDir.value.set(sp/a.width,0);gfxPass(GFX.m.bl,b);u.tSrc.value=b.texture;u.uDir.value.set(0,sp/b.height);gfxPass(GFX.m.bl,a)}
+function gfxPipeline(){gfxAlloc();const r=renderer,U=GFX.U,low=POSTFX.quality==='low',ek=POSTFX.exposure/.6,tm=r.toneMapping,oe=r.outputEncoding;
+  r.toneMapping=THREE.NoToneMapping;r.outputEncoding=THREE.LinearEncoding;
+  try{r.setRenderTarget(GFX.rt);r.render(scene,camera)}finally{r.toneMapping=tm;r.outputEncoding=oe}
+  const src=GFX.rt.texture;U.br.tSrc.value=src;U.br.uTexel.value.set(1/GFX.w,1/GFX.h);U.br.uSpread.value=low?1.6:1;U.br.uExpo.value=ek;
+  if(low){gfxPass(GFX.m.br,GFX.cA);gfxBlur(GFX.cA,GFX.cB,1.25)}
+  else{gfxPass(GFX.m.br,GFX.bA);gfxBlur(GFX.bA,GFX.bB,1);U.dn.tSrc.value=GFX.bA.texture;U.dn.uTexel.value.set(1/GFX.bA.width,1/GFX.bA.height);gfxPass(GFX.m.dn,GFX.cA);gfxBlur(GFX.cA,GFX.cB,1.7)}
+  const rays=!low&&GFX.rayI>.003;
+  if(rays){U.mk.tSrc.value=src;U.mk.uTexel.value.set(1/GFX.w,1/GFX.h);U.mk.uExpo.value=ek;gfxPass(GFX.m.mk,GFX.mask);U.ry.tSrc.value=GFX.mask.texture;U.ry.uJit.value=(GFX.t*60)%97;gfxPass(GFX.m.ry,GFX.rays)}
+  const C=U.co;C.tScene.value=src;C.tB1.value=low?GFX.cA.texture:GFX.bA.texture;C.tB2.value=GFX.cA.texture;C.tRays.value=rays?GFX.rays.texture:GFX.cA.texture;
+  C.uB1.value=low?.6:.28;C.uB2.value=low?0:.42;C.uRay.value=rays?GFX.rayI:0;C.uExpo.value=ek;
+  gfxPass(GFX.m.co,null);gfxVerify()}
+// a post shader that failed to link would leave the screen black: detect it and fall back
+// (r128 keeps the active program in properties.currentProgram; older builds used .program)
+function gfxProg(pr,m){const p=m&&pr.get(m);const w=p&&(p.currentProgram||p.program);return w&&w.program?w.program:null}
+function gfxVerify(){if(GFX.vOK)return;const pr=renderer.properties,gl=GFX.gl;if(!pr||typeof pr.get!=='function'||!gl)return;let pend=0;
+  for(const k in GFX.m){const p=gfxProg(pr,GFX.m[k]);if(!p){pend++;continue}if(gl.getProgramParameter(p,gl.LINK_STATUS)===false)throw new Error('post shader "'+k+'" failed')}
+  if(!pend)GFX.vOK=true}
+function gfxSkyVerify(){if(GFX.skyOK)return;const pr=renderer.properties;if(!pr||typeof pr.get!=='function')return;const gl=GFX.gl||renderer.getContext();
+  const chk=(m,bad)=>{const p=gfxProg(pr,m);if(!p)return 0;if(gl.getProgramParameter(p,gl.LINK_STATUS)===false){bad();return -1}return 1};
+  const a=chk(sky.material,()=>{sky.material=GFX.oldSky;POSTFX.failed=true;POSTFX.reason='sky shader';console.warn('[gfx] sky shader failed; original sky restored')});
+  const b=chk(stars.material,()=>{stars.material=GFX.oldStars;console.warn('[gfx] star shader failed')});
+  const c=GFXD.mesh?chk(GFXD.mesh.material,()=>{GFXD.mesh.visible=false;GFXD.off=true;console.warn('[gfx] decal shader failed')}):1;
+  if(a&&b&&c)GFX.skyOK=true}
+// the frame's draw call (replaces renderer.render(scene,camera) in render())
+function gfxRender(dt){const want=!!(POSTFX.enabled&&!POSTFX.failed);if(want&&!GFX.tried)gfxInit();
+  const use=want&&GFX.ready&&!POSTFX.failed;if(use!==GFX.active)gfxSwitch(use);
+  if(use){try{gfxPipeline();gfxPerf();return}catch(e){POSTFX.failed=true;POSTFX.reason=String(e&&e.message||e);console.warn('[gfx] post-processing failed, using direct rendering:',POSTFX.reason);
+    try{renderer.setRenderTarget(null)}catch(_){}gfxSwitch(false);gfxUpdateBtn()}}
+  renderer.render(scene,camera);gfxPerf()}
+// adaptive quality: average frame time above ~22 ms for 3 s drops High -> Low (unless the player picked a level)
+function gfxPerf(){const now=performance.now(),ft=now-(GFX.lastNow||now);GFX.lastNow=now;if(!(ft>0&&ft<250))return;GFX.ftAvg+=(ft-GFX.ftAvg)*.05;GFX.warm+=ft/1000;
+  if(!(POSTFX.enabled&&!POSTFX.failed&&POSTFX.quality==='high'&&!POSTFX.manual&&GFX.warm>8))return;
+  if(GFX.ftAvg>22){GFX.slowT+=ft/1000;if(GFX.slowT>3){POSTFX.quality='low';GFX.slowT=0;gfxUpdateBtn();if(S)feedMsg('Graphics set to Low for a smoother frame rate (change it in the pause menu)')}}
+  else GFX.slowT=Math.max(0,GFX.slowT-ft/2000)}
+function gfxLabel(){return 'Graphics: '+(POSTFX.failed?'Basic':!POSTFX.enabled?'Off':POSTFX.quality==='low'?'Low':'High')}
+function gfxUpdateBtn(){try{const b=document.getElementById('pGfx');if(b)b.textContent=gfxLabel()}catch(e){}}
+function gfxCycle(){if(POSTFX.failed){if(S)feedMsg('Post-processing is not supported here ('+POSTFX.reason+')');return}
+  if(!POSTFX.enabled){POSTFX.enabled=true;POSTFX.quality='high'}else if(POSTFX.quality!=='low')POSTFX.quality='low';else POSTFX.enabled=false;
+  POSTFX.manual=true;GFX.slowT=0;try{localStorage.setItem('rss_gfx',!POSTFX.enabled?'off':POSTFX.quality)}catch(e){}gfxUpdateBtn()}
+try{const st=document.createElement('style');st.textContent='body.gfxpp #cv{filter:none!important}body.gfxpp #vig,body.gfxpp #glare,body.gfxpp #uw{display:none!important}';document.head.appendChild(st);
+  const act=document.querySelector('#pause .card .actions');if(act){const b=document.createElement('button');b.className='btn gray';b.id='pGfx';b.title='Post-processing: bloom, sun rays, colour grading';b.textContent=gfxLabel();
+    b.onclick=e=>{e.stopPropagation();gfxCycle()};act.insertBefore(b,act.firstChild)}}catch(e){console.warn('[gfx] ui',e)}
+addEventListener('resize',()=>{try{const pr=Math.min(window.devicePixelRatio||1,2);if(Math.abs(pr-renderer.getPixelRatio())>.01){renderer.setPixelRatio(pr);renderer.setSize(innerWidth,innerHeight,false)}}catch(e){}});
+
+/* ---- shadows: 4096 map when allowed (2048 on Low/Off), stable texel-snapped sun shadow camera ---- */
+function gfxShadowCfg(){const hi=POSTFX.enabled&&!POSTFX.failed&&POSTFX.quality!=='low'?GFX.shadowHi:2048;if(GFX.shRes===hi)return;GFX.shRes=hi;
+  const e=hi>2048?50:42;Object.assign(sun.shadow.camera,{left:-e,right:e,top:e,bottom:-e});sun.shadow.camera.updateProjectionMatrix();sun.shadow.radius=2;
+  sun.shadow.mapSize.set(hi,hi);if(sun.shadow.map){sun.shadow.map.dispose();sun.shadow.map=null}}
+gfxShadowCfg();
+function gfxSnapShadow(){const cam=sun.shadow.camera,tex=(cam.right-cam.left)/(sun.shadow.mapSize.x||2048);if(!(tex>0))return;const t=sun.target.position,p=sun.position;
+  const z=GFX.sz.subVectors(p,t);if(z.lengthSq()<1e-6)return;z.normalize();const x=GFX.sx.crossVectors(GFX.up,z);if(x.lengthSq()<1e-6)return;x.normalize();const y=GFX.sy.crossVectors(z,x);
+  const tx=x.dot(t),ty=y.dot(t),dx=Math.round(tx/tex)*tex-tx,dy=Math.round(ty/tex)*tex-ty;t.addScaledVector(x,dx).addScaledVector(y,dy);p.addScaledVector(x,dx).addScaledVector(y,dy)}
+
+/* ---- material polish: normal + roughness variation baked from the existing procedural textures ---- */
+function gfxBumpFrom(tex,str,rAmt){const img=tex&&tex.image;if(!img||typeof img.getContext!=='function')return null;const w=img.width|0,h=img.height|0;if(w<16||h<16)return null;
+  const src=img.getContext('2d').getImageData(0,0,w,h).data,H=new Float32Array(w*h);let mean=0;for(let i=0;i<w*h;i++){H[i]=(src[i*4]*.3+src[i*4+1]*.59+src[i*4+2]*.11)/255;mean+=H[i]}mean/=w*h;
+  const mk=()=>{const c=document.createElement('canvas');c.width=w;c.height=h;const g=c.getContext('2d');return{c,g,im:g.createImageData(w,h)}};const N=mk(),Rg=mk(),nd=N.im.data,rd=Rg.im.data;
+  for(let y=0;y<h;y++)for(let x=0;x<w;x++){const i=y*w+x,o=i*4,dx=(H[y*w+(x+1)%w]-H[y*w+(x-1+w)%w])*str,dy=(H[((y-1+h)%h)*w+x]-H[((y+1)%h)*w+x])*str,l=Math.sqrt(dx*dx+dy*dy+1);
+    nd[o]=(-dx/l*.5+.5)*255;nd[o+1]=(-dy/l*.5+.5)*255;nd[o+2]=(.5/l+.5)*255;nd[o+3]=255;rd[o]=rd[o+1]=rd[o+2]=clamp(.86+(mean-H[i])*rAmt,.45,1)*255;rd[o+3]=255}
+  N.g.putImageData(N.im,0,0);Rg.g.putImageData(Rg.im,0,0);
+  const mt=c=>{const t=new THREE.CanvasTexture(c);t.wrapS=t.wrapT=THREE.RepeatWrapping;t.anisotropy=MAXANI;if(tex.repeat)t.repeat.copy(tex.repeat);return t};return{n:mt(N.c),r:mt(Rg.c)}}
+for(const [m,tex,str,ns,ra] of [[MAT.tier.stone,TEX.stone,3,.9,.6],[MAT.tier.metal,TEX.metal,1.6,.6,.8],[MAT.concrete,TEX.concrete,2.2,.7,.5],[MAT.tier.wood,TEX.wood,2.4,.65,.4]]){
+  try{const b=gfxBumpFrom(tex,str,ra);if(!b||!m)continue;m.normalMap=b.n;m.normalScale=new THREE.Vector2(ns,ns);m.roughnessMap=b.r;m.needsUpdate=true}catch(e){console.warn('[gfx] bump',e)}}
+/* ---- water: fresnel sky reflection + stronger sun glints (wraps the existing wave shader) ---- */
+function gfxWaterPolish(){const m=(typeof waveRing!=='undefined'&&waveRing&&waveRing.material)||(water&&water.material);if(!m||!m.isMaterial||(m.userData&&m.userData.gfx))return;
+  m.userData.gfx=1;const prev=m.onBeforeCompile;
+  m.onBeforeCompile=function(sh,r){if(typeof prev==='function')prev.call(this,sh,r);sh.uniforms.uGfxSky=GFX.wSky;
+    sh.fragmentShader=sh.fragmentShader.replace('#include <common>','#include <common>\nuniform vec3 uGfxSky;').replace('#include <lights_fragment_end>',
+      '#include <lights_fragment_end>\nfloat gfxFr=pow(1.-clamp(dot(normal,normalize(vViewPosition)),0.,1.),5.);\nreflectedLight.indirectSpecular+=uGfxSky*(.03+.97*gfxFr)*.85;\nreflectedLight.directSpecular*=1.6;\ndiffuseColor.a=mix(diffuseColor.a,1.,gfxFr*.8);')};
+  m.customProgramCacheKey=()=>'gfxWater1|'+String(prev);m.needsUpdate=true}
+{const _bt=buildTerrain;buildTerrain=function(){const r=_bt.apply(this,arguments);try{gfxWaterPolish()}catch(e){console.warn('[gfx] water',e)}return r}}
+/* ---- brighter emitters so they bloom (fire, muzzle flash, bullets, fireflies) ---- */
+GFX.dot=canvasTex(32,(g,s)=>{const gr=g.createRadialGradient(s/2,s/2,0,s/2,s/2,s/2);gr.addColorStop(0,'rgba(255,255,255,1)');gr.addColorStop(.4,'rgba(255,255,255,.55)');gr.addColorStop(1,'rgba(255,255,255,0)');g.clearRect(0,0,s,s);g.fillStyle=gr;g.fillRect(0,0,s,s)});
+try{bulletMat.color.setRGB(3.2,2.6,1.5);ffMat.color.setRGB(1.15,1.55,.45);ffMat.map=GFX.dot;ffMat.size=5;ffMat.needsUpdate=true}catch(e){}
+{const _fs=flameSprite;flameSprite=function(){const m=_fs.apply(this,arguments);try{m.material.color.setRGB(1.9,1.7,1.5)}catch(e){}return m}}
+{const _vf=vmFor;vmFor=function(id){const r=_vf.apply(this,arguments);try{const u=r&&r.userData;if(u&&!u.gfxB){u.gfxB=1;if(u.muzzle&&u.muzzle.material&&u.muzzle.material.color)u.muzzle.material.color.multiplyScalar(3)}}catch(e){}return r}}
+{const _dm=depMesh;depMesh=function(type){const g=_dm.apply(this,arguments);try{const u=g&&g.userData;if(type==='campfire'&&u&&u.flame&&!u.gfxGlow){if(u.flame.material&&u.flame.material.color)u.flame.material.color.setRGB(2.2,1.2,.36);
+  const sp=flameSprite(.85);sp.position.y=.5;g.add(sp);u.gfxGlow=sp}}catch(e){}return g}}
+
+/* ---- decals: one instanced pool of ground-aligned quads (blood, scorch, acid) that spread in and fade out ---- */
+const GFXD={N:160,mesh:null,attr:null,next:0,off:false,t:{value:0},recent:[],out:[],outT:0,bleedT:-9,hitT:new WeakMap(),m4:new THREE.Matrix4(),q:new THREE.Quaternion(),q2:new THREE.Quaternion(),
+  n:new V3(),up:new V3(0,1,0),p:new V3(),s:new V3(),c:new THREE.Color(),zero:new THREE.Matrix4().makeScale(0,0,0)};
+const GFXD_T={blood:{id:0,tiles:[0,1],cols:['#5e0b0a','#4a0807','#6a1210'].map(col),a:.92,life:60,sc:1,spread:.15},scorch:{id:1,tiles:[2],cols:['#16120e','#1c1712'].map(col),a:.9,life:70,sc:1.15,spread:.1},
+  acid:{id:2,tiles:[3],cols:['#7ed63a','#97e64a'].map(col),a:.85,life:50,sc:1,spread:.5},iblood:{id:3,tiles:[0,1],cols:['#3d190b','#33140a','#45200f'].map(col),a:.92,life:60,sc:1,spread:.15}};
+const GFXD_IDS=['blood','scorch','acid','iblood'];
+function gfxDecalTex(){const tex=canvasTex(512,(g,s)=>{g.clearRect(0,0,s,s);const T=s/2,org=i=>[(i%2)*T,i<2?T:0];
+  const blob=(x,y,r,a,v)=>{const gr=g.createRadialGradient(x,y,0,x,y,r);gr.addColorStop(0,`rgba(${v},${v},${v},${a})`);gr.addColorStop(.75,`rgba(${v+20},${v+20},${v+20},${a*.85})`);gr.addColorStop(1,'rgba(255,255,255,0)');g.fillStyle=gr;g.beginPath();g.arc(x,y,r,0,7);g.fill()};
+  const drop=(x,y,r,a)=>{g.fillStyle=`rgba(255,255,255,${a})`;g.beginPath();g.arc(x,y,r,0,7);g.fill()};
+  for(const i of[0,1]){const [ox,oy]=org(i),cx=ox+T/2,cy=oy+T/2;
+    if(i===0){for(let k=0;k<9;k++)blob(cx+R(-26,26),cy+R(-26,26),R(26,52),.95,RI(190,225));
+      for(let k=0;k<34;k++){const a=R(0,6.28),d=R(58,108);drop(cx+Math.cos(a)*d,cy+Math.sin(a)*d,R(1.5,6.5),R(.6,.95))}
+      for(let k=0;k<7;k++){const a=R(0,6.28),d0=R(40,60),d1=d0+R(18,44);g.strokeStyle='rgba(255,255,255,.85)';g.lineCap='round';g.lineWidth=R(3,7);g.beginPath();g.moveTo(cx+Math.cos(a)*d0,cy+Math.sin(a)*d0);g.lineTo(cx+Math.cos(a)*d1,cy+Math.sin(a)*d1);g.stroke()}}
+    else{blob(cx-30,cy,46,.95,205);blob(cx-8,cy+6,34,.9,215);for(let k=0;k<26;k++){const a=R(-.55,.55),d=R(20,112),r=R(1.5,7)*(1-d/150);g.save();g.translate(cx-20+Math.cos(a)*d,cy+Math.sin(a)*d);g.rotate(a);g.fillStyle='rgba(255,255,255,.9)';g.beginPath();g.ellipse(0,0,r*2.6,r,0,0,7);g.fill();g.restore()}
+      for(let k=0;k<4;k++){const y=cy+R(-30,30);g.strokeStyle='rgba(255,255,255,.8)';g.lineWidth=R(2,4);g.beginPath();g.moveTo(cx-10,y);g.lineTo(cx+R(60,105),y+R(-8,8));g.stroke()}}}
+  {const [ox,oy]=org(2),cx=ox+T/2,cy=oy+T/2;const gr=g.createRadialGradient(cx,cy,0,cx,cy,T*.46);gr.addColorStop(0,'rgba(140,140,140,1)');gr.addColorStop(.45,'rgba(200,200,200,.92)');gr.addColorStop(1,'rgba(255,255,255,0)');
+    g.fillStyle=gr;g.beginPath();g.arc(cx,cy,T*.46,0,7);g.fill();for(let k=0;k<30;k++){const a=R(0,6.28),l=R(T*.28,T*.47),w=R(.03,.08);g.fillStyle=`rgba(255,255,255,${R(.35,.7)})`;g.beginPath();g.moveTo(cx+Math.cos(a-w)*T*.15,cy+Math.sin(a-w)*T*.15);g.lineTo(cx+Math.cos(a)*l,cy+Math.sin(a)*l);g.lineTo(cx+Math.cos(a+w)*T*.15,cy+Math.sin(a+w)*T*.15);g.fill()}
+    for(let k=0;k<14;k++)blob(cx+R(-60,60),cy+R(-60,60),R(6,16),.5,255)}
+  {const [ox,oy]=org(3),cx=ox+T/2,cy=oy+T/2;for(let k=0;k<7;k++)blob(cx+R(-30,30),cy+R(-30,30),R(30,58),.9,RI(205,235));g.strokeStyle='rgba(255,255,255,.95)';
+    for(let k=0;k<16;k++){g.lineWidth=R(1.2,2.6);g.beginPath();g.arc(cx+R(-48,48),cy+R(-48,48),R(3,9),0,7);g.stroke()}for(let k=0;k<12;k++){const a=R(0,6.28),d=R(70,100);drop(cx+Math.cos(a)*d,cy+Math.sin(a)*d,R(2,6),.85)}}
+},1,true);tex.wrapS=tex.wrapT=THREE.ClampToEdgeWrapping;return tex}
+function gfxDecInit(){if(GFXD.mesh)return;const g=new THREE.PlaneGeometry(1,1).rotateX(-Math.PI/2),cnt=g.attributes.position.count|0;
+  g.setAttribute('color',new THREE.Float32BufferAttribute(new Array(cnt*3).fill(1),3));GFXD.attr=new THREE.InstancedBufferAttribute(new Float32Array(GFXD.N*4),4);GFXD.attr.setUsage(THREE.DynamicDrawUsage);g.setAttribute('aDec',GFXD.attr);
+  const mat=new THREE.MeshStandardMaterial({map:gfxDecalTex(),vertexColors:true,transparent:true,depthWrite:false,polygonOffset:true,polygonOffsetFactor:-2,polygonOffsetUnits:-6,roughness:.7,metalness:0});
+  mat.onBeforeCompile=sh=>{sh.uniforms.uDT=GFXD.t;
+    sh.vertexShader='attribute vec4 aDec;\nuniform float uDT;\nvarying float vDA;\nvarying float vDGl;\n'+sh.vertexShader.replace('#include <uv_vertex>','#include <uv_vertex>\nvUv=vUv*.5+vec2(mod(aDec.x,2.),floor(aDec.x*.5+.01))*.5;\nvDGl=aDec.x>2.5?.45:0.;')
+      .replace('#include <begin_vertex>','#include <begin_vertex>\nfloat dAge=uDT-aDec.y;float dSp=max(floor(aDec.w)*.1,.04);\ntransformed.xz*=.3+.7*smoothstep(0.,dSp,dAge);\nvDA=fract(aDec.w)*smoothstep(-.01,.05,dAge)*(1.-smoothstep(aDec.z*.75,aDec.z,dAge));');
+    sh.fragmentShader='varying float vDA;\nvarying float vDGl;\n'+sh.fragmentShader.replace('#include <map_fragment>','#include <map_fragment>\ndiffuseColor.a*=vDA;').replace('#include <emissivemap_fragment>','#include <emissivemap_fragment>\ntotalEmissiveRadiance+=diffuseColor.rgb*vDGl;')};
+  mat.customProgramCacheKey=()=>'gfxDecal1';
+  const m=new THREE.InstancedMesh(g,mat,GFXD.N);m.frustumCulled=false;m.renderOrder=1;m.receiveShadow=true;m.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+  for(let i=0;i<GFXD.N;i++){m.setMatrixAt(i,GFXD.zero);m.setColorAt(i,GFXD.c.setRGB(1,1,1))}m.instanceMatrix.needsUpdate=true;if(m.instanceColor)m.instanceColor.needsUpdate=true;scene.add(m);GFXD.mesh=m}
+function gfxDecClear(){const m=GFXD.mesh;GFXD.recent.length=0;GFXD.out.length=0;GFXD.next=0;if(!m)return;for(let i=0;i<GFXD.N;i++){m.setMatrixAt(i,GFXD.zero);GFXD.attr.setXYZW(i,0,-999,0,0)}m.instanceMatrix.needsUpdate=true;GFXD.attr.needsUpdate=true}
+// decal(pos,type,size): type 'blood'|'scorch'|'acid'; size ~ diameter in metres. Aligns to the terrain slope (or lies flat on
+// floors/foundations), spreads in, fades out over ~60 s. Calls are de-duplicated and mirrored to other players.
+function decal(pos,type,size,opt){try{const T=GFXD_T[type];if(!pos||!T||GFXD.off)return;const x=+pos.x,z=+pos.z;if(!isFinite(x)||!isFinite(z))return;size=clamp(+size||1,.12,8);
+  gfxDecInit();const m=GFXD.mesh;if(!m)return;const now=GFXD.t.value,R2=.5*size+.25;
+  for(let i=GFXD.recent.length-1;i>=0;i--){const r=GFXD.recent[i];if(now-r.t>1.5)break;if(r.k===T.id&&Math.abs(r.x-x)+Math.abs(r.z-z)<R2)return}
+  const gh=groundH(x,z),py=+pos.y;let y=gh,flat=false;if(isFinite(py)&&py>gh+.4){const sh=supportH(x,z,py+.25,.05);if(sh>gh+.3){y=sh;flat=true}}if(!flat&&gh<-.2)return;
+  if(flat)GFXD.n.set(0,1,0);else{const e=Math.max(.35,size*.35);GFXD.n.set(groundH(x-e,z)-groundH(x+e,z),2*e,groundH(x,z-e)-groundH(x,z+e)).normalize()}
+  GFXD.q.setFromUnitVectors(GFXD.up,GFXD.n);GFXD.q2.setFromAxisAngle(GFXD.up,Math.random()*6.2832);GFXD.q.multiply(GFXD.q2);
+  const s=size*T.sc*R(.85,1.15),i=GFXD.next;GFXD.next=(i+1)%GFXD.N;GFXD.s.set(s,1,s);GFXD.p.set(x,y+(flat?.02:.045),z);GFXD.m4.compose(GFXD.p,GFXD.q,GFXD.s);m.setMatrixAt(i,GFXD.m4);
+  m.setColorAt(i,GFXD.c.copy(pick(T.cols)));const pool=!!(opt&&opt.pool);
+  GFXD.attr.setXYZW(i,pick(T.tiles),now,T.life,Math.floor((pool?2.6:T.spread)*10)+Math.min(.99,T.a));GFXD.attr.needsUpdate=true;m.instanceMatrix.needsUpdate=true;if(m.instanceColor)m.instanceColor.needsUpdate=true;
+  GFXD.recent.push({k:T.id,x,z,t:now});if(GFXD.recent.length>40)GFXD.recent.shift();
+  if(opt!==true&&!(opt&&opt.net)&&NET.role&&GFXD.out.length<400)GFXD.out.push(+x.toFixed(2),+y.toFixed(2),+z.toFixed(2),T.id,+(pool?-size:size).toFixed(2));
+  if(type==='blood'&&!(opt&&opt.net)&&opt!==true&&S&&P&&dist2(x,z,P.x,P.z)<12)tip('gfx_blood','Blood trails','Wounded creatures and players leave <b>blood on the ground</b>. Fresh splatter fades after about a minute, so it tells you something was hurt here recently.')}
+  catch(e){console.warn('[gfx] decal',e)}}
+function gfxBloodAt(t,size,pool){if(!t||!isFinite(+t.x))return;decal({x:t.x+R(-.25,.25),y:t.y,z:t.z+R(-.25,.25)},t.t==='z'?'iblood':'blood',size,pool?{pool:true}:undefined)}
+function gfxHitBlood(t,dmg){if(!t||typeof t!=='object'||!(dmg>0))return;const now=GFXD.t.value,last=GFXD.hitT.get(t);if(last!==undefined&&now-last<.3)return;GFXD.hitT.set(t,now);gfxBloodAt(t,clamp(.3+dmg/70,.3,.85),false)}
+try{const _dn=damageNpc;damageNpc=function(n,dmg){const was=!n||n.dead;const r=_dn.apply(this,arguments);if(!was)try{gfxHitBlood(n,dmg)}catch(e){}return r}}catch(e){}
+try{const _da=damageAnimal;damageAnimal=function(a,dmg){const was=!a||a.dead;const r=_da.apply(this,arguments);if(!was)try{gfxHitBlood(a,dmg)}catch(e){}return r}}catch(e){}
+try{if(typeof explode==='function'){const _ex=explode;explode=function(pos,radius){const r=_ex.apply(this,arguments);try{if(pos&&isFinite(+pos.x)&&isFinite(+pos.z)&&(+pos.y||0)-groundH(+pos.x,+pos.z)<2.5)decal(pos,'scorch',clamp((+radius||3)*.5,.8,4))}catch(e){}return r}}}catch(e){}
+onHook('kill',t=>{if(!t||typeof t!=='object')return;if(t.t==='npc'||t.t==='z'||(typeof ANIM!=='undefined'&&ANIM[t.t]))gfxBloodAt(t,t.t==='z'?1.25:t.t==='npc'?1.3:1.2,true)});
+onHook('hurt',(dmg,cause)=>{if(!(dmg>0)||!P||!P.alive)return;const now=GFXD.t.value,bl=cause==='bleed';if(now-GFXD.bleedT<(bl?1.4:.5))return;
+  if(bl||((cause==='infected'||cause==='npc'||cause==='animal')&&dmg>=5)){GFXD.bleedT=now;decal({x:P.x+R(-.3,.3),y:P.y,z:P.z+R(-.3,.3)},'blood',bl?R(.22,.35):clamp(.25+dmg/80,.25,.6))}});
+onHook('netMsg',m=>{if(!m||m.k!=='g_dc'||!Array.isArray(m.d))return;const d=m.d;for(let i=0;i+4<d.length&&i<500;i+=5){const tp=GFXD_IDS[d[i+3]|0],sz=+d[i+4];if(tp&&isFinite(sz))decal({x:+d[i],y:+d[i+1],z:+d[i+2]},tp,Math.abs(sz),{net:true,pool:sz<0})}});
+try{RELAY.add('g_dc')}catch(e){}
+function gfxNetTick(dt){if(!NET.role){GFXD.out.length=0;return}GFXD.outT-=dt;if(GFXD.outT>0||!GFXD.out.length)return;GFXD.outT=.15;try{netSend({k:'g_dc',d:GFXD.out.splice(0,250)})}catch(e){}}
+
+/* ---- atmosphere: embers + smoke over fires and burning creatures, mist banks in low ground at dawn and night ---- */
+const GFXE={N:84,p:[],pos:null,col:null,geo:null,pts:null,acc:0,src:[]},GFXS={N:10,p:[],acc:0},GFXM={N:12,s:[],amt:0};
+try{const dot=GFX.dot;
+  const g=GFXE.geo=new THREE.BufferGeometry();GFXE.pos=new Float32Array(GFXE.N*3);GFXE.col=new Float32Array(GFXE.N*3);g.setAttribute('position',new THREE.BufferAttribute(GFXE.pos,3));g.setAttribute('color',new THREE.BufferAttribute(GFXE.col,3));
+  GFXE.pts=new THREE.Points(g,new THREE.PointsMaterial({size:.075,map:dot,vertexColors:true,transparent:true,depthWrite:false,blending:THREE.AdditiveBlending}));GFXE.pts.frustumCulled=false;GFXE.pts.visible=false;scene.add(GFXE.pts);
+  for(let i=0;i<GFXE.N;i++)GFXE.p.push({life:0,max:1,x:0,y:0,z:0,vx:0,vy:0,vz:0,ph:0});
+  const smk=canvasTex(64,(g,s)=>{g.clearRect(0,0,s,s);for(let k=0;k<6;k++){const x=R(s*.3,s*.7),y=R(s*.3,s*.7),r=R(s*.18,s*.32),gr=g.createRadialGradient(x,y,0,x,y,r);gr.addColorStop(0,'rgba(255,255,255,.5)');gr.addColorStop(1,'rgba(255,255,255,0)');g.fillStyle=gr;g.fillRect(0,0,s,s)}});
+  for(let i=0;i<GFXS.N;i++){const sp=new THREE.Sprite(new THREE.SpriteMaterial({map:smk,transparent:true,depthWrite:false,opacity:0,color:0x8a8580}));sp.visible=false;scene.add(sp);GFXS.p.push({sp,life:0,max:1,x:0,y:0,z:0,vx:0,s0:.6,rot:0})}
+  const mst=canvasTex(128,(g,s)=>{g.clearRect(0,0,s,s);for(let k=0;k<18;k++){const x=R(s*.18,s*.82),y=R(s*.38,s*.62),r=R(s*.12,s*.3),gr=g.createRadialGradient(x,y,0,x,y,r);gr.addColorStop(0,'rgba(255,255,255,.32)');gr.addColorStop(1,'rgba(255,255,255,0)');g.fillStyle=gr;g.fillRect(0,0,s,s)}
+    g.globalCompositeOperation='destination-in';const v=g.createLinearGradient(0,0,0,s);v.addColorStop(0,'rgba(0,0,0,0)');v.addColorStop(.36,'rgba(0,0,0,1)');v.addColorStop(.6,'rgba(0,0,0,1)');v.addColorStop(.86,'rgba(0,0,0,0)');g.fillStyle=v;g.fillRect(0,0,s,s);
+    const hz=g.createLinearGradient(0,0,s,0);hz.addColorStop(0,'rgba(0,0,0,0)');hz.addColorStop(.25,'rgba(0,0,0,1)');hz.addColorStop(.75,'rgba(0,0,0,1)');hz.addColorStop(1,'rgba(0,0,0,0)');g.fillStyle=hz;g.fillRect(0,0,s,s);g.globalCompositeOperation='source-over'});
+  mst.wrapS=mst.wrapT=THREE.ClampToEdgeWrapping;
+  for(let i=0;i<GFXM.N;i++){const sp=new THREE.Sprite(new THREE.SpriteMaterial({map:mst,transparent:true,depthWrite:false,opacity:0,fog:true}));sp.visible=false;sp.renderOrder=2;scene.add(sp);GFXM.s.push({sp,on:false,a:0,op:1,ph:R(0,6.28),x:0,y:0,z:0,sx:10,sy:3})}}
+catch(e){console.warn('[gfx] atmosphere',e)}
+function gfxFireSources(){const src=GFXE.src;src.length=0;for(const d of deps)if(d.type==='campfire'&&Math.abs(d.x-P.x)<45&&Math.abs(d.z-P.z)<45&&src.length<16)src.push(d.x,(d.y||0)+.3,d.z,.26);
+  const add=L=>{if(!L||!L.length)return;for(const c of L){if(src.length>=32)break;if(c&&!c.dead&&c.st&&c.st.burn>0&&Math.abs(c.x-P.x)<35&&Math.abs(c.z-P.z)<35)src.push(c.x,(c.y||0)+.9,c.z,.35)}};
+  if(typeof zombies!=='undefined')add(zombies);add(npcs);add(animals);return src}
+function gfxEmbers(dt){if(!GFXE.pts)return;const src=gfxFireSources(),ns=src.length>>2,t=GFX.t,pos=GFXE.pos,cl=GFXE.col;GFXE.acc=Math.min(3,GFXE.acc+dt*(ns?7+ns*5:0));let k=0;
+  for(const e of GFXE.p){if(e.life<=0&&ns&&GFXE.acc>=1){GFXE.acc-=1;const j=(Math.random()*ns|0)*4,r=src[j+3];e.x=src[j]+R(-r,r);e.y=src[j+1]+R(0,.2);e.z=src[j+2]+R(-r,r);e.vx=R(-.25,.25);e.vy=R(.7,1.6);e.vz=R(-.25,.25);e.max=e.life=R(1,2.4);e.ph=R(0,6.28)}
+    if(e.life<=0)continue;e.life-=dt;e.vx+=Math.sin(t*2.7+e.ph)*dt*.9;e.vz+=Math.cos(t*2.3+e.ph*1.3)*dt*.9;e.vy+=(.35-e.vy)*dt*.4;e.x+=e.vx*dt;e.y+=e.vy*dt;e.z+=e.vz*dt;
+    const f=Math.max(0,e.life/e.max),b=f*f*(.65+.35*Math.sin(t*23+e.ph*7));pos[k*3]=e.x;pos[k*3+1]=e.y;pos[k*3+2]=e.z;cl[k*3]=3.4*b;cl[k*3+1]=1.3*b*(.6+.4*f);cl[k*3+2]=.3*b*f;k++}
+  GFXE.geo.setDrawRange(0,k);GFXE.pts.visible=k>0;if(k){GFXE.geo.attributes.position.needsUpdate=true;GFXE.geo.attributes.color.needsUpdate=true}
+  // smoke from the two nearest campfires
+  let n1=null,n2=null,d1=1e9,d2=1e9;for(const d of deps){if(d.type!=='campfire')continue;const dd=dist2(d.x,d.z,P.x,P.z);if(dd>40)continue;if(dd<d1){n2=n1;d2=d1;n1=d;d1=dd}else if(dd<d2){n2=d;d2=dd}}
+  const L=S.light!==undefined?S.light:1,fires=n2?2:n1?1:0;GFXS.acc=Math.min(2,GFXS.acc+dt*1.7*fires);
+  for(const s of GFXS.p){if(s.life<=0&&fires&&GFXS.acc>=1){GFXS.acc-=1;const f=(fires>1&&Math.random()<.5)?n2:n1;s.x=f.x+R(-.15,.15);s.y=(f.y||0)+.7;s.z=f.z+R(-.15,.15);s.vx=R(.05,.3);s.max=s.life=R(3.5,5.5);s.s0=R(.45,.75);s.rot=R(0,6.28);s.sp.material.rotation=s.rot}
+    if(s.life<=0){s.sp.visible=false;continue}s.life-=dt;const f=1-s.life/s.max;s.x+=s.vx*dt;s.y+=dt*(.85-.35*f);s.sp.position.set(s.x,s.y,s.z);const sc=s.s0+f*2.3;s.sp.scale.set(sc,sc,1);
+    s.sp.material.rotation=s.rot+f*.8;s.sp.material.opacity=Math.sin(Math.min(1,f*1.15)*Math.PI)*.2;const w=(1-f)*(1-L);s.sp.material.color.setRGB(.5*L+.3*w+.02,.49*L+.13*w+.02,.47*L+.04*w+.025);s.sp.visible=true}
+  // flicker the campfire glow sprites
+  for(const d of deps){if(d.type!=='campfire'||Math.abs(d.x-P.x)>90||Math.abs(d.z-P.z)>90)continue;const g=d.obj&&d.obj.userData&&d.obj.userData.gfxGlow;if(!g)continue;const f=1+.12*Math.sin(t*13+d.x)+.07*Math.sin(t*29+d.z);g.scale.set(.85*f,1.23*f,1)}}
+function gfxMistPlace(m){for(let k=0;k<6;k++){const a=Math.random()*6.283,r=R(14,58),x=P.x+Math.cos(a)*r,z=P.z+Math.sin(a)*r,h=groundH(x,z);if(h<-1.5||h>Math.max(5,P.y-1.2))continue;
+  m.x=x;m.z=z;m.sx=R(9,17);m.sy=R(2.4,4);m.y=Math.max(h,0)+m.sy*.34;m.op=R(.55,1);m.a=0;return true}return false}
+function gfxMist(dt,st){if(!GFXM.s.length)return;const rn=S.rain||0,dawn=st.sunT>=0?1-smooth(.015,.13,st.sunT):0,dusk=st.sunT>=0?smooth(.9,1,st.sunT)*.4:0;
+  const tgt=clamp(Math.max(dawn,dusk,st.night*.55)*(1-.5*rn),0,1)*(GFX.under>.5?0:1);GFXM.amt=lerp(GFXM.amt,tgt,Math.min(1,dt*.25));const on=GFXM.amt>.01;let tries=0;
+  if(on){const fc=scene.fog.color;GFX.c4.setRGB(fc.r*1.2+GFX.mistNight.r*st.night,fc.g*1.2+GFX.mistNight.g*st.night,fc.b*1.2+GFX.mistNight.b*st.night)}
+  for(const m of GFXM.s){if(!on){m.on=false;m.sp.visible=false;continue}const dd=Math.hypot(m.x-P.x,m.z-P.z);
+    if(!m.on||dd>72){m.on=false;m.sp.visible=false;if(tries>=2)continue;tries++;if(!gfxMistPlace(m))continue;m.on=true}
+    m.a=Math.min(1,m.a+dt*.25);m.ph+=dt*.15;m.x+=dt*.35;m.z+=Math.sin(m.ph)*dt*.2;m.sp.position.set(m.x,m.y,m.z);m.sp.scale.set(m.sx*(1+.08*Math.sin(m.ph*1.3)),m.sy,1);
+    const op=GFXM.amt*m.op*m.a*smooth(5,14,Math.hypot(m.x-P.x,m.z-P.z))*.28;m.sp.material.opacity=op;m.sp.material.color.copy(GFX.c4);m.sp.visible=op>.003}}
+onHook('newGame',()=>{try{gfxDecClear();for(const e of GFXE.p)e.life=0;for(const s of GFXS.p){s.life=0;s.sp.visible=false}for(const m of GFXM.s){m.on=false;m.sp.visible=false}GFXM.amt=0}catch(e){console.warn('[gfx] reset',e)}});
+
+/* ---- per-frame: sky/light state, fog matching, grading uniforms (runs right before the draw call) ---- */
+function gfxSunState(){const st=GFX.st,p=dayP();let D=0,sunT=-1;if(p<.66){sunT=p/.66;D=smooth(0,.1,sunT)*smooth(0,.1,1-sunT)}
+  st.p=p;st.sunT=sunT;st.D=D;st.set=sunT>=0?clamp(1-D,0,1)*smooth(0,.03,sunT)*smooth(0,.03,1-sunT):0;st.night=Math.max(0,1-D-st.set*.6);st.el=sunT>=0?Math.sin(sunT*Math.PI):-.3;return st}
+function gfxFrame(dt){GFX.t+=dt;GFXD.t.value+=dt;const st=gfxSunState(),rn=S.rain||0;
+  // keep the canvas at the display's pixel ratio (DPR can change without a resize event, e.g. moving between monitors)
+  if((GFX.dprT=(GFX.dprT||0)-dt)<=0){GFX.dprT=.5;const pr=Math.min(window.devicePixelRatio||1,2);if(Math.abs(pr-renderer.getPixelRatio())>.01){renderer.setPixelRatio(pr);renderer.setSize(innerWidth,innerHeight,false)}}
+  // sky & stars
+  const vis=st.sunT>=0?clamp(st.el*4,0,1):0,w=smooth(0,.4,st.el);skyU.uSunC.value.setRGB(1,lerp(.5,.93,w),lerp(.22,.8,w)).multiplyScalar(vis);
+  skyU.uSet.value=st.set;skyU.uDay.value=st.D;skyU.uNight.value=st.night;skyU.uExpoK.value=POSTFX.exposure/.6;
+  const uwN=camera.position.y<-.02?1:0;GFX.uwSky=lerp(GFX.uwSky||0,uwN,Math.min(1,dt*10));skyU.uUnder.value=GFX.uwSky;
+  if(GFX.uwSky>.001&&scene.fog){if(GFX.active)skyU.uUW.value.copy(scene.fog.color);else gfxTone(scene.fog.color,skyU.uUW.value)}
+  GFX.starU.uOp.value=(+stars.material.opacity||0)*(1-GFX.uwSky);GFX.starU.uT.value=(performance.now()/1000)%1000;GFX.starU.uPR.value=(+renderer.getPixelRatio()||1)*(GFX.active?GFX.scale:1);gfxSkyVerify();
+  // fog colour that blends distant terrain exactly into the horizon (only when it is still the sky-driven fog)
+  const fl=GFX.c1.copy(skyU.bot.value).convertSRGBToLinear(),f=scene.fog;
+  if(f&&f.color&&Math.abs(f.color.r-fl.r)+Math.abs(f.color.g-fl.g)+Math.abs(f.color.b-fl.b)<1e-4)gfxInvTone(fl,f.color);
+  gfxInvTone(fl,GFX.c2);gfxInvTone(GFX.c3.copy(skyU.top.value).convertSRGBToLinear(),GFX.c3);GFX.wSky.value.copy(GFX.c2).lerp(GFX.c3,.35).multiplyScalar(.9);
+  // lights: bluer, slightly brighter moonlight; stable shadows
+  moon.intensity=.105*st.night*(1-.45*rn);hemi.intensity+=.022*st.night*(1-.3*rn);hemi.color.lerp(GFX.hemiNight,st.night*.55);hemi.groundColor.copy(GFX.hemiG0).lerp(GFX.hemiGN,st.night*.7);
+  gfxShadowCfg();gfxSnapShadow();
+  // soften the ground normal map under grazing light (low sun / moon) where it reads as blotchy noise
+  if(typeof terrain!=='undefined'&&terrain&&terrain.material&&terrain.material.normalScale){const ns=.8*lerp(.4,1,smooth(.06,.45,st.el));terrain.material.normalScale.set(ns,ns)}
+  gfxEmbers(dt);gfxMist(dt,st);gfxNetTick(dt);
+  // post-processing uniforms
+  const U=GFX.U.co,k=Math.min(1,dt*3);GFX.lowHP=lerp(GFX.lowHP,P.alive&&P.hp<35?.25+.75*clamp((35-P.hp)/35,0,1):0,k);
+  let ch=0;if(typeof chaseLevel==='function'){try{const lv=+chaseLevel()||0;ch=lv>=3?(lv-2)*.055*(.65+.35*Math.sin(GFX.t*4.5)):0}catch(e){}}GFX.chase=lerp(GFX.chase,ch,k);
+  GFX.under=lerp(GFX.under,camera.position.y<-.02?1:0,Math.min(1,dt*8));GFX.dead=lerp(GFX.dead,P.alive?0:1,Math.min(1,dt*1.5));
+  const ph=(GFX.t*(1.15+GFX.lowHP*.9))%1,pulse=Math.exp(-ph*10)+(ph>.22?.6*Math.exp(-(ph-.22)*11):0),D=st.D,set=st.set,nt=st.night;
+  U.uGain.value.set(1+.03*D+.06*set-.08*nt-.02*rn,1+.005*D-.01*set-.02*nt,1-.04*D-.08*set+.09*nt+.02*rn);U.uLift.value.set(0,.003*nt,.011*nt);
+  U.uSat.value=1.08*(1+.05*D)*(1-.16*nt)*(1-.32*rn)*(1-.7*GFX.lowHP)*(1-.8*GFX.dead);U.uCon.value=1.05*(1-.05*rn)+.04*GFX.lowHP;
+  U.uLowHP.value=GFX.lowHP;U.uPulse.value=Math.min(1,pulse);U.uChase.value=GFX.chase;U.uUnder.value=GFX.under;U.uDead.value=GFX.dead;U.uTime.value=GFX.t%1000;
+  U.uCA.value=POSTFX.quality==='low'?.006:.012;U.uVig.value=.3+.15*GFX.under;U.uGrain.value=.028;U.uAspect.value=camera.aspect||1;GFX.U.mk.uAspect.value=camera.aspect||1;
+  // sun position on screen for rays & glare
+  const sd=skyU.sunDir.value;camera.getWorldDirection(GFX.fwd);const dp=GFX.fwd.dot(sd);GFX.sunV.copy(camera.position).addScaledVector(sd,500).project(camera);
+  const sx=GFX.sunV.x*.5+.5,sy=GFX.sunV.y*.5+.5;U.uSun.value.set(sx,sy);GFX.U.mk.uSun.value.set(sx,sy);GFX.U.ry.uSun.value.set(sx,sy);
+  const sc=skyU.uSunC.value,sl=Math.max(sc.r,sc.g,sc.b),sv=sl*(1-rn)*(1-GFX.under)*smooth(.05,.65,dp)*(P.alive?1:.5);
+  GFX.rayI=sv*.6;U.uGlare.value=Math.pow(Math.max(0,dp),6)*sv*.3;if(sl>0)U.uRayCol.value.setRGB(sc.r/sl,sc.g/sl,sc.b/sl)}
+onHook('render',gfxFrame);
 
 /* ================= RENDER ================= */
 const tmpC=new THREE.Color(),tmpC2=new THREE.Color();
@@ -4017,7 +4428,7 @@ function render(dt){
   S.light=clamp(.12+.88*Math.max(D,set*.6)+(torchOn()?.25:0),0,1);
   if(npcFlashT>0){npcFlashT-=dt;if(npcFlashT<=0)npcFlash.intensity=0}
   updateRain(dt);updateFireflies(dt);updateMotes(dt);updateNearGrass();ambUpdate(dt);updateVM(dt);updateGhost();updateScreenFX();
-  runHook('render',dt);/*RENDER_CALL*/renderer.render(scene,camera);/*RENDER_CALL_END*/updateHud()}
+  runHook('render',dt);/*RENDER_CALL*/gfxRender(dt);/*RENDER_CALL_END*/updateHud()}
 
 /* ================= HUD ================= */
 let lastInfo='',hudT=0;
