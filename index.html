@@ -7791,6 +7791,751 @@ function evDebug(what){if(!S||NET.role==='client')return'host/solo only';const L
   if(what==='dawn'){if(!EV.red)return'no Red Moon';S.time=evDawn(EV.redNi)+.5;return'skipped to dawn'}
   return'usage: evDebug("red"|"storm"|"bolt"|"crash"|"dawn")'}
 
+/* ================= BASE DEFENSE AND TRADER CAMP ================= */
+// Tower-defense-lite base defenses and Haven Camp (second-wave module "defense").
+// · Deployables (recipes in 'Defenses'): Spike Barricade, Shock Fence, Flame Trap, Auto Turret. The host (or solo player)
+//   simulates every trap in 'worldTick' - its own deps plus the traps other players list in NET.builds - while clients mirror
+//   trap state from the snapshot (m.dtr) and replay effects from batched 'd_fx' messages. Owners manage their traps with E.
+// · Haven Camp: a fortified survivor camp placed deterministically from the terrain (static geometry built once in
+//   buildTerrain, mon:1 collision boxes re-pushed every new game). Inside the safe zone hostiles lose interest and are pushed
+//   out, two tower guards shoot anything that follows you in, and Mags the trader, a recycler, a workbench, water and a fire
+//   are there for everyone.
+// Public API (cross-module contract): CAMP {name,x,z,r,y,ready} · safeZone(x,z) · turret damage source {t:'turret',name,x,z,trap}, other traps {t:'df_trap',...} · deployable types 'spike_trap','shock_fence',
+//   'flame_trap','auto_turret' · network kinds 'd_fx' (host->all), 'd_set','d_fuel','d_bat','d_rep' (owner->host), 'd_brk' (host->owner).
+var CAMP={name:'Haven Camp',x:0,z:0,r:45,y:0,ready:false};
+function safeZone(x,z){return !!(CAMP&&CAMP.ready)&&Math.hypot(x-CAMP.x,z-CAMP.z)<CAMP.r}
+
+/* ---- data & state ---- */
+const DF_TYPES={
+ spike_trap:{n:'Spike Barricade',max:500,rep:{wood:50},repAmt:.4,mm:'#d0a26a',dcol:'#7a5634'},
+ shock_fence:{n:'Shock Fence',max:300,rep:{metal_frag:25},repAmt:.5,mm:'#f0d84a',dcol:'#6a7076'},
+ flame_trap:{n:'Flame Trap',max:260,rep:{metal_frag:25},repAmt:.5,mm:'#ff7a3a',dcol:'#a3301f'},
+ auto_turret:{n:'Auto Turret',max:420,rep:{metal_frag:50},repAmt:.5,mm:'#7fd0ff',dcol:'#4a5056'}};
+const DF_T=new Set(Object.keys(DF_TYPES));
+const DF_RINGS=[[0,1],[12,8],[24,12],[36,16],[46,16]];
+const DF={list:[],rs:{},cs:{},rmesh:{},vis:[],visT:0,colT:0,frame:0,fxq:[],fxT:0,pend:{},flames:{},shake:{},snapN:0,
+ guards:[],gsrc:[],trader:null,traderPos:null,boxes:[],inter:[],built:false,flat:null,towers:[],beams:[],campG:null,flag:null,fireSpr:[],gen:null,
+ genPos:null,firePos:null,fireDep:null,wbPos:null,respPt:null,recProto:null,hum:null,crackT:0,hammerT:5,smokeT:0,roarT:0,emberT:0,wasIn:false,banT:0,
+ hudN:0,statOn:0,aim:null,panelDep:null,say:'',H:[],foeTmp:[],fp:[],arcs:[],trs:[],trS:null,gTipT:0};
+const dfMe=()=>NET.myId||'me';
+const dfR2=v=>+(+v).toFixed(2);
+const dfKey=(o,t,x,z)=>o+'|'+t+'|'+dfR2(x)+'|'+dfR2(z);
+const dfKeyOfDep=d=>dfKey(dfMe(),d.type,d.x,d.z);
+function dfAng(a){a=(a+Math.PI)%(Math.PI*2);if(a<0)a+=Math.PI*2;return a-Math.PI}
+const dfTurn=(a,b,k)=>dfAng(a+clamp(dfAng(b-a),-k,k));
+const dfAlive=c=>!!c&&!c.dead&&!c.rm&&!(c.hp<=0);
+const dfTH=c=>c.ph||(c.t==='npc'?1.85:c.t==='z'?1.75:1);
+const dfCostTxt=c=>Object.entries(c).map(([k,v])=>v+' '+(ITEMS[k]?ITEMS[k].n:k)).join(', ');
+const dfNight=()=>1-clamp((S&&S.dayF!==undefined?S.dayF:1)*1.6,0,1);
+
+/* ---- items, recipes, deployables, look-at cards, prompts ---- */
+const DF_COST={
+ spike_trap:ITEMS.nails?{wood:300,nails:10}:{wood:300,metal_frag:25},
+ shock_fence:ITEMS.battery?{battery:1,metal_frag:100}:{metal_frag:100,scrap:20},
+ flame_trap:{lgf:50,metal_pipe:2},
+ auto_turret:{metal_frag:400,gears:2,metal_pipe:2}};
+Object.assign(ITEMS,{
+ spike_trap:{n:'Spike Barricade',c:'#8d6a3e',cat:'Defense',hot:1,dep:'spike_trap',d:'A low frame of sharpened stakes, nails and barbed wire. Anything hostile that crosses it is slowed to a crawl and cut up.',f:'Craft: '+dfCostTxt(DF_COST.spike_trap)+' (Defenses).',u:'Place it across a path into your base. Infected, wolves, boars and hostile players crossing it move at a third of their speed and take 25 damage per second. It wears down as it works: press E on it to repair it.'},
+ shock_fence:{n:'Shock Fence',c:'#d9b23a',cat:'Defense',hot:1,dep:'shock_fence',d:'A 3 m charged wire fence on a battery charger. Zaps and stuns anything hostile that comes within a metre.',f:'Craft: '+dfCostTxt(DF_COST.shock_fence)+' (Defenses).',u:'Place it along a wall or across a gap. Every zap uses 20% of its charge; the charger refills slowly on its own'+(ITEMS.battery?', or instantly with a Battery (press E).':'.')},
+ flame_trap:{n:'Flame Trap',c:'#c8502a',cat:'Defense',hot:1,dep:'flame_trap',d:'A pressurised fuel tank with a nozzle. When something hostile walks into its cone it fires a 3-second jet of flame.',f:'Craft: '+dfCostTxt(DF_COST.flame_trap)+' (Defenses).',u:'Place it facing the way enemies will come: it fires where you were looking. Each burst burns 10 fuel from its 100-unit tank. Press E to refill it with Low Grade Fuel.'},
+ auto_turret:{n:'Auto Turret',c:'#6f7a84',cat:'Defense',hot:1,dep:'auto_turret',d:'A motorised gun turret. Tracks and shoots the nearest hostile it can see within 30 m. Never targets players.',f:'Craft: '+dfCostTxt(DF_COST.auto_turret)+' (Defenses).',u:'Place it with a clear view. Press E to switch it on or off and to repair it. Real Rust turrets need electricity, ammo and building privilege; on the training island it runs on an internal battery with unlimited ammo.'}});
+Object.assign(DEPS,{spike_trap:{size:[2.5,.9,1.6]},shock_fence:{size:[3,1.35,.35]},flame_trap:{size:[.9,1.1,.9],solid:1},auto_turret:{size:[.9,1.2,.9],solid:1}});
+{const i=RECIPES.findIndex(r=>r.wb);RECIPES.splice(i<0?RECIPES.length:i,0,
+  {id:'spike_trap',cost:DF_COST.spike_trap,time:20,cat:'Defenses'},{id:'shock_fence',cost:DF_COST.shock_fence,time:25,cat:'Defenses'},
+  {id:'flame_trap',cost:DF_COST.flame_trap,time:30,cat:'Defenses'},{id:'auto_turret',cost:DF_COST.auto_turret,time:45,cat:'Defenses'})}
+Object.assign(INFO,{
+ spike_trap:{k:'Defense',t:'Spike Barricade',d:'Hostiles that cross it are slowed to a third of their speed and take 25 damage per second.',rows:[['Wear','Loses durability while it works. E: repair (50 wood) or pick up.'],['Tip','Put it where enemies must cross, in front of a turret.']],g:'dftraps'},
+ shock_fence:{k:'Defense',t:'Shock Fence',d:'Zaps anything hostile within a metre of the wire: damage plus a short stun.',rows:[['Charge','20% per zap, refills on its own'+(ITEMS.battery?' or instantly with a Battery':'')],['Tip','Line it up with gaps and doorways.']],g:'dftraps'},
+ flame_trap:{k:'Defense',t:'Flame Trap',d:'Fires a 3-second jet of flame at hostiles in front of the nozzle and sets them alight.',rows:[['Fuel','10 per burst from a 100-unit tank. E: refill with Low Grade Fuel.'],['Aim','It faces the way you looked when you placed it.']],g:'dftraps'},
+ auto_turret:{k:'Defense',t:'Auto Turret',d:'Tracks and shoots hostiles within 30 m that it can see. Never targets players.',rows:[['Training','Runs on an internal battery with unlimited ammo. Real Rust turrets need power, ammo and TC authorisation.'],['Careful','Loud: gunfire draws the infected. They and hostile players fight back.']],g:'dftraps'},
+ trader:{k:'Haven Camp',t:'Mags - Trader',d:'Buys and sells for scrap. Stock and buying limits refresh every morning.',rows:[['Sells','Bandages, ammo, fuel, food and scavenged supplies'],['Buys','Fish, wool, milk, materials and components']],g:'dftraps'},
+ df_wb:{k:'Haven Camp',t:'Camp Workbench',d:'Counts as a Workbench Level 1 while you stand next to it. E opens the tech tree.',rows:[['Free to use','Shared by everyone in the camp.']],g:'progression'}});
+{const DYN={
+  spike_trap:s=>s&&s.hp<s.max-1?'Repair / pick up barricade':'Inspect barricade',
+  shock_fence:s=>'Shock fence · '+(s?Math.round(s.charge):100)+'% charge',
+  flame_trap:s=>'Refuel flame trap · '+(s?Math.floor(s.fuel):0)+'/100',
+  auto_turret:s=>'Turret controls · '+(s&&s.on===false?'OFFLINE':'ONLINE')};
+ for(const k in DYN)Object.defineProperty(PROMPTS,k,{get(){let s=null;try{s=DF.aim&&DF.aim.type===k?dfStateOf(DF.aim):null}catch(e){s=null}return DYN[k](s)},enumerable:true,configurable:true})}
+PROMPTS.trader='Trade';PROMPTS.df_wb='Workbench';
+KITS.dfguard={cloth:'#55603f',pants:'#3b3a33',hat:'#6b5a3a',range:40,name:'Camp Rifle',armor:1};
+if(typeof GUIDE!=='undefined'&&Array.isArray(GUIDE)&&!GUIDE.some(g=>g&&g.id==='dftraps'))GUIDE.push({id:'dftraps',t:'Traps, Turrets & Haven Camp',h:`<h2>Traps, Turrets &amp; Haven Camp</h2><p class="lead">Defend what you build, and know where you can rest.</p>
+<h3>Base defenses</h3><p>Craft them under <b>Defenses</b> (Tab). Place them like any deployable; look at one and press <b>E</b> to manage it. They only ever hurt hostiles: the infected, hostile players, wolves and boars.</p>
+<table><tr><th>Defense</th><th>What it does</th><th>Upkeep</th></tr>
+<tr><td><b>Spike Barricade</b></td><td>Slows anything crossing it to a third of its speed; 25 damage per second.</td><td>Wears down while it works. Repair with wood.</td></tr>
+<tr><td><b>Shock Fence</b></td><td>3 m wire. Zaps and stuns hostiles within 1 m.</td><td>20% charge per zap; recharges by itself.</td></tr>
+<tr><td><b>Flame Trap</b></td><td>3-second flame jet at anything in front of it. Sets targets on fire.</td><td>10 fuel per burst, 100-unit tank. Refill with Low Grade Fuel.</td></tr>
+<tr><td><b>Auto Turret</b></td><td>Tracks and shoots the nearest visible hostile within 30 m.</td><td>Repair with metal fragments. Switch it off when you don't need it.</td></tr></table>
+<div class="box">Layer them: spikes hold attackers in place, the fence and flames punish the crowd, the turret picks them off. Gunfire is loud and draws more of the infected, and anything a defense hurts may turn and attack it.</div>
+<div class="box r">Real Rust: auto turrets need electricity, ammunition and building privilege, and they shoot players who aren't authorised on your Tool Cupboard. The training island simplifies that so you can learn layouts safely.</div>
+<h3>Haven Camp</h3><p>A fortified survivor camp between the western wilds and the eastern ruins (map: green tent). Inside its safe zone:</p><ul>
+<li>Hostiles lose interest and are pushed back out; two guards on the watchtowers shoot anything that follows you.</li>
+<li><b>Mags</b> trades for scrap: bandages, ammo, fuel and food, and buys fish, wool, milk, materials and components. Stock refreshes every morning.</li>
+<li>A <b>recycler</b>, a free <b>workbench</b> (counts as Workbench Level 1), fresh water and a campfire to cook and warm up.</li>
+<li>Once you've found it you can respawn there after death (3-minute cooldown).</li>
+<li>No building inside the camp or right next to it.</li></ul>`});
+
+/* ---- shared materials & geometry helpers ---- */
+const DFM={st_on:new THREE.MeshBasicMaterial({color:0x58ff7a}),st_off:new THREE.MeshBasicMaterial({color:0xff3b2a}),st_warn:new THREE.MeshBasicMaterial({color:0xffb030}),
+ bulb:new THREE.MeshBasicMaterial({color:0xffffff}),lens:M('#101418',{roughness:.15,metalness:.6}),
+ pilot:new THREE.SpriteMaterial({map:fireTex,transparent:true,depthWrite:false,blending:THREE.AdditiveBlending,color:0xbfd8ff}),
+ beam:new THREE.MeshBasicMaterial({color:0xfff0c8,transparent:true,opacity:0,blending:THREE.AdditiveBlending,depthWrite:false,side:THREE.DoubleSide}),
+ gun:M('#2a2b2d',{metalness:.6,roughness:.4}),stock:M('#4a3220',{roughness:.8})};
+const DFG={};const dfG=(k,f)=>DFG[k]||(DFG[k]=f());
+const DF_UP=new V3(0,1,0);
+// merged vertex-coloured part list (one draw call per model)
+function dfP(){const a=[];const o={a,
+ box(w,h,d,c,x,y,z,rx,ry,rz,j){a.push({g:dfG('b',()=>new THREE.BoxGeometry(1,1,1)),c,p:[x,y,z],r:[rx||0,ry||0,rz||0],s:[w,h,d],j:j===undefined?.1:j});return o},
+ cyl(r,h,c,x,y,z,rx,ry,rz,seg,tp,j){const s=seg||8,t=tp===undefined?1:tp;a.push({g:dfG('c'+s+'_'+t,()=>new THREE.CylinderGeometry(t,1,1,s)),c,p:[x,y,z],r:[rx||0,ry||0,rz||0],s:[r,h,r],j:j===undefined?.08:j});return o},
+ cone(r,h,c,x,y,z,rx,ry,rz,seg){const s=seg||6;a.push({g:dfG('k'+s,()=>new THREE.ConeGeometry(1,1,s)),c,p:[x,y,z],r:[rx||0,ry||0,rz||0],s:[r,h,r],j:.08});return o},
+ ico(sx,sy,sz,c,x,y,z,ry,j){a.push({g:dfG('i',()=>new THREE.IcosahedronGeometry(1,0)),c,p:[x,y,z],r:[0,ry||0,0],s:[sx,sy,sz],j:j===undefined?.15:j});return o},
+ dode(s,c,x,y,z){a.push({g:dfG('d',()=>new THREE.DodecahedronGeometry(1,0)),c,p:[x,y,z],r:[R(0,3),R(0,3),0],s:[s,s*.7,s],j:.2});return o},
+ prism(w,len,h,c,x,y,z,ry,j){a.push({g:dfG('pr',()=>new THREE.CylinderGeometry(1,1,1,3)),c,p:[x,y+h/3,z],r:[-Math.PI/2,ry||0,0],s:[w/1.732,len,h/1.5],j:j===undefined?.06:j});return o},
+ stick(ax,ay,az,bx,by,bz,r,c,seg){const dx=bx-ax,dy=by-ay,dz=bz-az,L=Math.hypot(dx,dy,dz)||1e-3;const q=new THREE.Quaternion().setFromUnitVectors(DF_UP,new V3(dx/L,dy/L,dz/L));const e=new THREE.Euler().setFromQuaternion(q);
+   const s=seg||6;a.push({g:dfG('c'+s+'_1',()=>new THREE.CylinderGeometry(1,1,1,s)),c,p:[(ax+bx)/2,(ay+by)/2,(az+bz)/2],r:[e.x,e.y,e.z],s:[r,L,r],j:.08});return o},
+ geo(){return buildGeo(a)}};return o}
+
+/* ---- trap models (local frame: origin on the ground, front = -Z) ---- */
+function dfGeoSpike(){const p=dfP(),W='#6e4a2a',W2='#8a6038',MT='#8c9297',RU='#8a4a2a';
+ p.cyl(.09,2.6,W,0,.1,-.3,0,0,Math.PI/2,7).cyl(.09,2.6,W,0,.1,.3,0,0,Math.PI/2,7).cyl(.06,2.5,W2,0,.42,0,0,0,Math.PI/2,6);
+ for(const x of[-1.05,-.35,.35,1.05]){p.stick(x,0,-.55,x,.85,.55,.05,W2,5);p.stick(x,0,.55,x,.85,-.55,.05,W2,5)}
+ for(let i=0;i<7;i++){const x=-1.1+i*.3667;for(const s of[-1,1]){const bx=x,by=.12,bz=s*.25,tx=x+R(-.06,.06),ty=.78+R(-.05,.05),tz=s*.8;p.stick(bx,by,bz,tx,ty,tz,.035,W2,5);
+   const L=Math.hypot(tx-bx,ty-by,tz-bz);p.stick(tx,ty,tz,tx+(tx-bx)/L*.15,ty+(ty-by)/L*.15,tz+(tz-bz)/L*.15,.02,MT,4)}}
+ for(let i=0;i<16;i++){const x0=-1.2+i*.15;p.stick(x0,.84+(i%2)*.06,i%2?.06:-.06,x0+.15,.84+((i+1)%2)*.06,(i+1)%2?.06:-.06,.008,MT,3)}
+ p.box(.42,.26,.03,RU,-.7,.42,-.03,0,0,.2).box(.36,.22,.03,MT,.55,.38,.03,0,0,-.15);
+ for(let i=0;i<12;i++)p.box(.025,.025,.025,'#2a2a2a',R(-1.1,1.1),R(.3,.6),R(-.12,.12));
+ return p.geo()}
+function dfGeoShock(){const p=dfP(),MT='#5d646b',CN='#7b7973',IN='#e8e2d4',WI='#b8bec4',BX='#2f3a2e',YL='#e2c13a',BK='#1c1c1c';
+ for(const x of[-1.45,0,1.45]){const w=x===0?.07:.1;p.box(w,1.45,w,MT,x,.72,0).box(.3,.12,.3,CN,x,.06,0);for(const y of[.3,.62,.94,1.26])p.cyl(.03,.07,IN,x,y,-.06,Math.PI/2,0,0,6)}
+ for(const y of[.3,.62,.94,1.26])p.box(2.9,.014,.014,WI,0,y,-.1,0,0,0,.02);
+ p.box(.36,.32,.24,BX,1.2,.2,.22).box(.37,.05,.25,YL,1.2,.3,.22).box(.06,.2,.06,'#3a3a3a',1.32,.45,.22).stick(1.2,.36,.22,1.42,.94,-.06,.012,BK,4);
+ p.box(.34,.34,.02,YL,-.72,.78,-.12).box(.06,.15,.025,BK,-.7,.83,-.135,0,0,.5).box(.06,.15,.025,BK,-.74,.71,-.135,0,0,.5);
+ return p.geo()}
+function dfGeoFlame(){const p=dfP(),BS='#34373a',RD='#a3301f',RD2='#7e2416',MT='#6e757b',BR='#b08a3a',YL='#d9b23a',BK='#1a1a1a',WH='#e8e4da',HP=Math.PI/2;
+ p.box(.86,.08,.86,BS,0,.04,0);for(let i=0;i<6;i++)p.box(.12,.02,.05,i%2?YL:BK,-.36+i*.144,.09,-.39);
+ p.box(.08,.22,.5,MT,-.24,.19,.05).box(.08,.22,.5,MT,.24,.19,.05);
+ p.cyl(.24,.66,RD,0,.42,.05,0,0,HP,12).cyl(.245,.04,RD2,-.3,.42,.05,0,0,HP,12).cyl(.245,.04,RD2,.3,.42,.05,0,0,HP,12).cyl(.248,.06,WH,0,.42,.05,0,0,HP,12);
+ p.cyl(.07,.05,WH,.12,.69,.05,0,0,0,10).cyl(.075,.02,BK,.12,.665,.05,0,0,0,10);
+ p.cyl(.035,.42,MT,-.1,.82,-.12,0,0,0,6).cyl(.035,.32,MT,-.1,1.0,-.27,HP,0,0,6);
+ p.cyl(.06,.2,BK,-.1,1.0,-.48,-HP,0,0,8,.75).cyl(.045,.05,BR,-.1,1.0,-.6,-HP,0,0,8).box(.05,.05,.08,'#c8c8c8',-.1,.93,-.52);
+ return p.geo()}
+function dfGeoTBase(){const p=dfP(),DK='#33373b',MD='#4a5056',YL='#d9b23a',BK='#1a1a1a';
+ p.cyl(.36,.12,DK,0,.06,0,0,0,0,8).cyl(.22,.5,MD,0,.36,0,0,0,0,8,.85).cyl(.27,.08,DK,0,.62,0,0,0,0,10);
+ for(let i=0;i<3;i++){const a=i*2.094;p.stick(Math.sin(a)*.18,.42,Math.cos(a)*.18,Math.sin(a)*.44,.02,Math.cos(a)*.44,.04,DK,5)}
+ p.box(.26,.2,.18,'#2b3a2b',.34,.1,.22).box(.27,.04,.19,YL,.34,.18,.22).stick(.3,.12,.15,.12,.3,.08,.015,BK,4);
+ return p.geo()}
+function dfGeoTHead(){const p=dfP(),AR='#5b636b',AR2='#46505a',DK='#24272a',YL='#d9b23a';
+ p.box(.46,.3,.5,AR,0,.17,0).box(.48,.06,.52,AR2,0,.33,0).box(.44,.18,.06,AR2,0,.2,-.27,-.35,0,0);
+ p.box(.14,.22,.3,DK,.3,.15,.02).box(.15,.03,.31,YL,.3,.27,.02).cyl(.075,.09,DK,.12,.38,-.12,0,0,0,10).stick(-.16,.33,.18,-.2,.74,.24,.008,'#222',3);
+ return p.geo()}
+function dfGeoTGun(){const p=dfP(),DK='#202224',MT='#3c4146',HP=Math.PI/2;
+ p.box(.12,.12,.26,MT,0,0,-.08).cyl(.03,.45,DK,0,.01,-.4,-HP,0,0,8).cyl(.045,.1,DK,0,.01,-.64,-HP,0,0,8).cyl(.04,.22,MT,0,-.065,-.3,-HP,0,0,6);
+ return p.geo()}
+const dfTG=k=>dfG('t_'+k,()=>({spike:dfGeoSpike,shock:dfGeoShock,flame:dfGeoFlame,tb:dfGeoTBase,th:dfGeoTHead,tg:dfGeoTGun})[k]());
+const dfLedGeo=()=>dfG('led',()=>new THREE.BoxGeometry(.04,.04,.04));
+function dfTrapMesh(type){const g=new THREE.Group();const u=g.userData;
+ if(type==='spike_trap')g.add(new THREE.Mesh(dfTG('spike'),MAT.vc));
+ else if(type==='shock_fence'){g.add(new THREE.Mesh(dfTG('shock'),MAT.vc));const led=new THREE.Mesh(dfLedGeo(),DFM.st_on);led.position.set(1.12,.43,.1);g.add(led);u.led=led}
+ else if(type==='flame_trap'){g.add(new THREE.Mesh(dfTG('flame'),MAT.vc));const pf=new THREE.Sprite(DFM.pilot);pf.scale.set(.1,.15,1);pf.position.set(-.1,1.0,-.67);g.add(pf);u.pilot=pf}
+ else{g.add(new THREE.Mesh(dfTG('tb'),MAT.vc));const head=new THREE.Group();head.position.y=.66;g.add(head);head.add(new THREE.Mesh(dfTG('th'),MAT.vc));
+   const gun=new THREE.Group();gun.position.set(-.06,.17,-.22);head.add(gun);gun.add(new THREE.Mesh(dfTG('tg'),MAT.vc));
+   const lens=new THREE.Mesh(dfG('lens',()=>new THREE.CylinderGeometry(.045,.045,.03,10)),DFM.lens);lens.rotation.x=Math.PI/2;lens.position.set(.12,.38,-.2);head.add(lens);
+   const led=new THREE.Mesh(dfLedGeo(),DFM.st_on);led.position.set(.21,.37,-.2);head.add(led);u.head=head;u.gun=gun;u.led=led}
+ u.dfType=type;return shadowAll(g)}
+{const _dfDepMesh=depMesh;depMesh=function(type){return DF_T.has(type)?dfTrapMesh(type):_dfDepMesh.apply(this,arguments)}}
+// viewmodel: a miniature of the trap in the hand (same root/g/arm/item structure as core vmFor)
+{const _dfVmFor=vmFor;vmFor=function(id){const it=ITEMS[id];if(!it||!DF_T.has(it.dep)||vmCache[id])return _dfVmFor.apply(this,arguments);
+  const root=new THREE.Group(),g=new THREE.Group();g.position.z=-.25;root.add(g);g.add(armMesh());const itg=new THREE.Group();itg.position.set(0,0,-.06);g.add(itg);
+  const mini=dfTrapMesh(it.dep);mini.scale.setScalar({spike_trap:.085,shock_fence:.075,flame_trap:.15,auto_turret:.15}[it.dep]);mini.position.set(0,-.03,-.1);mini.rotation.set(.35,.6,0);itg.add(mini);
+  shadowAll(root,false,false);vmCache[id]=root;return root}}
+
+/* ---- trap state ---- */
+function dfNewState(type,x,y,z,ry,owner,key,dep){const T=DF_TYPES[type];const st={key,owner,type,x,y,z,ry:+ry||0,hp:T.max,max:T.max,charge:100,fuel:type==='flame_trap'?40:0,on:true,cd:0,
+  yaw:dfAng((+ry||0)+Math.PI),pitch:0,tgt:null,scanT:R(0,.3),fireT:0,trigT:0,active:0,dmgT:0,kills:0,dep,broken:false,noiseT:0,fxT:0};
+ const nm=owner===dfMe()?T.n:(NET.names[owner]||'Friend')+'\'s '+T.n;
+ st.src={t:type==='auto_turret'?'turret':'df_trap',name:nm,x,y:y+.5,z,yaw:0,speed:0,dead:false,eyeH:type==='auto_turret'?.9:.6,hostileToNpc:type==='auto_turret',trap:st};return st}
+function dfMirror(key,type){type=type||key.split('|')[1];const T=DF_TYPES[type]||DF_TYPES.spike_trap;return{key,type,max:T.max,hp:T.max,charge:100,fuel:type==='flame_trap'?40:0,on:true,yaw:undefined,pitch:0,act:0,kills:0,synced:0}}
+// host/solo: the authoritative state lives on the dep (d.tr); clients read the snapshot mirror
+function dfStateOf(d){if(NET.role!=='client')return d.tr||(d.tr=dfNewState(d.type,d.x,d.y,d.z,d.obj?d.obj.rotation.y:0,dfMe(),dfKeyOfDep(d),d));
+ const k=dfKeyOfDep(d);return DF.cs[k]||(DF.cs[k]=dfMirror(k,d.type))}
+function dfCollect(){const L=[];
+ for(const d of deps)if(DF_T.has(d.type)){const st=dfStateOf(d);st.dep=d;st.x=d.x;st.y=d.y;st.z=d.z;if(!st.broken)L.push(st)}
+ if(NET.role==='host'){const seen={};for(const owner in NET.builds){if(owner===NET.myId)continue;const b=NET.builds[owner];if(!b||!Array.isArray(b.deps))continue;
+   for(const dp of b.deps){if(!dp||!DF_T.has(dp.type))continue;const key=dfKey(owner,dp.type,dp.x,dp.z);seen[key]=1;let st=DF.rs[key];
+     if(!st){st=DF.rs[key]=dfNewState(dp.type,+dp.x,+dp.y,+dp.z,+dp.r||0,owner,key,null);const pl=DF.pend[key];if(pl){for(const m of pl)dfApplyOp(st,m);delete DF.pend[key]}}
+     if(!st.broken)L.push(st)}}
+  for(const k in DF.rs)if(!seen[k])delete DF.rs[k]}
+ DF.list=L}
+function dfApplyOp(st,m){if(m.k==='d_set')st.on=!!m.on;else if(m.k==='d_fuel')st.fuel=clamp(st.fuel+(+m.n||0),0,100);else if(m.k==='d_bat')st.charge=100;else if(m.k==='d_rep')st.hp=clamp(st.hp+(+m.n||0),0,st.max)}
+
+/* ---- placement: no building in the camp, set up new traps ---- */
+function dfNoBuild(x,z){return CAMP.ready&&dist2(x,z,CAMP.x,CAMP.z)<CAMP.r+15}
+{const _dfPlanDep=planDep;planDep=function(id){const r=_dfPlanDep.apply(this,arguments);if(r&&r.ok&&r.point&&dfNoBuild(r.point.x,r.point.z))return{ok:false,point:r.point,reason:'Building blocked ('+CAMP.name+' safe zone)'};return r}}
+{const _dfPlanPiece=planPiece;planPiece=function(){const r=_dfPlanPiece.apply(this,arguments);if(r&&r.ok){let x,z;if(r.gx!==undefined){x=r.gx*3+1.5;z=r.gz*3+1.5}else if(r.key){const b=wallBox(r.key);x=(b.minx+b.maxx)/2;z=(b.minz+b.maxz)/2}
+  if(x!==undefined&&dfNoBuild(x,z))return Object.assign({},r,{ok:false,reason:'Building blocked ('+CAMP.name+' safe zone)'})}return r}}
+{const _dfPlaceDep=placeDep;placeDep=function(id){const n=deps.length;const res=_dfPlaceDep.apply(this,arguments);const it=ITEMS[id];
+  if(it&&DF_T.has(it.dep)&&deps.length>n){const d=deps[deps.length-1];if(d&&d.type===it.dep)dfOnPlaced(d)}return res}}
+const DF_PTIPS={
+ spike_trap:['dfspike','Spike Barricade','Anything hostile that crosses it is slowed to a third of its speed and cut for <b>25 damage per second</b>. It wears down as it works: press <b>E</b> on it to repair it with wood. Spikes hold attackers in place for your other defenses.'],
+ shock_fence:['dfshock','Shock Fence','Zaps and stuns anything hostile within a metre of the wire. Each zap uses 20% of the charge, which refills slowly on its own'+(ITEMS.battery?' (or press <b>E</b> and insert a Battery)':'')+'. Line it up with gaps and doorways.'],
+ flame_trap:['dfflame','Flame Trap','It fires a 3-second jet of flame at hostiles <b>in front of the nozzle</b> (the way you were looking). Each burst burns 10 of its 100 fuel: press <b>E</b> to refill it with Low Grade Fuel.'],
+ auto_turret:['dfturret','Auto Turret','It tracks and shoots the nearest hostile it can see within 30 m and <b>never targets players</b>. Gunfire is loud and draws the infected, and anything it shoots may come for it: keep it repaired (E). Real Rust turrets need electricity, ammo and TC authorisation; here it runs on an internal battery.']};
+function dfOnPlaced(d){dfStateOf(d);DF.colT=0;DF.visT=0;burst(new V3(d.x,d.y+.15,d.z),CHIP.dirt,10,2,1.4);const t=DF_PTIPS[d.type];if(t)tip(t[0],t[1],t[2])}
+
+/* ---- Haven Camp site: deterministic search + terrain flattening ---- */
+function dfFindSite(){const R0=CAMP.r;let best=null;
+ const town=(typeof TOWN!=='undefined'&&TOWN&&isFinite(TOWN.cx)&&isFinite(TOWN.cz))?TOWN:null;
+ const pois=(typeof POIS!=='undefined'&&Array.isArray(POIS))?POIS:[];const inT=typeof inTown==='function'?inTown:null;
+ const ev=(x,z,strict)=>{const m=60;if(x<m+R0||z<m+R0||x>WS-m-R0||z>WS-m-R0)return null;if(inMon(x,z,R0+45)||inLake(x,z,R0+30)||Math.abs(x-ROAD_X)<R0+20)return null;
+   if(strict){if(inT){try{if(inT(x,z,R0+70))return null}catch(e){}}for(const q of pois)if(q&&isFinite(q.x)&&dist2(x,z,q.x,q.z)<(q.r||30)+R0+30)return null}
+   const hs=[];for(const [rr,n] of DF_RINGS)for(let i=0;i<n;i++){const a=i/n*6.2832;const h=groundH(x+Math.sin(a)*rr,z+Math.cos(a)*rr);if(!(h>3.2))return null;if(rr<=36)hs.push(h)}
+   if(strict)for(let gx=-54;gx<=54;gx+=6)for(let gz=-54;gz<=54;gz+=6){if(gx*gx+gz*gz>2916)continue;if(onRoad(x+gx,z+gz))return null}
+   let mn=1e9,mx=-1e9,s=0;for(const h of hs){if(h<mn)mn=h;if(h>mx)mx=h;s+=h}return{x,z,spread:mx-mn,y:s/hs.length,f:forest(x,z)}};
+ for(const strict of[true,false]){
+  if(town){const ax=LAKE.x,az=LAKE.z,bx=town.cx,bz=town.cz,L=dist2(ax,az,bx,bz)||1,ux=(bx-ax)/L,uz=(bz-az)/L;
+   for(let t=.25;t<=.751;t+=.025)for(let off=-180;off<=180;off+=15){const s=ev(ax+(bx-ax)*t-uz*off,az+(bz-az)*t+ux*off,strict);if(!s||s.spread>7)continue;const sc=s.spread+Math.abs(t-.5)*6+Math.abs(off)*.012+s.f*2;if(!best||sc<best.sc){best=s;best.sc=sc}}}
+  if(!best)for(let rr=110;rr<=260;rr+=15)for(let a=0;a<6.283;a+=.13){const s=ev(LAKE.x+Math.sin(a)*rr,LAKE.z+Math.cos(a)*rr,strict);if(!s||s.spread>7)continue;const sc=s.spread-s.y*.08+Math.abs(rr-150)*.01+s.f*2;if(!best||sc<best.sc){best=s;best.sc=sc}}
+  if(best)break}
+ const x=Math.round((best?best.x:clamp(LAKE.x+160,120,WS-120))*2)/2,z=Math.round((best?best.z:LAKE.z)*2)/2;let s=0,n=0;
+ for(const [rr,k] of DF_RINGS){if(rr>36)continue;for(let i=0;i<k;i++){const a=i/k*6.2832;s+=groundH(x+Math.sin(a)*rr,z+Math.cos(a)*rr);n++}}
+ return{x,z,y:Math.max(3.5,Math.round(s/n*20)/20)}}
+function dfSetSite(s){CAMP.x=s.x;CAMP.z=s.z;CAMP.y=s.y;CAMP.ready=true;DF.flat={x:s.x,z:s.z,y:s.y,r0:40,r1:57,r0q:1600,r1q:3249}}
+{const _dfGH=groundH;groundH=function(x,z){const h=_dfGH(x,z);const f=DF.flat;if(f===null)return h;const dx=x-f.x,dz=z-f.z,q=dx*dx+dz*dz;if(q>=f.r1q)return h;if(q<=f.r0q)return f.y;return lerp(f.y,h,smooth(f.r0,f.r1,Math.sqrt(q)))}}
+{const _dfLandOK=landOK;landOK=function(x,z,m){const f=DF.flat;if(f!==null){const dx=x-f.x,dz=z-f.z;if(dx*dx+dz*dz<2704)return false}return _dfLandOK(x,z,m)}}
+try{dfSetSite(dfFindSite())}catch(e){CAMP.ready=false;DF.flat=null} // retried lazily in buildTerrain if another module was not ready yet
+
+/* ---- Haven Camp construction (static, once, in buildTerrain) ---- */
+function dfSignTex(top,sub){const c=document.createElement('canvas');c.width=512;c.height=112;const g=c.getContext('2d');g.fillStyle='#3a2a1a';g.fillRect(0,0,512,112);
+ g.fillStyle='rgba(0,0,0,.14)';for(let i=0;i<5;i++)g.fillRect(0,i*22+10,512,2);g.strokeStyle='#c8b48a';g.lineWidth=4;g.strokeRect(6,6,500,100);
+ g.textAlign='center';g.font='bold 56px Roboto Condensed,Arial Narrow,Arial';g.fillStyle='#e8dcc0';g.fillText(top,256,sub?64:76);
+ if(sub){g.font='bold 20px Roboto Condensed,Arial';g.fillStyle='#9fe08a';g.fillText(sub,256,94)}
+ const t=new THREE.CanvasTexture(c);t.encoding=THREE.sRGBEncoding;t.anisotropy=MAXANI;return t}
+function dfFlagTex(){const c=document.createElement('canvas');c.width=256;c.height=160;const g=c.getContext('2d');g.fillStyle='#2f4a2c';g.fillRect(0,0,256,160);g.fillStyle='#e8dcc0';g.fillRect(0,0,256,13);g.fillRect(0,147,256,13);
+ g.beginPath();g.moveTo(128,44);g.lineTo(178,122);g.lineTo(78,122);g.closePath();g.fill();g.fillStyle='#2f4a2c';g.beginPath();g.moveTo(128,84);g.lineTo(144,122);g.lineTo(112,122);g.closePath();g.fill();
+ g.fillStyle='#ff9a3a';g.beginPath();g.moveTo(128,18);g.quadraticCurveTo(142,34,128,42);g.quadraticCurveTo(114,34,128,18);g.fill();const t=new THREE.CanvasTexture(c);t.encoding=THREE.sRGBEncoding;return t}
+function dfSandbags(p,x,z,n,rows,ax){for(let r=0;r<rows;r++)for(let i=0;i<n;i++){const o=(i-(n-1)/2)*.6+(r%2)*.3;p.ico(ax==='x'?.32:.2,.14,ax==='x'?.2:.32,'#b8a070',ax==='x'?x+o:x,.14+r*.26,ax==='x'?z:z+o,R(-.15,.15),.12)}}
+function dfTower(p,x,z,inn){const WD='#6a4a2a',WD2='#7d5a36',MT='#7b838a',MT2='#68707a',RU='#8a4b2c',C=[[-1.35,-1.35],[1.35,-1.35],[-1.35,1.35],[1.35,1.35]];
+ for(const [a,b] of C)p.box(.18,5.6,.18,WD,x+a,2.8,z+b);
+ for(const s of[-1,1]){p.stick(x-1.35,.3,z+s*1.35,x+1.35,4.7,z+s*1.35,.05,WD2,4).stick(x+1.35,.3,z+s*1.35,x-1.35,4.7,z+s*1.35,.05,WD2,4)
+   .stick(x+s*1.35,.3,z-1.35,x+s*1.35,4.7,z+1.35,.05,WD2,4).stick(x+s*1.35,.3,z+1.35,x+s*1.35,4.7,z-1.35,.05,WD2,4)}
+ for(let i=0;i<8;i++)p.box(.41,.12,3.4,i%2?WD2:WD,x-1.43+i*.41,5.0,z,0,0,0,.15);
+ for(const [a,b] of[[-1.62,-1.62],[1.62,-1.62],[-1.62,1.62],[1.62,1.62]])p.box(.1,2.45,.1,WD,x+a,6.28,z+b);
+ const out=-inn;for(let k=0;k<22;k++){const c=k%2?MT:MT2,o=-1.6+k*.152;p.box(.04,.95,.15,c,x+out*1.64,5.55,z+o).box(.15,.95,.04,c,x+o,5.55,z-1.64).box(.15,.95,.04,c,x+o,5.55,z+1.64)}
+ p.box(.08,.08,3.3,WD2,x+inn*1.62,5.95,z+0).box(.08,.08,1.0,WD2,x+inn*1.62,5.5,z-1.15).box(.08,.08,1.0,WD2,x+inn*1.62,5.5,z+1.15);
+ p.box(3.9,.08,3.9,RU,x,7.52,z,.07,0,0);for(let k=-1;k<=1;k++)p.box(3.92,.1,.12,'#6e3a22',x,7.53+k*.01,z+k*1.2,.07,0,0);
+ for(let y=.35;y<5;y+=.35)p.box(.07,.05,.66,WD2,x+inn*1.78,y,z);p.box(.07,5.3,.07,WD,x+inn*1.78,2.65,z-.33).box(.07,5.3,.07,WD,x+inn*1.78,2.65,z+.33);
+ p.cyl(.17,.34,'#3a3f44',x+out*1.48,6.32,z,0,0,Math.PI/2,10).box(.08,.3,.08,'#2a2a2a',x+out*1.4,6.05,z);
+ dfSandbags(p,x+out*2.1,z-1.3,3,2,'z');dfSandbags(p,x,z+(out>0?2.1:-2.1),3,1,'x')}
+function dfStall(p,x,z){const WD='#6e4f2f',WD2='#8a6a43',DK='#4a3220',MT='#7b838a',MT2='#68707a';
+ for(const [a,b,h] of[[-2.6,1.7,2.55],[2.6,1.7,2.55],[-2.6,-1.7,3.0],[2.6,-1.7,3.0]])p.box(.16,h,.16,DK,x+a,h/2,z+b);
+ p.box(4.8,1.0,.7,WD,x,.5,z+1.45).box(5.0,.08,.86,WD2,x,1.04,z+1.45);for(let i=0;i<9;i++)p.box(.5,.9,.03,i%2?'#5e4228':WD,x-2.2+i*.55,.47,z+1.81);
+ for(let k=0;k<34;k++)p.box(.16,2.9,.04,k%2?MT:MT2,x-2.6+k*.158,1.45,z-1.8);for(const s of[-1,1])p.box(.05,1.1,3.3,WD,x+s*2.62,.55,z);
+ for(const y of[1.25,1.85]){p.box(4.6,.05,.4,WD2,x,y,z-1.55);for(let i=0;i<11;i++){const c=['#b8443a','#d9b23a','#5a7a3a','#3f6a8a','#c8c0a8','#8a5a3a','#e0e0d8'][(i*3+(y>1.5?2:0))%7];
+   if(i%3===0)p.cyl(.07,.2,c,x-2.1+i*.42,y+.125,z-1.55,0,0,0,8);else p.box(.16+(i%2)*.08,.14+(i%3)*.05,.2,c,x-2.1+i*.42,y+.1+(i%3)*.025,z-1.55)}}
+ p.box(.3,.06,.24,'#3a3a3a',x+1.4,1.11,z+1.4).cyl(.06,.18,'#9fc8d8',x-1.5,1.17,z+1.35,0,0,0,8).cyl(.06,.14,'#d9b23a',x-1.25,1.15,z+1.5,0,0,0,8).box(.4,.18,.3,'#8a6a43',x+.7,1.17,z+1.3);
+ p.box(.9,.8,.9,'#7a5a34',x+3.5,.4,z+1.2).box(.8,.7,.8,'#836139',x+3.5,1.15,z+1.25,0,.3,0).cyl(.32,.95,'#2d5d8c',x+3.4,.48,z-.6,0,0,0,12);
+ p.box(.12,.32,.12,'#2a2a2a',x+2.0,2.3,z+1.95).box(.02,.25,.02,'#2a2a2a',x+2.0,2.55,z+1.95)}
+function dfTent(p,x,z,len,wid,hei,c,dc){p.prism(wid,len,hei,c,x,0,z).prism(wid*.5,.04,hei*.72,dc,x,0,z-len/2-.01,0,.04);
+ for(const s of[-1,1]){p.cyl(.03,hei+.25,'#4a3220',x,(hei+.25)/2,z+s*(len/2+.05),0,0,0,5).stick(x,hei+.1,z+s*(len/2+.05),x,0,z+s*(len/2+1.1),.012,'#c8b88a',3);
+   for(const t of[-1,1])p.stick(x+s*wid*.45,hei*.33,z+t*len*.35,x+s*(wid/2+.6),0,z+t*len*.35,.01,'#c8b88a',3)}}
+function dfCrate(p,x,z,s,ry,y){p.box(s,s*.85,s,'#7a5a34',x,(y||0)+s*.425,z,0,ry||0,0).box(s*1.02,.06,s*1.02,'#4a3520',x,(y||0)+s*.7,z,0,ry||0,0)}
+function dfBuildCamp(){const cx=CAMP.x,cz=CAMP.z,y0=CAMP.y,W=26;const CG=new THREE.Group();CG.position.set(cx,y0,cz);scene.add(CG);DF.campG=CG;
+ const p=dfP(),BX=DF.boxes;BX.length=0;DF.inter.length=0;DF.towers.length=0;DF.beams.length=0;
+ const cb=(lx,lz,w,d,h,y)=>BX.push({minx:cx+lx-w/2,maxx:cx+lx+w/2,minz:cz+lz-d/2,maxz:cz+lz+d/2,miny:y0+(y||0)-1,maxy:y0+(y||0)+h,mon:1});
+ const ib=(kind,lx,lz,w,d,h)=>{const it={kind,box:{minx:cx+lx-w/2,maxx:cx+lx+w/2,minz:cz+lz-d/2,maxz:cz+lz+d/2,miny:y0,maxy:y0+h}};DF.inter.push(it);return it};
+ // palisade: instanced pointed logs (gates in the west and east walls)
+ {const lg=buildGeo([{g:new THREE.CylinderGeometry(.19,.22,3.3,7),c:'#6b4b2e',p:[0,1.65,0],j:.18},{g:new THREE.ConeGeometry(.19,.5,7),c:'#5a3d24',p:[0,3.55,0],j:.15}]);
+  const pos=[];for(let x=-W;x<=W+.01;x+=.4){pos.push([x,-W]);pos.push([x,W])}for(let z=-W+.4;z<W-.01;z+=.4){if(Math.abs(z)<3.6)continue;pos.push([-W,z]);pos.push([W,z])}
+  const im=new THREE.InstancedMesh(lg,MAT.vc,pos.length);const m4=new THREE.Matrix4(),q=new THREE.Quaternion(),e=new THREE.Euler(),c=new THREE.Color();
+  pos.forEach(([x,z],i)=>{e.set(R(-.04,.04),R(0,6.28),R(-.04,.04));q.setFromEuler(e);const s=R(.9,1.12);m4.compose(new V3(x+R(-.04,.04),R(-.25,0),z+R(-.04,.04)),q,new V3(R(.9,1.1),s,R(.9,1.1)));im.setMatrixAt(i,m4);c.setRGB(1,1,1).multiplyScalar(R(.75,1.1));im.setColorAt(i,c)});
+  im.instanceMatrix.needsUpdate=true;if(im.instanceColor)im.instanceColor.needsUpdate=true;im.castShadow=im.receiveShadow=true;im.frustumCulled=false;CG.add(im)}
+ for(const s of[-1,1]){p.box(2*W,.12,.12,'#4e341f',0,1.1,s*(W-.32)).box(2*W,.12,.12,'#4e341f',0,2.6,s*(W-.32));
+   for(const zz of[-1,1]){const zc=zz*(W+3.6)/2,len=W-3.6;p.box(.12,.12,len,'#4e341f',s*(W-.32),1.1,zc).box(.12,.12,len,'#4e341f',s*(W-.32),2.6,zc)}}
+ for(const [x,z,w,ax] of[[-9,-W-.3,3.2,'x'],[14,W+.3,2.6,'x'],[-W-.3,13,2.8,'z'],[W+.3,-15,3,'z']])for(let k=0;k<Math.round(w/.16);k++){const o=-w/2+k*.16;p.box(ax==='x'?.15:.04,2.2,ax==='x'?.04:.15,k%2?'#7b838a':'#8a5a3a',ax==='x'?x+o:x,1.4,ax==='x'?z:z+o)}
+ cb(0,-W,2*W+.8,.8,3.4);cb(0,W,2*W+.8,.8,3.4);for(const s of[-1,1]){cb(s*W,-(W+3.6)/2,.8,W-3.6,3.4);cb(s*W,(W+3.6)/2,.8,W-3.6,3.4)}
+ // gates: log arch, sign, sandbag chicanes
+ const sign=dfSignTex(CAMP.name.toUpperCase(),'SAFE ZONE · TRADER · REST');const signM=M('#ffffff',{map:sign,roughness:.9});
+ for(const s of[-1,1]){const x=s*W;for(const z of[-3.9,3.9]){p.cyl(.3,5.4,'#5a3d24',x,2.7,z,0,0,0,8,.9);cb(x,z,.7,.7,5.4)}
+   p.box(.4,.5,8.6,'#4e341f',x,5.2,0).box(.12,1.1,4.8,'#3a2a1a',x+s*.26,4.45,0).stick(x+s*.2,5.0,-2.2,x+s*.25,4.95,-2.2,.02,'#2a2a2a',3);
+   const sp=new THREE.Mesh(dfG('signg',()=>new THREE.PlaneGeometry(4.6,1.0)),signM);sp.position.set(x+s*.33,4.45,0);sp.rotation.y=s*Math.PI/2;CG.add(sp);
+   for(const z of[-6.3,6.3])dfSandbags(p,x+s*1.7,z,4,2,'z');for(const z of[-5.6,5.6])dfSandbags(p,x-s*2.2,z,3,2,'z')}
+ // watchtowers next to the gates (guards + searchlights)
+ const beamGeo=dfG('beam',()=>{const g=new THREE.ConeGeometry(2.8,26,18,1,true);g.translate(0,-13,0);return g});
+ for(const [lx,lz,inn,face] of[[-W+3.2,-7.5,1,-Math.PI/2],[W-3.2,7.5,-1,Math.PI/2]]){dfTower(p,lx,lz,inn);for(const [a,b] of[[-1.35,-1.35],[1.35,-1.35],[-1.35,1.35],[1.35,1.35]])cb(lx+a,lz+b,.3,.3,5.6);
+   BX.push({minx:cx+lx-1.65,maxx:cx+lx+1.65,minz:cz+lz-1.65,maxz:cz+lz+1.65,miny:y0+4.92,maxy:y0+5.08,mon:1});DF.towers.push({x:cx+lx,y:y0+5.08,z:cz+lz,yaw:face});
+   const lens=new THREE.Mesh(dfG('lensb',()=>new THREE.CircleGeometry(.15,12)),DFM.bulb);lens.position.set(lx-inn*1.66,6.32,lz);lens.rotation.y=-inn*Math.PI/2;CG.add(lens);
+   const piv=new THREE.Group();piv.position.set(lx-inn*1.6,6.32,lz);const cone=new THREE.Mesh(beamGeo,DFM.beam);cone.rotation.x=Math.PI/2-.3;cone.renderOrder=3;piv.add(cone);piv.rotation.y=face+Math.PI;CG.add(piv);DF.beams.push(piv)}
+ // trader stall (north side, facing the path)
+ dfStall(p,0,-18);cb(0,-16.55,5.0,.9,1.1);cb(0,-19.8,5.4,.3,3);for(const s of[-1,1])cb(s*2.62,-18,.3,3.3,1.1);cb(3.5,-16.8,1,1,1.6);cb(3.4,-18.6,.7,.7,1);
+ {const aw=canvasTex(128,(g,s)=>{for(let i=0;i<8;i++){g.fillStyle=i%2?'#e8dcc0':'#a8402e';g.fillRect(i*16,0,16,s)}g.fillStyle='rgba(0,0,0,.12)';g.fillRect(0,s-10,s,10)});aw.repeat.set(2,1);
+  const awM=M('#ffffff',{map:aw,roughness:1});const a1=box(5.9,.05,4.3,awM,0,2.78,-18);a1.rotation.x=.11;CG.add(a1);const a2=box(5.9,.28,.03,awM,0,2.43,-15.85);CG.add(a2);shadowAll(a1);
+  const st=new THREE.Mesh(dfG('stsign',()=>new THREE.PlaneGeometry(3.2,.7)),M('#ffffff',{map:dfSignTex('MAGS\' BARTER','SCRAP ONLY · FAIR PRICES'),roughness:.9}));st.position.set(0,3.32,-15.86);CG.add(st);
+  const lb=new THREE.Mesh(dfG('bulbL',()=>new THREE.IcosahedronGeometry(.09,1)),DFM.bulb);lb.position.set(2.0,2.14,-16.05);CG.add(lb)}
+ DF.traderPos={x:cx,y:y0,z:cz-17.6};ib('trader',0,-17.05,5.0,1.9,2.1);
+ // campfire with sitting logs
+ {const fx=-4,fz=-8;for(let i=0;i<9;i++){const a=i/9*6.283;p.dode(.2,'#77736c',fx+Math.cos(a)*.62,.1,fz+Math.sin(a)*.62)}p.cyl(.52,.04,'#2a2420',fx,.02,fz,0,0,0,10);
+  for(const a of[.3,1.9,3.5,5.0])p.stick(fx+Math.cos(a)*.45,.05,fz+Math.sin(a)*.45,fx-Math.cos(a)*.05,.45,fz-Math.sin(a)*.05,.06,'#4a3220',6);
+  for(const [a,len] of[[0,2],[2.1,1.8],[4.2,2.2]])p.cyl(.24,len,'#5a3d24',fx+Math.cos(a)*2.6,.24,fz+Math.sin(a)*2.6,0,Math.PI/2-a,Math.PI/2,8);
+  cb(fx,fz,1.1,1.1,.5);const fg=new THREE.Group();fg.position.set(fx,0,fz);CG.add(fg);for(const [s,y,ox] of[[.9,.55,0],[.6,.5,.15],[.55,.45,-.15]]){const f=flameSprite(s);f.position.set(ox,y,ox*.5);fg.add(f);DF.fireSpr.push(f)}
+  DF.firePos={x:cx+fx,y:y0,z:cz+fz};const it=ib('df_fire',fx,fz,1.6,1.6,1.0);DF.fireDep={type:'campfire',x:cx+fx,y:y0,z:cz+fz,store:{},obj:fg,box:it.box,solid:0,camp:1}}
+ // tents, supply tent, workbench lean-to, water barrel, flag, generator, crates
+ for(const [x,z,len,wid,hei,c] of[[-15,15,3.4,2.6,2.0,'#5d6b3a'],[-5,17,3.0,2.4,1.9,'#9a8460'],[6,16,3.6,2.8,2.1,'#3c4a5a']]){dfTent(p,x,z,len,wid,hei,c,'#2a2620');cb(x,z,wid,len,hei*.8)}
+ p.box(4,1.8,3.4,'#6b6a4a',14,.9,11).prism(4.3,3.6,1.2,'#5a5a3c',14,1.8,11).box(1.3,1.5,.05,'#2a2620',14,.75,9.28);dfCrate(p,12.4,9,.6,.3);cb(14,11,4.1,3.5,2.7);
+ {const x=-15,z=-17;p.box(2.2,.1,1.0,'#8a6a43',x,.92,z).box(2.1,.08,.9,'#6e4f2f',x,.35,z);for(const [a,b] of[[-1,-.42],[1,-.42],[-1,.42],[1,.42]])p.box(.1,.9,.1,'#4e341f',x+a,.45,z+b);
+  p.box(.25,.18,.22,'#5a5f64',x+.75,1.06,z+.2).box(.08,.2,.08,'#5a5f64',x+.75,1.2,z+.33).box(.5,.03,.12,'#8a8f94',x-.4,.985,z+.1,0,.4,0).box(.1,.06,.3,'#4a3220',x-.1,1.0,z-.2);
+  p.box(2.4,1.2,.06,'#6e4f2f',x,1.7,z-.62);for(let i=0;i<5;i++)p.box(.06,.4,.04,['#8a8f94','#4a3220','#9a3f34','#8a8f94','#d9b23a'][i],x-.8+i*.4,1.75,z-.58,0,0,i%2?.3:-.2);
+  for(const [a,b,h] of[[-1.3,.9,2.6],[1.3,.9,2.6],[-1.3,-.7,3.0],[1.3,-.7,3.0]])p.box(.12,h,.12,'#4e341f',x+a,h/2,z+b);p.box(3.0,.06,2.2,'#7b838a',x,2.85,z+.1,.24,0,0);
+  cb(x,z,2.2,1.0,1.0);ib('df_wb',x,z,2.4,1.4,1.3);DF.wbPos={x:cx+x,y:y0,z:cz+z}}
+ {const x=-21,z=7;p.cyl(.38,1.0,'#2d5d8c',x,.5,z,0,0,0,12).cyl(.4,.05,'#1f4466',x,1.0,z,0,0,0,12).cone(.7,.42,'#5d7a8a',x,1.3,z,Math.PI,0,0,8);for(const [a,b] of[[-.6,-.6],[.6,-.6],[-.6,.6],[.6,.6]])p.box(.05,1.6,.05,'#4a3220',x+a,.8,z+b);
+  cb(x,z,.9,.9,1.1);ib('df_water',x,z,1.2,1.2,1.5)}
+ p.cyl(.06,7,'#8a8f94',7,3.5,-8,0,0,0,6).cyl(.1,.12,'#6a6f74',7,.06,-8,0,0,0,8);
+ {const fg=new THREE.PlaneGeometry(1.8,1.1,9,5);fg.translate(.9,0,0);const fm=new THREE.Mesh(fg,new THREE.MeshStandardMaterial({map:dfFlagTex(),side:THREE.DoubleSide,roughness:1,flatShading:true}));fm.position.set(7.06,6.35,-8);fm.castShadow=true;CG.add(fm);
+  DF.flag={m:fm,base:Float32Array.from(fg.attributes.position.array)}}
+ {const gp=dfP();gp.box(1.5,.12,.9,'#2a2a2a',0,.06,0).box(1.3,.75,.75,'#9a8a3a',0,.5,0).box(1.32,.08,.77,'#7a6a2a',0,.9,0).box(.5,.4,.5,'#5a5f64',-.35,1.1,0).cyl(.07,.6,'#3a3a3a',.45,1.2,-.2,0,0,0,6)
+   .cyl(.11,.35,'#4a4a4a',.45,1.55,-.2,0,0,Math.PI/2,8).box(.3,.25,.05,'#222222',.3,.55,.38).cyl(.04,.02,'#e8e4da',.24,.6,.41,Math.PI/2,0,0,8);for(const [a,b] of[[-.65,-.38],[.65,-.38],[-.65,.38],[.65,.38]])gp.box(.06,1.05,.06,'#2a2a2a',a,.55,b);
+  const gen=new THREE.Mesh(gp.geo(),MAT.vc);gen.position.set(17,0,18);gen.castShadow=gen.receiveShadow=true;CG.add(gen);DF.gen=gen;DF.genPos={x:cx+17,y:y0,z:cz+18};p.box(.3,.4,.18,'#a3301f',18.3,.2,18.5);cb(17,18,1.6,1.0,1.3)}
+ for(const [x,z,s,ry] of[[-9.5,-20.6,.9,.2],[-8.4,-21,.7,.6],[21,-11,.9,0],[4,21.6,.8,.4],[5,21.2,.6,.1]])dfCrate(p,x,z,s,ry);dfCrate(p,21,-11,.7,.5,.765);
+ for(const [x,z,c] of[[12.5,20.5,'#9b3a2a'],[13.3,20.8,'#2d5d8c'],[-18,-3.8,'#9b3a2a']])p.cyl(.32,.95,c,x,.48,z,0,0,0,12);
+ for(const [x,z,w,d,h] of[[-9,-20.8,2,1.4,1],[21,-11,1,1,1.4],[4.5,21.4,1.8,1,.9],[12.9,20.6,1.6,.8,1],[-18,-3.8,.7,.7,1]])cb(x,z,w,d,h);
+ // string lights between poles around the yard and to the stall
+ {const poles=[[-11,-4.5],[11,-4.5],[-11,4.5],[11,4.5],[-3,-14.8],[3,-14.8]];for(const [x,z] of poles)p.box(.12,3.9,.12,'#4a3220',x,1.95,z).box(.5,.06,.06,'#4a3220',x,3.75,z);
+  const segs=[],bulbs=[];for(const [a,b] of[[0,1],[2,3],[0,2],[1,3],[0,4],[1,5],[4,5]]){const A=poles[a],B=poles[b],L=Math.hypot(B[0]-A[0],B[1]-A[1]),sag=L>12?.55:.3,n=Math.max(4,Math.round(L/.9));let pv=null;
+    for(let i=0;i<=n;i++){const t=i/n,x=lerp(A[0],B[0],t),z=lerp(A[1],B[1],t),y=3.72-sag*4*t*(1-t);if(pv)segs.push(pv[0],pv[1],pv[2],x,y,z);pv=[x,y,z];if(i>0&&i<n)bulbs.push([x,y-.08,z])}}
+  {let pv=[17.6,.9,17.6];for(const [x,z] of[[16,15],[13,10],[11.2,6],[11,4.6]]){const y=x===11?3.6:.03;segs.push(pv[0],pv[1],pv[2],x,y,z);pv=[x,y,z]}}
+  const lg=new THREE.BufferGeometry();lg.setAttribute('position',new THREE.Float32BufferAttribute(segs,3));CG.add(new THREE.LineSegments(lg,new THREE.LineBasicMaterial({color:0x1c1a18})));
+  const bm=new THREE.InstancedMesh(dfG('bulb',()=>new THREE.IcosahedronGeometry(.075,0)),DFM.bulb,bulbs.length);const m4=new THREE.Matrix4(),c=new THREE.Color();
+  bulbs.forEach((b,i)=>{m4.makeTranslation(b[0],b[1],b[2]);bm.setMatrixAt(i,m4);c.set(['#ffe6a8','#ffd27a','#ffb35a','#ffe6a8','#ff8a6a','#a8e0ff','#b8ffb0'][i%7]);bm.setColorAt(i,c)});
+  bm.instanceMatrix.needsUpdate=true;if(bm.instanceColor)bm.instanceColor.needsUpdate=true;bm.frustumCulled=false;CG.add(bm)}
+ const mm=new THREE.Mesh(p.geo(),MAT.vc);mm.castShadow=mm.receiveShadow=true;CG.add(mm);
+ // recycler (world coordinates: core shakes ents by e.x)
+ {const rp=dfP();rp.box(2.0,1.6,1.3,'#4a6e3a',0,.8,0).box(2.02,.14,1.32,'#d8b24a',0,1.45,0).box(1.2,.5,.9,'#3e5e30',-.2,1.85,0).box(.9,.08,.6,'#2a2a2a',-.2,2.12,0)
+   .box(1.5,.55,.05,'#1c241a',0,1.0,.66).cyl(.35,.12,'#2a2a2a',1.05,.8,0,0,0,Math.PI/2,12).box(.5,.3,.6,'#3e5e30',.9,.3,.5);for(let i=0;i<8;i++)rp.box(.25,.12,.02,i%2?'#d8b24a':'#1a1a1a',-.9+i*.25,.15,.66);
+  const rec=new THREE.Mesh(rp.geo(),MAT.vc);const rx=cx+16,rz=cz-17;rec.position.set(rx,y0,rz);rec.castShadow=rec.receiveShadow=true;scene.add(rec);
+  const lab=labelSprite('RECYCLER','#a4d68a');lab.position.set(rx,y0+3.2,rz);lab.scale.set(5,5,1);scene.add(lab);DF.recProto={id:'df_rec',t:'recycler',x:rx,z:rz,y:y0,obj:rec,r:1.15,solid:1,ph:2.1}}
+ DF.respPt={x:cx-7,z:cz+1};dfFireL.position.set(cx-4,y0+1.3,cz-8);
+ dfPaintGround();if(typeof grass!=='undefined')dfHideGrass(grass,30)}
+// packed-dirt yard and gravel path painted into the terrain vertex colours
+function dfPaintGround(){if(typeof terrain==='undefined'||!terrain||!terrain.geometry)return;const g=terrain.geometry,Pa=g.attributes.position,Ca=g.attributes.color;if(!Pa||!Ca)return;
+ const cx=CAMP.x,cz=CAMP.z,dirt=col('#6b5a3e'),grav=col('#7d776a'),dark=col('#4a3e2c'),tmp=new THREE.Color(),base=new THREE.Color();
+ for(let i=0;i<Pa.count;i++){const x=Pa.getX(i),z=Pa.getZ(i),dx=x-cx,dz=z-cz;if(Math.abs(dx)>40||Math.abs(dz)>40)continue;const k=1-smooth(27,36,Math.max(Math.abs(dx),Math.abs(dz)));if(k<=0)continue;
+   base.setRGB(Ca.getX(i),Ca.getY(i),Ca.getZ(i));tmp.copy(dirt).lerp(dark,fbm(x*.15,z*.15,2)*.6);if(Math.abs(dz)<3.4)tmp.lerp(grav,.75*(1-smooth(2.2,3.4,Math.abs(dz))));if(dist2(x,z,cx-4,cz-8)<3)tmp.lerp(dark,.6);
+   base.lerp(tmp,k*.92);Ca.setXYZ(i,base.r,base.g,base.b)}Ca.needsUpdate=true}
+function dfHideGrass(im,half){if(!im||!im.isInstancedMesh||!(im.count>0)||!CAMP.ready)return;const m4=DFG.gm4||(DFG.gm4=new THREE.Matrix4());let ch=0;
+ for(let i=0;i<im.count;i++){im.getMatrixAt(i,m4);const e=m4.elements;if(Math.abs(e[12]-CAMP.x)<half&&Math.abs(e[14]-CAMP.z)<half){m4.makeScale(0,0,0);im.setMatrixAt(i,m4);ch=1}}if(ch)im.instanceMatrix.needsUpdate=true}
+{const _dfBuildTerrain=buildTerrain;buildTerrain=function(){if(!CAMP.ready){try{dfSetSite(dfFindSite())}catch(e){console.error('defense: camp site',e)}}
+  const r=_dfBuildTerrain.apply(this,arguments);if(CAMP.ready&&!DF.built){DF.built=true;try{dfBuildCamp()}catch(e){console.error('defense: camp build',e)}}return r}}
+// core clutter (pebbles, flowers, ferns) ignores landOK for pebbles/flowers: clear it out of the camp yard and gates
+{const _dfBC=buildClutter;buildClutter=function(){const r=_dfBC.apply(this,arguments);try{if(CAMP.ready&&typeof GEO!=='undefined')for(const o of scene.children)if(o&&o.isInstancedMesh&&o!==grass&&(o.geometry===GEO.peb||o.geometry===GEO.flower||o.geometry===GEO.fern))dfHideGrass(o,30)}catch(e){console.error('defense: clutter',e)}return r}}
+{const _dfUNG=updateNearGrass;updateNearGrass=function(){const before=ngC;const r=_dfUNG.apply(this,arguments);if(ngC!==before&&DF.built&&P&&dist2(P.x,P.z,CAMP.x,CAMP.z)<110)dfHideGrass(nearGrass,30);return r}}
+
+/* ---- per game: collision, recycler, guards and trader ---- */
+function dfRifleGeo(){return dfG('rifle',()=>buildGeo([{g:new THREE.BoxGeometry(.05,.075,.36),c:'#2c2c2e',p:[0,.04,-.1]},{g:new THREE.CylinderGeometry(.014,.014,.46,7),c:'#232325',p:[0,.06,-.5],r:[Math.PI/2,0,0]},
+ {g:new THREE.BoxGeometry(.045,.1,.24),c:'#4a3220',p:[0,0,.18]},{g:new THREE.BoxGeometry(.03,.09,.06),c:'#2c2c2e',p:[0,-.04,-.06]},{g:new THREE.CylinderGeometry(.02,.02,.14,6),c:'#3a3a3c',p:[0,.11,-.12],r:[Math.PI/2,0,0]}]))}
+function dfArmGuard(m){try{const w=new THREE.Mesh(dfRifleGeo(),MAT.vc);w.castShadow=true;if(m.rig&&m.rig.handR){m.rig.handR.add(w);return}const aR=m.aR;if(aR&&aR.children&&aR.children.length){const g=aR.children[aR.children.length-1];w.position.set(0,0,-.05);g.add(w)}}catch(e){}}
+function dfMakeTraderRig(){const r=makeRig({skin:'#c99d7b',shirt:'#6b4630',pants:'#3b3833',boots:'#2a2420',hat:'#4d3826',hair:'#8f8b84',backpack:false,build:{h:1,w:1.25}});if(!r||!r.g||!r.head)return null;
+ const H=r.H||1,Wd=r.W||1.25,fl={flatShading:true};
+ r.head.add(ell(.1,M('#8f8b84',fl),1.05*Wd,.78,.72,0,.03*H,-.075));
+ const brim=new THREE.Mesh(new THREE.CylinderGeometry(.3,.3,.022,14),M('#4d3826',fl));brim.position.set(0,.15*H,0);r.head.add(brim);
+ const band=new THREE.Mesh(new THREE.CylinderGeometry(.124*Wd,.124*Wd,.03,12),M('#9a3f34',fl));band.position.set(0,.168*H,.01);r.head.add(band);
+ for(const s of[-1,1]){const gg=new THREE.Mesh(new THREE.CylinderGeometry(.034,.034,.025,10),M('#a8d8ec',{metalness:.5,roughness:.15}));gg.rotation.x=Math.PI/2;gg.position.set(s*.048,.205*H,-.085);r.head.add(gg)}
+ if(r.chest)r.chest.add(box(.36*Wd,.6,.02,M('#c4ab84',fl),0,-.06*H,-.14));shadowAll(r.g);
+ return{rig:r,g:r.g,body:null,head:r.head,aL:r.armL,aR:r.armR}}
+function dfMakeTraderBasic(){const g=new THREE.Group(),fl={flatShading:true};const jk=M('#6b4630',fl),ap=M('#c4ab84',fl),pa=M('#3b3833',fl),sk=M('#c99d7b',fl),bd=M('#8f8b84',fl),ht=M('#4d3826',fl),sc=M('#9a3f34',fl),dk=M('#24201c');
+ for(const s of[-1,1]){g.add(box(.17,.86,.2,pa,s*.11,.43,0));g.add(box(.19,.12,.28,dk,s*.11,.06,-.04))}
+ const body=new THREE.Group();body.position.y=.88;g.add(body);body.add(box(.5,.62,.3,jk,0,.32,0));body.add(box(.44,.58,.02,ap,0,.25,-.16));body.add(box(.52,.07,.32,dk,0,.03,0));body.add(box(.38,.1,.33,sc,0,.6,0));
+ const arm=s=>{const a=new THREE.Group();a.position.set(s*.32,.56,0);a.add(box(.13,.34,.15,jk,0,-.17,0));a.add(box(.12,.26,.14,jk,0,-.46,0));a.add(box(.1,.1,.12,sk,0,-.63,0));body.add(a);return a};
+ const aL=arm(-1),aR=arm(1),head=new THREE.Group();head.position.y=.82;body.add(head);
+ head.add(ell(.15,sk,1,1.08,1,0,0,0));head.add(ell(.14,bd,1.02,.75,.8,0,-.09,-.05));head.add(box(.04,.06,.05,sk,0,0,-.15));for(const s of[-1,1])head.add(box(.04,.025,.02,dk,s*.055,.035,-.14));
+ const brim=new THREE.Mesh(new THREE.CylinderGeometry(.31,.31,.025,14),ht);brim.position.y=.11;head.add(brim);const crown=new THREE.Mesh(new THREE.CylinderGeometry(.15,.17,.16,10),ht);crown.position.y=.2;head.add(crown);
+ const band=new THREE.Mesh(new THREE.CylinderGeometry(.172,.172,.035,10),sc);band.position.y=.14;head.add(band);shadowAll(g);return{rig:null,g,body,head,aL,aR}}
+function dfSpawnCampFolk(){DF.guards=[];DF.gsrc=[];
+ DF.towers.forEach((T,i)=>{let m=null;try{m=makeHuman('dfguard')}catch(e){m=null}if(!m||!m.g)return;dfArmGuard(m);
+   const g={t:'df_guard',id:'dfg'+i,name:'Camp Guard',kit:'dfguard',role:'guard',team:'camp',friendly:1,x:T.x,y:T.y,z:T.z,yaw:T.yaw,tyaw:T.yaw,base:T.yaw,speed:0,phase:0,state:'wander',atkT:0,obj:m.g,m,hp:100,dead:false,scanT:i*.2,cd:1,tgt:null,aim:0,foe:null,foeT:0};
+   m.g.position.set(g.x,g.y,g.z);m.g.rotation.y=g.yaw+Math.PI;world.add(m.g);DF.guards.push(g);
+   DF.gsrc.push({t:'df_guard',name:'Camp Guard',x:T.x,y:T.y,z:T.z,yaw:0,speed:0,dead:true,eyeH:1.6})}); // dead:true -> creatures never chase a guard
+ let tm=null;if(typeof makeRig==='function'){try{tm=dfMakeTraderRig()}catch(e){tm=null}}if(!tm)tm=dfMakeTraderBasic();
+ const P0=DF.traderPos;tm.g.position.set(P0.x,P0.y,P0.z);tm.g.rotation.y=Math.PI;world.add(tm.g);
+ DF.trader=Object.assign(tm,{t:'df_trader',name:'Mags',x:P0.x,y:P0.y,z:P0.z,yaw:0,obj:tm.g,wave:0,nod:0,use:0,flinch:0,greetT:-99,near:false,dead:false,speed:0})}
+onHook('newGame',()=>{DF.banQ=undefined;S.dfHostT=0;DF.lastRow={};DF.list=[];DF.rs={};DF.cs={};DF.rmesh={};DF.vis=[];DF.fxq=[];DF.pend={};DF.flames={};DF.shake={};DF.guards=[];DF.gsrc=[];DF.trader=null;DF.wasIn=false;DF.panelDep=null;DF.aim=null;for(const p of DF_FP)p.l=0;
+ if(!CAMP.ready||!DF.built)return;for(const b of DF.boxes)boxes.push(b);if(DF.recProto&&!ents.some(e=>e.id==='df_rec'))regEnt(Object.assign({},DF.recProto));
+ try{dfSpawnCampFolk()}catch(e){console.error('defense: camp folk',e)}});
+
+/* ---- simulation (host / solo) ---- */
+// allocation-free line of sight (same rules as core los: terrain, collision boxes, rocks) for turrets and guards
+const DFLO={x:0,y:0,z:0},DFLD={x:0,y:0,z:0};
+function dfLos(ax,ay,az,bx,by,bz){const d=dist2(ax,az,bx,bz),n=Math.ceil(d/2);for(let i=1;i<n;i++){const t=i/n,x=lerp(ax,bx,t),y=lerp(ay,by,t),z=lerp(az,bz,t);if(y<groundH(x,z)-.1)return false}
+ const dx=bx-ax,dy=by-ay,dz=bz-az,L=Math.hypot(dx,dy,dz);if(!(L>.01))return true;DFLO.x=ax;DFLO.y=ay;DFLO.z=az;DFLD.x=dx/L;DFLD.y=dy/L;DFLD.z=dz/L;
+ const mnx=Math.min(ax,bx)-1,mxx=Math.max(ax,bx)+1,mnz=Math.min(az,bz)-1,mxz=Math.max(az,bz)+1;
+ for(const b of boxes){if(b.maxx<mnx||b.minx>mxx||b.maxz<mnz||b.minz>mxz)continue;const t=rayBox(DFLO,DFLD,b,L);if(t!==null&&t<L-.3)return false}
+ const mx=(ax+bx)/2,mz=(az+bz)/2,h=L/2+2;for(const e of ents){if((e.t==='stone'||e.t==='metal'||e.t==='sulfur'||e.t==='boulder')&&Math.abs(e.x-mx)<h&&Math.abs(e.z-mz)<h){const t=rayCyl(DFLO,DFLD,e.x,e.z,e.r*.9,e.y,e.y+(e.t==='boulder'?e.ph:1.4),L);if(t!==null&&t<L-.5&&t>.5)return false}}
+ return true}
+// Headless smoke harness only (THREE is a deep proxy, so Vector3.length() is not a number): core los cannot run there.
+// Wrap it so a stub failure fails closed ("cannot see") instead of throwing (the code after a true los needs real vector
+// maths too). The core los still runs on every call. In a browser the detection is false and los is left untouched.
+{let vecOK=false;try{vecOK=typeof new V3(1,2,3).length()==='number'}catch(e){vecOK=false}if(!vecOK){const _l=los;los=function(){try{return _l.apply(this,arguments)}catch(e){return false}}}}
+function dfHostiles(){const H=DF.H;H.length=0;
+ if(typeof zombies!=='undefined'&&Array.isArray(zombies))for(const zb of zombies)if(zb&&!zb.dead&&!zb.rm&&!zb.mirror&&isFinite(zb.x))H.push(zb);
+ for(const n of npcs)if(!n.dead&&!n.friendly)H.push(n);for(const a of animals)if(!a.dead&&(a.t==='wolf'||a.t==='boar'))H.push(a);return H}
+function dfSlow(c,k){const f=DF.frame;if(c._dfSf===f-1){c.x=c._dfSx+(c.x-c._dfSx)*k;c.z=c._dfSz+(c.z-c._dfSz)*k}c._dfSx=c.x;c._dfSz=c.z;c._dfSf=f}
+function dfSpike(st,dt,H){const c0=Math.cos(st.ry),s0=Math.sin(st.ry);
+ for(const c of H){const dx=c.x-st.x,dz=c.z-st.z;if(dx*dx+dz*dz>4.6||Math.abs((c.y||0)-st.y)>1.6)continue;const lx=dx*c0-dz*s0,lz=dx*s0+dz*c0;if(Math.abs(lx)>1.55||Math.abs(lz)>1.0)continue;
+   dfSlow(c,.33);c._dfSpk=(c._dfSpk||0)+dt;if(c._dfSpk>=.5){c._dfSpk=0;damageAny(c,12.5,st.src,{wname:'Spike Barricade'});st.hp-=6;
+     if(S.time-st.fxT>.45){st.fxT=S.time;dfFx(['s',st.key,dfR2(c.x),dfR2((c.y||0)+.6),dfR2(c.z)])}}}}
+function dfShock(st,dt,H){st.charge=Math.min(100,st.charge+3*dt);st.cd-=dt;if(st.charge<20||st.cd>0)return;const c0=Math.cos(st.ry),s0=Math.sin(st.ry);let best=null,bd=1.25,blx=0;
+ for(const c of H){const dx=c.x-st.x,dz=c.z-st.z;if(dx*dx+dz*dz>9||Math.abs((c.y||0)-st.y)>1.8)continue;const lx=dx*c0-dz*s0,lz=dx*s0+dz*c0,d=Math.hypot(Math.max(0,Math.abs(lx)-1.5),lz);if(d<bd){bd=d;best=c;blx=clamp(lx,-1.45,1.45)}}
+ if(!best)return;const c=best;st.charge-=20;st.cd=.45;st.hp-=1.5;const wx=st.x+blx*c0,wz=st.z-blx*s0;
+ damageAny(c,30,st.src,{wname:'Shock Fence'});const dx=c.x-wx,dz=c.z-wz,l=Math.hypot(dx,dz)||1;
+ if(typeof applyStatus==='function'){try{applyStatus(c,'shock',1.6,st.src)}catch(e){}knockback(c,dx/l,dz/l,2.5)}else knockback(c,dx/l,dz/l,6);
+ dfFx(['z',dfR2(wx),dfR2(st.y+.95),dfR2(wz),dfR2(c.x),dfR2((c.y||0)+dfTH(c)*.55),dfR2(c.z)])}
+function dfInCone(st,c,range,half){const dx=c.x-st.x,dz=c.z-st.z,d=Math.hypot(dx,dz);if(d>range||d<.2||Math.abs((c.y||0)-st.y)>2)return false;return(-dx*Math.sin(st.ry)-dz*Math.cos(st.ry))/d>Math.cos(half)}
+function dfFlame(st,dt,H){st.cd-=dt;
+ if(st.active>0){st.active-=dt;st.dmgT-=dt;if(st.dmgT<=0){st.dmgT=.5;const as=typeof applyStatus==='function';
+     for(const c of H)if(dfInCone(st,c,6.5,.6)){if(as){try{applyStatus(c,'burn',4,st.src)}catch(e){}damageAny(c,6,st.src,{wname:'Flame Trap'})}else damageAny(c,16,st.src,{wname:'Flame Trap'})}}
+   if(st.active<=0){st.active=0;st.cd=2.5}return}
+ if(st.cd>0||st.fuel<1)return;st.trigT-=dt;if(st.trigT>0)return;st.trigT=.2;
+ for(const c of H)if(dfInCone(st,c,5.5,.5)){st.active=3;st.dmgT=.15;st.fuel=Math.max(0,st.fuel-10);st.hp-=3;dfFx(['f',st.key,3]);
+   if(typeof decal==='function'){try{decal(new V3(st.x-Math.sin(st.ry)*3.5,st.y,st.z-Math.cos(st.ry)*3.5),'scorch',2.2)}catch(e){}}break}}
+function dfTurretPick(st,H){const ox=st.x,oz=st.z,oy=st.y+.84;const vis=c=>{const d=dist2(c.x,c.z,ox,oz)||1;return dfLos(ox+(c.x-ox)/d*.95,oy,oz+(c.z-oz)/d*.95,c.x,(c.y||0)+dfTH(c)*.6,c.z)};
+ const T=st.tgt;if(T&&dfAlive(T)&&dist2(T.x,T.z,ox,oz)<31&&vis(T))return T;
+ const cand=[];for(const c of H){const dx=c.x-ox,dz=c.z-oz;if(Math.abs(dx)>30||Math.abs(dz)>30)continue;const d=Math.hypot(dx,dz);if(d<=30)cand.push([d,c])}
+ if(!cand.length)return null;cand.sort((a,b)=>a[0]-b[0]);for(let i=0;i<Math.min(3,cand.length);i++)if(vis(cand[i][1]))return cand[i][1];return null}
+function dfTurret(st,dt,H){if(!st.on){st.tgt=null;st.pitch=lerp(st.pitch,-.38,Math.min(1,dt*3));return}
+ st.scanT-=dt;if(st.scanT<=0){st.scanT=.25;const prev=st.tgt;st.tgt=dfTurretPick(st,H);if(st.tgt&&st.tgt!==prev&&!prev)dfFx(['a',dfR2(st.x),dfR2(st.y+1),dfR2(st.z)])}
+ const T=st.tgt&&dfAlive(st.tgt)?st.tgt:(st.tgt=null);
+ if(T){const dx=T.x-st.x,dz=T.z-st.z,hd=Math.hypot(dx,dz),want=Math.atan2(dx,dz);st.yaw=dfTurn(st.yaw,want,dt*6);
+   st.pitch=lerp(st.pitch,clamp(Math.atan2((T.y||0)+dfTH(T)*.6-(st.y+.84),Math.max(hd,.5)),-.8,.8),Math.min(1,dt*8));st.fireT-=dt;
+   if(st.fireT<=0&&Math.abs(dfAng(want-st.yaw))<.1){st.fireT=.24;dfTurretFire(st,T,hd)}}
+ else{st.yaw=dfAng(st.yaw+dt*.55*Math.sin(S.time*.45+st.x));st.pitch=lerp(st.pitch,0,Math.min(1,dt*2))}}
+function dfTurretFire(st,T,hd){const ce=Math.cos(st.pitch),mx=st.x+Math.sin(st.yaw)*.88*ce,my=st.y+.84+Math.sin(st.pitch)*.88,mz=st.z+Math.cos(st.yaw)*.88*ce;
+ const hit=Math.random()<clamp(.92-hd/60-(T.speed||0)*.025,.35,.92),head=hit&&Math.random()<.15,th=dfTH(T);
+ let tx=T.x,ty=(T.y||0)+th*(head?.9:.6),tz=T.z;if(!hit){tx+=R(-1,1);ty+=R(-.4,.8);tz+=R(-1,1)}
+ if(hit)damageAny(T,10*(head?2:1)*falloff(hd),st.src,{head,wname:'Auto Turret'});st.hp-=.15;
+ dfFx(['t',dfR2(mx),dfR2(my),dfR2(mz),dfR2(tx),dfR2(ty),dfR2(tz),hit?1:0]);st.noiseT-=.24;if(st.noiseT<=0){st.noiseT=1.5;noise(st.x,st.z,45)}}
+function dfBreak(st){if(st.broken)return;st.broken=true;st.hp=0;st.src.dead=true;dfFx(['b',st.type,dfR2(st.x),dfR2(st.y),dfR2(st.z)]);
+ if(st.dep){dfRemoveDep(st.dep);if(st.owner===dfMe()){feedMsg('Your '+DF_TYPES[st.type].n+' was destroyed');tip('dfbreak','Defenses wear out','Traps lose durability while they work and when enemies attack them. Look at one and press <b>E</b> to repair it before it breaks.')}}
+ else{const rm=DF.rmesh[st.key];if(rm&&rm.obj)rm.obj.visible=false;if(NET.role==='host')sendTo(st.owner,{k:'d_brk',key:st.key})}DF.colT=0;DF.visT=0}
+function dfRemoveDep(d){if(d.obj)world.remove(d.obj);deps=deps.filter(x=>x!==d);rebuildBoxes();if(DF.panelDep===d){DF.panelDep=null;if(!$('#panel').classList.contains('hidden'))closeAll()}}
+/* camp safe zone + guards */
+function dfOutPt(c,ex){let dx=c.x-CAMP.x,dz=c.z-CAMP.z,d=Math.hypot(dx,dz);if(d<.5){dx=1;dz=0;d=1}return{x:CAMP.x+dx/d*(CAMP.r+ex),z:CAMP.z+dz/d*(CAMP.r+ex)}}
+function dfPushOut(c,dx,dz,d,dt){if(d<.5){dx=1;dz=0;d=1}const r=CAMP.r+.25,k=d<r-8?Math.min(1,dt*2.2):1;c.x=lerp(c.x,CAMP.x+dx/d*r,k);c.z=lerp(c.z,CAMP.z+dz/d*r,k);const g=groundH(c.x,c.z);if(!(c.y>g&&c.y<g+.6))c.y=g}
+const dfInZone=o=>!!o&&typeof o==='object'&&o.x!==undefined&&safeZone(o.x,o.z);
+// aggression: a player who attacks a hostile from inside the safe zone loses its protection for 30 s (refreshed by every hit)
+function dfAggro(o){if(!o||!S)return false;if(o===P)return (S.dfHostT||0)>S.time;return o.t==='rplayer'&&(o.dfHostT||0)>S.time}
+const dfProt=o=>dfInZone(o)&&!dfAggro(o);
+function dfMarkAggro(att){if(!CAMP.ready||!S||!P)return;const p=(att===undefined||att===null||att==='player'||att===P)?P:(att&&typeof att==='object'&&att.t==='rplayer'&&remotes[att.id]===att?att:null);
+ if(!p||!safeZone(p.x,p.z))return;if(p===P){const was=(S.dfHostT||0)>S.time;S.dfHostT=S.time+30;if(!was){feedMsg('You attacked from the safe zone: hostiles can target you for 30 s');sfx('df_beep',.6);
+   tip('dfhostile','Hostile in the safe zone','Attacking anything from inside the camp marks you <b>HOSTILE</b> for 30 seconds. While the timer runs, the infected and hostile players can see and target you, even behind the walls. Every hit you land resets it.')}}else p.dfHostT=S.time+30}
+{const _f=damageNpc;damageNpc=function(n,dmg,att){try{if(n&&!n.dead&&(att===undefined||att==='player'||(att&&att.t==='rplayer')))dfMarkAggro(att)}catch(e){}return _f.apply(this,arguments)}}
+if(typeof zmDamage==='function'){try{const _f=zmDamage;zmDamage=function(zb,dmg,src){try{if(zb&&!zb.dead&&!zb.mirror&&dmg>0&&(src==='player'||src===P||(src&&src.t==='rplayer')))dfMarkAggro(src)}catch(e){}return _f.apply(this,arguments)}}catch(e){}}
+function dfNpcLeave(n){if((n._dfLv||0)>S.time)return;n._dfLv=S.time+3;const o=dfOutPt(n,35);n.foe=null;n.state='wander';n.target=o;n.mem={x:o.x,z:o.z,t:S.time};n.searchT=0}
+const DF_ZCALM={chase:1,bang:1,hunt:1,investigate:1,idle:1,wander:1};
+function dfZLose(zb){if(zb.mirror||zb.dead)return;const f=zb.foe;
+ if(f&&dfProt(f)&&(f===P||f.t==='rplayer'||f.t==='npc'||f.t==='df_guard')&&DF_ZCALM[zb.state]){zb.foe=null;const o=dfOutPt(zb,14);zb.state='investigate';zb.gx=o.x;zb.gz=o.z;zb.wT=6;zb.unreach=false}
+ if(zb.state==='hunt'&&dfProt(zb.hunt)){const o=dfOutPt(zb,18);zb.state='investigate';zb.gx=o.x;zb.gz=o.z;zb.wT=8}
+ if(zb.state==='investigate'&&typeof zb.gx==='number'&&safeZone(zb.gx,zb.gz)){const o=dfOutPt(zb,10);zb.gx=o.x;zb.gz=o.z}
+ if(typeof zb.hx==='number'&&safeZone(zb.hx,zb.hz)){const o=dfOutPt({x:zb.hx,z:zb.hz},12);zb.hx=o.x;zb.hz=o.z}}
+function dfCampSim(dt,H){const cx=CAMP.x,cz=CAMP.z,r=CAMP.r;
+ for(const c of H){const dx=c.x-cx,dz=c.z-cz;if(Math.abs(dx)>r+3||Math.abs(dz)>r+3)continue;const d=Math.hypot(dx,dz);if(d<r)dfPushOut(c,dx,dz,d,dt);
+   if(c.t==='z')dfZLose(c);
+   else if(c.t==='npc'){if(d<r+1||dfProt(c.foe)||(dfInZone(c.target)&&!dfAggro(c.foe)))dfNpcLeave(c)}
+   else if(d<r||dfProt(c.foe)){if(c.state==='attack'){c.state='wander';c.foe=null}if(!c.target||safeZone(c.target.x,c.target.z)){c.target=dfOutPt(c,22);c.tt=5}}}
+ for(const n of npcs)if(!n.dead&&n.state==='chase'&&dfProt(n.foe)&&dist2(n.x,n.z,cx,cz)<r+60)dfNpcLeave(n);
+ for(const a of animals){if(a.dead||a.t==='wolf'||a.t==='boar')continue;const dx=a.x-cx,dz=a.z-cz;if(Math.abs(dx)>r||Math.abs(dz)>r)continue;const d=Math.hypot(dx,dz);if(d<r-12){dfPushOut(a,dx,dz,d,dt);a.target=dfOutPt(a,12);a.tt=5}}
+ dfGuards(dt,H)}
+function dfGuardPick(g,H){const R2=CAMP.r+30,eye=g.y+1.6;const vis=c=>dfLos(g.x,eye,g.z,c.x,(c.y||0)+dfTH(c)*.6,c.z);
+ const T=g.tgt;if(T&&dfAlive(T)&&dist2(T.x,T.z,CAMP.x,CAMP.z)<R2&&dist2(T.x,T.z,g.x,g.z)<85&&vis(T))return T;
+ const cand=[];for(const c of H){const dc=dist2(c.x,c.z,CAMP.x,CAMP.z);if(dc>R2||dist2(c.x,c.z,g.x,g.z)>85)continue;cand.push([dc,c])}
+ if(!cand.length)return null;cand.sort((a,b)=>a[0]-b[0]);for(let i=0;i<Math.min(3,cand.length);i++)if(vis(cand[i][1]))return cand[i][1];return null}
+function dfGuards(dt,H){for(let i=0;i<DF.guards.length;i++){const g=DF.guards[i];g.cd-=dt;g.scanT-=dt;if(g.scanT<=0){g.scanT=.4;g.tgt=dfGuardPick(g,H)}
+  const T=g.tgt&&dfAlive(g.tgt)?g.tgt:(g.tgt=null);g.foe=T;
+  if(T){const want=Math.atan2(T.x-g.x,T.z-g.z);g.yaw=dfTurn(g.yaw,want,dt*3.2);g.aim=1;if(g.cd<=0&&Math.abs(dfAng(want-g.yaw))<.12){g.cd=R(.85,1.25);dfGuardFire(i,g,T)}}
+  else{g.aim=0;g.yaw=dfTurn(g.yaw,g.base+Math.sin(S.time*.22+i*2)*1.0,dt*.7)}}}
+function dfGuardFire(i,g,T){const d=dist2(g.x,g.z,T.x,T.z),hit=Math.random()<clamp(.94-d/140,.5,.92),head=hit&&Math.random()<.18;let tx=T.x,ty=(T.y||0)+dfTH(T)*(head?.92:.6),tz=T.z;
+ if(!hit){tx+=R(-1.2,1.2);ty+=R(-.5,1);tz+=R(-1.2,1.2)}if(hit&&DF.gsrc[i])damageAny(T,34*(head?2:1),DF.gsrc[i],{head,wname:'Camp Rifle'});dfFx(['g',i,dfR2(tx),dfR2(ty),dfR2(tz),hit?1:0])}
+function dfSim(dt){DF.colT-=dt;if(DF.colT<=0){DF.colT=.5;dfCollect()}const H=dfHostiles();
+ for(const st of DF.list){if(st.broken||!st.src)continue;if(st.hp<=0){dfBreak(st);continue}st.src.x=st.x;st.src.y=st.y+.5;st.src.z=st.z;
+   if(st.type==='spike_trap')dfSpike(st,dt,H);else if(st.type==='shock_fence')dfShock(st,dt,H);else if(st.type==='flame_trap')dfFlame(st,dt,H);else dfTurret(st,dt,H);if(st.hp<=0)dfBreak(st)}
+ if(CAMP.ready&&DF.built)dfCampSim(dt,H);
+ if(NET.role==='host'){DF.fxT-=dt;if(DF.fxq.length&&DF.fxT<=0){DF.fxT=.1;netBroadcast({k:'d_fx',e:DF.fxq.splice(0,48)})}}else DF.fxq.length=0}
+onHook('worldTick',dt=>{if(!S||!P||NET.role==='client')return;DF.frame++;dfSim(dt)});
+
+/* ---- combat & AI integration ---- */
+DMG_EXT.df_trap=(t,dmg)=>{const st=t&&t.trap;if(!st||st.broken||NET.role==='client'||!(dmg>0))return;st.hp-=dmg;if(Math.random()<.6)dfFx(['h',dfR2(st.x),dfR2(st.y+.7),dfR2(st.z)]);if(st.hp<=0)dfBreak(st)};
+DMG_EXT.turret=(t,d,s,o)=>DMG_EXT.df_trap(t,d,s,o);KNOCK_EXT.turret=()=>{};DMG_EXT.df_guard=()=>{};DMG_EXT.df_trader=()=>{};KNOCK_EXT.df_trap=()=>{};KNOCK_EXT.df_guard=()=>{};KNOCK_EXT.df_trader=()=>{};
+// hostile players fight back against turrets that shoot them (bows included: their arrows can hit the turret)
+PROJ_EXT.push((pr,o,dir,L,test)=>{if(NET.role==='client'||!pr||!pr.owner||pr.owner.t!=='npc')return;for(const st of DF.list)if(st.type==='auto_turret'&&!st.broken&&st.src&&Math.abs(st.x-o.x)<L+2&&Math.abs(st.z-o.z)<L+2)test(['df_trap',st.src],st.src,.5,st.y,st.y+1.3)});
+PROJ_HIT.df_trap=(pr,e,np)=>{burst(np,['#ffe08a','#aaaaaa'],5,1.8,1.2,6,.25);sfx('metalhit',.45,np);if(e&&e.trap)DMG_EXT.df_trap(e,(pr.dmg||10)*(pr.kind==='bullet'&&typeof falloff==='function'?falloff(pr.dist||0):1))};
+FOE_EXT.push(n=>{const L=DF.foeTmp;L.length=0;for(const st of DF.list)if(st.type==='auto_turret'&&!st.broken&&st.on&&st.tgt===n)L.push(st.src);return L});
+{const _dfHostile=hostile;hostile=function(n,t){if(t&&(t===P||t.t==='rplayer')&&dfProt(t))return false;return _dfHostile.apply(this,arguments)}}
+// infected (first-wave module): players in the safe zone are invisible to them, and they never spawn inside the camp
+if(typeof zmSees==='function'){try{const _f=zmSees;zmSees=function(zb,K,t,d){if(t&&(t===P||t.t==='rplayer')&&dfProt(t))return false;return _f.apply(this,arguments)}}catch(e){}}
+if(typeof zmSpawnOK==='function'){try{const _f=zmSpawnOK;zmSpawnOK=function(x,z){if(CAMP.ready&&dist2(x,z,CAMP.x,CAMP.z)<CAMP.r+14)return false;return _f.apply(this,arguments)}}catch(e){}}
+if(typeof spawnZombie==='function'){try{const _f=spawnZombie;spawnZombie=function(kind,x,z,opts){if(CAMP.ready&&!(opts&&opts.mirror)&&isFinite(x)&&isFinite(z)){const dx=x-CAMP.x,dz=z-CAMP.z,d=Math.hypot(dx,dz);
+   if(d<CAMP.r+8){const k=(CAMP.r+12)/(d>.1?d:1);x=CAMP.x+(d>.1?dx:1)*k;z=CAMP.z+(d>.1?dz:0)*k;if(opts&&opts.y!==undefined)opts=Object.assign({},opts,{y:null})}}return _f.call(this,kind,x,z,opts)}}catch(e){}}
+onHook('kill',(t,src)=>{if(!src||typeof src!=='object')return;if((src.t==='df_trap'||src.t==='turret')&&src.trap){const st=src.trap;st.kills=(st.kills||0)+1;
+  if(st.owner===dfMe()&&P&&P.alive){tip('dfkill','Your defenses work',st.src.name+' just took one down. Keep it repaired'+(st.type==='flame_trap'?' and fuelled':'')+', and remember that noise brings more of them.');if(typeof gainXP==='function'&&st.kills%3===1){try{gainXP('survivor',4,'Defenses')}catch(e){}}}}});
+
+/* ---- effects: pooled tracers, arcs and flame particles (no runtime lights or materials) ---- */
+const dfFireL=new THREE.PointLight(0xff9a40,0,24,1.8);scene.add(dfFireL);
+const dfFxL=new THREE.PointLight(0x9fd8ff,0,14,2);scene.add(dfFxL);
+const dfFlameL=new THREE.PointLight(0xff7a20,0,16,1.8);scene.add(dfFlameL);
+const dfTrMat=new THREE.LineBasicMaterial({color:0xffd27a,transparent:true,opacity:.9,blending:THREE.AdditiveBlending,depthWrite:false});
+const dfArcMat=new THREE.LineBasicMaterial({color:0xcfefff,transparent:true,opacity:.95,blending:THREE.AdditiveBlending,depthWrite:false});
+for(let i=0;i<12;i++){const g=new THREE.BufferGeometry();g.setAttribute('position',new THREE.BufferAttribute(new Float32Array(6),3));const l=new THREE.Line(g,dfTrMat);l.visible=false;l.frustumCulled=false;scene.add(l);DF.trs.push({l,g,t:0})}
+for(let i=0;i<6;i++){const g=new THREE.BufferGeometry();g.setAttribute('position',new THREE.BufferAttribute(new Float32Array(36),3));const l=new THREE.Line(g,dfArcMat);l.visible=false;l.frustumCulled=false;scene.add(l);DF.arcs.push({l,g,t:0,a:[0,0,0],b:[0,0,0]})}
+const DF_FPN=220,dfFlGeo=new THREE.BufferGeometry(),dfFlPos=new Float32Array(DF_FPN*3),dfFlCol=new Float32Array(DF_FPN*3);
+const DF_FP=[];for(let i=0;i<DF_FPN;i++)DF_FP.push({x:0,y:0,z:0,vx:0,vy:0,vz:0,l:0,m:.55});DF.fpH=0;
+dfFlGeo.setAttribute('position',new THREE.BufferAttribute(dfFlPos,3));dfFlGeo.setAttribute('color',new THREE.BufferAttribute(dfFlCol,3));
+const dfFlPts=new THREE.Points(dfFlGeo,new THREE.PointsMaterial({size:.75,map:fireTex,vertexColors:true,transparent:true,depthWrite:false,blending:THREE.AdditiveBlending,sizeAttenuation:true}));dfFlPts.frustumCulled=false;scene.add(dfFlPts);
+function dfTracer(a,b){const t=DF.trs.find(x=>x.t<=0)||DF.trs[0];const p=t.g.attributes.position;p.setXYZ(0,a.x,a.y,a.z);p.setXYZ(1,b.x,b.y,b.z);p.needsUpdate=true;t.t=.06;t.l.visible=true}
+function dfArc(a,b){const r=DF.arcs.find(x=>x.t<=0)||DF.arcs[0];r.a=[a.x,a.y,a.z];r.b=[b.x,b.y,b.z];r.t=.16;r.l.visible=true;dfArcShape(r)}
+function dfArcShape(r){const p=r.g.attributes.position,[ax,ay,az]=r.a,[bx,by,bz]=r.b;for(let i=0;i<12;i++){const t=i/11,j=i===0||i===11?0:.22;p.setXYZ(i,lerp(ax,bx,t)+R(-j,j),lerp(ay,by,t)+R(-j,j),lerp(az,bz,t)+R(-j,j))}p.needsUpdate=true}
+function dfVisByKey(k){for(const v of DF.vis)if(v.key===k)return v;return null}
+function dfFx(e){dfPlayFx(e);if(NET.role==='host'){DF.fxq.push(e);if(DF.fxq.length>90)DF.fxq.splice(0,DF.fxq.length-90)}}
+function dfPlayFx(e){if(!Array.isArray(e)||!S||!P)return;const k=e[0];
+ if(k==='t'){const a=new V3(+e[1],+e[2],+e[3]),b=new V3(+e[4],+e[5],+e[6]),d=dist2(a.x,a.z,P.x,P.z);if(d<130){dfTracer(a,b);if(d<70)npcMuzzle(a);burst(b,e[7]?CHIP.flesh:CHIP.dirt,e[7]?4:3,1.5,1.1)}sfx('df_tshot',.75,a);
+   for(const v of DF.vis)if(v.type==='auto_turret'&&v.obj&&Math.abs(v.obj.position.x-a.x)<1.3&&Math.abs(v.obj.position.z-a.z)<1.3){v.obj.userData.flash=.08;break}}
+ else if(k==='g'){const g=DF.guards[e[1]];if(!g)return;const a=new V3(g.x+Math.sin(g.yaw)*.6,g.y+1.42,g.z+Math.cos(g.yaw)*.6),b=new V3(+e[2],+e[3],+e[4]);dfTracer(a,b);if(dist2(a.x,a.z,P.x,P.z)<90)npcMuzzle(a);
+   burst(b,e[5]?CHIP.flesh:CHIP.dirt,e[5]?5:4,1.7,1.3);sfx('df_gshot',1,a);g.atkT=1;if(NET.role==='client'){g.foe={x:b.x,y:b.y-.6,z:b.z,dead:false};g.foeT=S.time+1.6}
+   if(P.alive&&dist2(P.x,P.z,g.x,g.z)<80&&S.time>DF.gTipT){DF.gTipT=S.time+9999;tip('dfguards','The guards have your back','The camp guards shoot hostiles that come within about 30 m of the walls. Inside the safe zone the infected and hostile players lose track of you.')}}
+ else if(k==='z'){const a=new V3(+e[1],+e[2],+e[3]),b=new V3(+e[4],+e[5],+e[6]);dfArc(a,b);burst(b,['#dff4ff','#9fd8ff','#ffffff'],10,2.6,1.6,6,.3);burst(a,['#dff4ff','#ffe8a0'],6,2,1.2,6,.25);
+   if(dist2(b.x,b.z,P.x,P.z)<40){dfFxL.position.copy(b);dfFxL.intensity=4}sfx('df_zap',1,b)}
+ else if(k==='f'){DF.flames[e[1]]=+e[2]||3;const v=dfVisByKey(e[1]);sfx('df_flame',1,v&&v.obj?v.obj.position:null)}
+ else if(k==='s'){const p=new V3(+e[2],+e[3],+e[4]);burst(p,CHIP.flesh,7,1.8,1.3);burst(p,CHIP.tree,3,1.4,1);sfx('df_spike',.7,p);DF.shake[e[1]]=.25;if(typeof decal==='function'&&Math.random()<.35){try{decal(new V3(p.x,p.y-.6,p.z),'blood',.9)}catch(err){}}}
+ else if(k==='b'){const p=new V3(+e[2],+e[3]+.4,+e[4]);debris(p,DF_TYPES[e[1]]?DF_TYPES[e[1]].dcol:'#666666',10,.18,'box');burst(p,['#ffe08a','#ff9a40','#888888'],18,3.5,2.5);sfx('df_break',1,p)}
+ else if(k==='a')sfx('df_beep',.7,{x:+e[1],z:+e[3]});
+ else if(k==='h'){const p=new V3(+e[1],+e[2],+e[3]);burst(p,['#ffe08a','#ffd27a','#aaaaaa'],6,2.5,1.5,6,.3);sfx('metalhit',.45,p)}}
+function dfEmitFlame(o,dt){const ry=o.rotation.y,fx=-Math.sin(ry),fz=-Math.cos(ry),c=Math.cos(ry),s=Math.sin(ry);
+ const nx=o.position.x-.1*c-.62*s,ny=o.position.y+1.0,nz=o.position.z+.1*s-.62*c;const n=Math.min(10,Math.ceil(dt*120));
+ for(let i=0;i<n;i++){const a=R(-.2,.2),sp=R(7,10.5),vx=fx*Math.cos(a)+fz*Math.sin(a),vz=-fx*Math.sin(a)+fz*Math.cos(a);
+   const p=DF_FP[DF.fpH];DF.fpH=(DF.fpH+1)%DF_FPN;p.x=nx;p.y=ny;p.z=nz;p.vx=vx*sp;p.vy=R(-.6,1.6);p.vz=vz*sp;p.l=R(.38,.55);p.m=.55}
+ return{x:nx+fx*2.6,y:ny+.3,z:nz+fz*2.6}}
+function dfUpdateFx(dt,run){for(const t of DF.trs)if(t.t>0){t.t-=dt;if(t.t<=0)t.l.visible=false}
+ for(const r of DF.arcs)if(r.t>0){r.t-=dt;if(r.t<=0)r.l.visible=false;else dfArcShape(r)}
+ dfFxL.intensity=Math.max(0,dfFxL.intensity-dt*36);
+ const F=DF_FP,dr=Math.max(0,1-2.4*dt);let n=0;for(let i=0;i<DF_FPN;i++){const p=F[i];if(!(p.l>0))continue;if(run){p.l-=dt;if(p.l<=0)continue;p.vx*=dr;p.vz*=dr;p.vy=p.vy*dr+3.2*dt;p.x+=p.vx*dt;p.y+=p.vy*dt;p.z+=p.vz*dt}const t=clamp(p.l/p.m,0,1);dfFlPos[n*3]=p.x;dfFlPos[n*3+1]=p.y;dfFlPos[n*3+2]=p.z;dfFlCol[n*3]=t>.15?1:t*6.6;dfFlCol[n*3+1]=t>.6?.85:t>.3?.48*t/.6+.1:t*.6;dfFlCol[n*3+2]=t>.75?.45:.05;n++}
+ dfFlGeo.setDrawRange(0,n);dfFlGeo.attributes.position.needsUpdate=true;dfFlGeo.attributes.color.needsUpdate=true;dfFlPts.visible=n>0}
+
+/* ---- trap visuals (all peers) ---- */
+function dfRebuildVis(){const V=[];for(const d of deps)if(DF_T.has(d.type))V.push({key:dfKeyOfDep(d),type:d.type,obj:d.obj,dep:d});for(const k in DF.rmesh){const r=DF.rmesh[k];V.push({key:k,type:r.type,obj:r.obj,dep:null})}DF.vis=V}
+function dfVisState(v){if(NET.role!=='client')return v.dep?dfStateOf(v.dep):(DF.rs[v.key]||null);return DF.cs[v.key]||null}
+{const _dfBuildRemote=buildRemote;buildRemote=function(owner,d){const r=_dfBuildRemote.apply(this,arguments);try{dfLinkRemote(owner)}catch(e){}return r}}
+function dfLinkRemote(owner){for(const k in DF.rmesh)if(DF.rmesh[k].owner===owner)delete DF.rmesh[k];const rb=remoteBases[owner];if(rb&&rb.g&&rb.g.children)for(const ch of rb.g.children){const u=ch&&ch.userData;
+  if(u&&u.dfType){const key=dfKey(owner,u.dfType,ch.position.x,ch.position.z);DF.rmesh[key]={owner,type:u.dfType,obj:ch};const st=DF.rs[key];if(st&&st.broken)ch.visible=false}}DF.visT=0}
+function dfAnimTrap(v,dt,run,near){const o=v.obj;if(!o)return;const u=o.userData||{},st=dfVisState(v),cl=NET.role==='client';
+ if(v.type==='auto_turret'&&u.head){let yaw,pit;if(st&&st.yaw!==undefined){if(cl){st.vy=dfTurn(st.vy===undefined?st.yaw:st.vy,st.yaw,dt*8);st.vp=lerp(st.vp||0,st.pitch||0,Math.min(1,dt*8));yaw=st.vy;pit=st.vp}else{yaw=st.yaw;pit=st.pitch}}else{yaw=o.rotation.y+Math.PI;pit=0}
+   u.head.rotation.y=yaw+Math.PI-o.rotation.y;u.gun.rotation.x=pit;const on=!st||st.on!==false,busy=st&&(cl?st.act:!!st.tgt);u.led.material=!on?DFM.st_off:busy&&Math.sin(S.time*14)>0?DFM.st_warn:DFM.st_on;
+   if(u.flash>0){u.flash-=dt;u.gun.position.z=-.22+u.flash*.6}else u.gun.position.z=-.22}
+ else if(v.type==='flame_trap'&&u.pilot){const fuel=st?st.fuel:40;u.pilot.visible=fuel>=1;if(u.pilot.visible&&near){const s=.09+Math.random()*.035;u.pilot.scale.set(s,s*1.5,1)}
+   if(DF.flames[v.key]>0&&run&&near){const lp=dfEmitFlame(o,dt);if(!DF.flameNear||dist2(lp.x,lp.z,P.x,P.z)<dist2(DF.flameNear.x,DF.flameNear.z,P.x,P.z))DF.flameNear=lp}}
+ else if(v.type==='shock_fence'&&u.led){const ch=st?st.charge:100;u.led.material=ch>=60?DFM.st_on:ch>=20?DFM.st_warn:DFM.st_off;
+   if(run&&near&&ch>=20&&Math.random()<dt*.3){const c=Math.cos(o.rotation.y),s=Math.sin(o.rotation.y),lx=R(-1.4,1.4);burst(new V3(o.position.x+lx*c,o.position.y+pick([.3,.62,.94,1.26]),o.position.z-lx*s),['#dff4ff','#9fd8ff'],3,1.2,.8,6,.18);if(dist2(o.position.x,o.position.z,P.x,P.z)<9)sfx('df_crackle',.35,o.position)}}
+ if(DF.shake[v.key]>0){if(u.bx===undefined){u.bx=o.position.x;u.bz=o.position.z}o.position.x=u.bx+R(-.03,.03);o.position.z=u.bz+R(-.03,.03)}else if(u.bx!==undefined){o.position.x=u.bx;o.position.z=u.bz;u.bx=undefined}}
+function dfVisTick(dt){const run=!!(S.active||NET.role);DF.visT-=dt;if(DF.visT<=0){DF.visT=.5;dfRebuildVis()}
+ for(const k in DF.flames){DF.flames[k]-=dt;if(DF.flames[k]<=0)delete DF.flames[k]}for(const k in DF.shake){DF.shake[k]-=dt;if(DF.shake[k]<=0)delete DF.shake[k]}
+ DF.flameNear=null;for(const v of DF.vis){const o=v.obj;const near=!!o&&Math.abs(o.position.x-P.x)<80&&Math.abs(o.position.z-P.z)<80;dfAnimTrap(v,dt,run,near)}
+ const fn=DF.flameNear;if(fn&&dist2(fn.x,fn.z,P.x,P.z)<60){dfFlameL.position.set(fn.x,fn.y,fn.z);dfFlameL.intensity=2.6+Math.random()*.8;DF.roarT-=dt;if(DF.roarT<=0){DF.roarT=.16;sfx('df_roar',.55,fn)}}else dfFlameL.intensity=Math.max(0,dfFlameL.intensity-dt*12);
+ dfUpdateFx(dt,run)}
+
+/* ---- camp life: lights, sounds, guards, trader, flag ---- */
+function dfHum(){if(!AC||!MASTER||!DF.genPos)return;if(!DF.hum){try{const o=AC.createOscillator(),o2=AC.createOscillator(),f=AC.createBiquadFilter(),g=AC.createGain();o.type='sawtooth';o.frequency.value=52;o2.type='square';o2.frequency.value=104.5;f.type='lowpass';f.frequency.value=240;g.gain.value=0;
+   o.connect(f);o2.connect(f);f.connect(g);g.connect(MASTER);o.start();o2.start();DF.hum={g}}catch(e){DF.hum={g:null}}}
+ if(!DF.hum.g)return;const d=dist2(P.x,P.z,DF.genPos.x,DF.genPos.z),v=!muted&&inGame()&&d<30?Math.pow(1-d/30,2)*.05:0;DF.hum.g.gain.setTargetAtTime(v,AC.currentTime,.25)}
+function dfTraderTick(dt){const t=DF.trader;if(!t)return;const d=dist2(P.x,P.z,t.x,t.z);
+ if(P.alive&&d<9&&!t.near){t.near=true;if(S.time>t.greetT){t.greetT=S.time+45;t.wave=2.2;sfx('df_chirp',.8,t)}}if(d>14)t.near=false;
+ t.wave=Math.max(0,t.wave-dt);t.nod=Math.max(0,t.nod-dt);t.use=Math.max(0,t.use-dt);t.flinch=Math.max(0,t.flinch-dt);
+ const look=P.alive&&d<12;const ly=look?clamp(dfAng(Math.atan2(P.x-t.x,P.z-t.z)-t.yaw),-1.1,1.1):Math.sin(S.time*.35)*.35;const lp=look?clamp(Math.atan2(P.y+1.5-(t.y+1.6),Math.max(d,.5)),-.5,.5):0;
+ if(t.rig){if(Math.abs(t.x-P.x)>90||Math.abs(t.z-P.z)>90)return;const s=DF.trS||(DF.trS={});s.speed=0;s.idle=!t.use;s.lookYaw=ly;s.lookPitch=lp-(t.nod>0?Math.sin(t.nod*14)*.25:0);s.stagger=t.flinch;s.staggerDir=1;
+   s.attack=t.use>0?1-t.use/.9:0;s.attackStyle='use';s.aim=0;s.carry=0;s.crouch=0;try{animateRig(t.rig,s,dt)}catch(e){}
+   if(t.wave>0){t.rig.armR.rotation.x=-.15;t.rig.armR.rotation.z=2.55+Math.sin(S.time*11)*.32;if(t.rig.foreR)t.rig.foreR.rotation.x=.35}}
+ else{t.head.rotation.y=lerp(t.head.rotation.y,ly,Math.min(1,dt*5));t.head.rotation.x=lerp(t.head.rotation.x,-lp+(t.nod>0?Math.sin(t.nod*14)*.2:0),Math.min(1,dt*5));t.body.scale.y=1+Math.sin(S.time*1.8)*.012;
+   const k=Math.min(1,dt*8);if(t.wave>0){t.aR.rotation.z=lerp(t.aR.rotation.z,2.55+Math.sin(S.time*11)*.32,k);t.aR.rotation.x=lerp(t.aR.rotation.x,0,k)}else{t.aR.rotation.z=lerp(t.aR.rotation.z,0,k);t.aR.rotation.x=lerp(t.aR.rotation.x,t.use>0?1.3:.55+Math.sin(S.time*1.3)*.05,k)}
+   t.aL.rotation.x=lerp(t.aL.rotation.x,.55+Math.sin(S.time*1.1+1)*.05,k)}}
+function dfCampVis(dt,run){const cx=CAMP.x,cz=CAMP.z,dC=dist2(P.x,P.z,cx,cz),near=dC<130,night=dfNight();
+ if(!near){dfFireL.intensity=0;DFM.beam.opacity=0;if(DF.hum&&DF.hum.g&&AC)DF.hum.g.gain.setTargetAtTime(0,AC.currentTime,.3);return}
+ const fl=.85+Math.sin(S.time*17)*.08+Math.sin(S.time*7.3)*.07;dfFireL.intensity=(.45+night*2.1)*fl;for(let i=0;i<DF.fireSpr.length;i++){const f=DF.fireSpr[i],b=[.9,.6,.55][i]||.6,s=b*(.88+Math.sin(S.time*(13+i*5))*.1+Math.random()*.05);f.scale.set(s,s*1.45,1)}
+ const bk=.5+night*1.7;DFM.bulb.color.setRGB(bk,bk*.93,bk*.8);DFM.beam.opacity=night*.07;
+ for(let i=0;i<DF.beams.length;i++){const g=DF.guards[i],b=DF.beams[i];const yaw=g?g.yaw+(g.aim?0:Math.sin(S.time*.6+i)*.25):(DF.towers[i]?DF.towers[i].yaw:0);b.rotation.y=yaw+Math.PI}
+ for(const g of DF.guards){if(NET.role==='client'){if(g.tyaw!==undefined)g.yaw=dfTurn(g.yaw,g.tyaw,dt*6);if(g.foe&&S.time>g.foeT)g.foe=null;if(g.aim&&!g.foe)g.foe={x:g.x+Math.sin(g.yaw)*25,y:groundH(g.x+Math.sin(g.yaw)*25,g.z+Math.cos(g.yaw)*25),z:g.z+Math.cos(g.yaw)*25,dead:false}}
+   g.state=g.aim?'chase':'wander';g.speed=0;try{animateNpc(g,dt)}catch(e){g.obj.position.set(g.x,g.y,g.z);g.obj.rotation.y=g.yaw+Math.PI}}
+ dfTraderTick(dt);
+ if(DF.flag&&dC<90){const a=DF.flag.m.geometry.attributes.position,b=DF.flag.base;for(let i=0;i<a.count;i++){const x=b[i*3],y=b[i*3+1],w=x/1.8;a.setZ(i,(Math.sin(x*3.2-S.time*5.5+y*.8)*.14+Math.sin(S.time*2.1+x)*.05)*w)}a.needsUpdate=true}
+ if(DF.gen&&dC<45){DF.gen.position.y=Math.sin(S.time*60)*.004;DF.gen.position.x=17+Math.sin(S.time*53)*.003}
+ if(run){DF.smokeT-=dt;if(DF.smokeT<=0&&dC<60){DF.smokeT=.45;burst(new V3(DF.genPos.x+.45,DF.genPos.y+1.75,DF.genPos.z-.2),['#5a5a5a','#6a6a6a','#7a7a7a'],2,.25,1.1,-1.2,1.6)}
+   DF.emberT-=dt;if(DF.emberT<=0&&dC<50&&DF.firePos){DF.emberT=R(.15,.4);burst(new V3(DF.firePos.x,DF.firePos.y+.5,DF.firePos.z),['#ffb040','#ff7020','#ffe080'],1,.35,2.2,-.6,1.4)}
+   DF.crackT-=dt;if(DF.crackT<=0&&DF.firePos){DF.crackT=R(.08,.3);const fd=dist2(P.x,P.z,DF.firePos.x,DF.firePos.z);if(fd<12)sfx('df_crackle',.25*(1-fd/12),DF.firePos)}
+   DF.hammerT-=dt;if(DF.hammerT<=0){DF.hammerT=R(6,13);if(!night&&dC<60&&DF.wbPos)for(let i=0;i<RI(2,4);i++)setTimeout(()=>{if(S&&P)sfx('df_hammer',.35,DF.wbPos)},i*380)}}
+ dfHum()}
+function dfLocalChecks(dt){if(!CAMP.ready||!P||!P.alive)return;const d=dist2(P.x,P.z,CAMP.x,CAMP.z);
+ if(d<150)tip('dfcamp',CAMP.name,'A fortified survivor camp. Inside its walls you are safe: hostiles lose interest and the tower guards shoot anything that follows you in. <b>Mags</b> trades scrap for supplies, and there is a recycler, a free workbench, water and a campfire.');
+ if(d<60)S.dfFound=1;const inside=d<CAMP.r;if(inside!==DF.wasIn){DF.wasIn=inside;dfBanner(inside);if(inside)tip('dfsafe','Safe zone','While you are inside the camp the infected and hostile players cannot target you, and anything that wanders in is pushed back out. You cannot build here, and attacking from inside marks you hostile for 30 s. Once you have found the camp you can respawn here after death.')}}
+onHook('anyTick',dt=>{if(!S||!P)return;dfVisTick(dt);dfBannerTick();if(CAMP.ready&&DF.built)dfCampVis(dt,!!(S.active||NET.role));dfLocalChecks(dt);
+ if(!P.alive&&(S.dfRespT||0)>S.time-1&&Math.floor(S.time)!==Math.floor(S.time-dt))renderSpawns()});
+
+/* ---- networking ---- */
+// trap rows are delta-encoded: only rows whose values changed since the last send, plus a full list every 2 s (dtf=1) so
+// late joiners catch up and removed traps are dropped; idle traps therefore cost almost nothing
+onHook('snapshot',m=>{DF.snapN++;if(DF.snapN%2)return;const full=DF.snapN%20===0,last=DF.lastRow||(DF.lastRow={}),rows=[],seen={};
+ for(const s of DF.list){if(s.broken)continue;const r=[s.key,Math.round(s.hp/s.max*100),Math.round(s.charge),Math.floor(s.fuel),s.on?1:0,+s.yaw.toFixed(2),+s.pitch.toFixed(2),s.type==='auto_turret'?(s.tgt?1:0):(s.active>0?1:0),s.kills|0];
+   const sig=r.join(',');seen[s.key]=1;if(full||last[s.key]!==sig){last[s.key]=sig;rows.push(r)}}
+ for(const k in last)if(!seen[k])delete last[k];
+ if(rows.length||full)m.dtr=rows;if(full)m.dtf=1;
+ m.dgd=DF.guards.map(g=>[+g.yaw.toFixed(2),g.aim?1:0])});
+onHook('applySnap',m=>{if(Array.isArray(m.dtr)){const seen={};for(const r of m.dtr){if(!Array.isArray(r)||typeof r[0]!=='string')continue;const key=r[0];seen[key]=1;let c=DF.cs[key];if(!c)c=DF.cs[key]=dfMirror(key);
+   c.hp=(+r[1]||0)/100*c.max;c.charge=+r[2]||0;c.fuel=+r[3]||0;c.on=!!r[4];c.yaw=+r[5]||0;c.pitch=+r[6]||0;c.act=r[7]?1:0;c.kills=+r[8]||0;c.synced=1}
+  if(m.dtf)for(const k in DF.cs)if(!seen[k]&&DF.cs[k].synced)delete DF.cs[k]}
+ if(Array.isArray(m.dgd))for(let i=0;i<DF.guards.length&&i<m.dgd.length;i++){const r=m.dgd[i];if(!Array.isArray(r))continue;DF.guards[i].tyaw=+r[0]||0;DF.guards[i].aim=r[1]?1:0}});
+onHook('netMsg',m=>{if(!m||typeof m.k!=='string'||m.k.slice(0,2)!=='d_')return;
+ if(m.k==='d_fx'){if(NET.role==='client'&&Array.isArray(m.e))for(const e of m.e){try{dfPlayFx(e)}catch(err){}}return}
+ if(m.k==='d_brk'){if(NET.role==='client'&&typeof m.key==='string'){const d=deps.find(x=>DF_T.has(x.type)&&dfKeyOfDep(x)===m.key);if(d){dfRemoveDep(d);feedMsg('Your '+DF_TYPES[d.type].n+' was destroyed');delete DF.cs[m.key]}}return}
+ if(NET.role!=='host'||typeof m.key!=='string'||!m.from||m.key.indexOf(m.from+'|')!==0)return;
+ const st=DF.rs[m.key];if(st)dfApplyOp(st,m);else{const L=DF.pend[m.key]||(DF.pend[m.key]=[]);if(L.length<20)L.push(m)}});
+
+/* ---- interaction ---- */
+AIM_EXT.push((o,d,maxT,consider)=>{if(!DF.built||!DF.inter.length||Math.abs(o.x-CAMP.x)>45||Math.abs(o.z-CAMP.z)>45)return;for(const it of DF.inter)consider(rayBox(o,d,it.box,maxT),{kind:it.kind,e:it.kind==='trader'?(DF.trader||it):it})});
+INTERACT_EXT.push(a=>{if(a.kind==='dep'&&a.e&&DF_T.has(a.e.type)){DF.aim=a.e;return{kind:a.e.type,e:a.e}}
+ if(a.kind==='trader')return{kind:'trader',e:a.e};if(a.kind==='df_wb')return{kind:'df_wb',e:a.e};if(a.kind==='df_water')return{kind:'water'};if(a.kind==='df_fire'&&DF.fireDep)return{kind:'campfire',e:DF.fireDep};return null});
+for(const t of DF_T)INTERACT_DO[t]=x=>dfOpenTrapPanel(x.e);
+INTERACT_DO.trader=()=>dfOpenTrader();
+INTERACT_DO.df_wb=()=>{renderWB();tip('dfwb','Camp workbench','Standing next to this bench counts as <b>Workbench Level 1</b>, so you can craft T1 recipes here without building your own. In real Rust, safe zones have public workbenches like this too.')};
+HIT_EXT.trader=a=>{sfx('thud',.4,a.point);dfTraderBark('hit');if(DF.trader)DF.trader.flinch=.4;return true};
+HIT_EXT.df_wb=HIT_EXT.df_water=HIT_EXT.df_fire=a=>{sfx('thud',.4,a.point);burst(a.point,CHIP.build,4,1.5,1.2);return true};
+PROJ_EXT.push((pr,o,dir,L,test)=>{const t=DF.trader;if(!t||Math.abs(o.x-t.x)>L+2||Math.abs(o.z-t.z)>L+2)return;test(['df_npc',t],t,.42,t.y,t.y+1.85)});
+PROJ_HIT.df_npc=(pr,e,np,src)=>{burst(np,CHIP.build,4,1.4,1);sfx('hit',.5,np);if(src==='player'){dfTraderBark('hit');if(DF.trader)DF.trader.flinch=.5}};
+{const _dfWb=wbLevel;wbLevel=function(){const l=_dfWb.apply(this,arguments);if(l>=1||!DF.wbPos||!P)return l;return dist2(DF.wbPos.x,DF.wbPos.z,P.x,P.z)<6&&Math.abs(DF.wbPos.y-P.y)<3?1:l}}
+{const _dfCf=updateComfort;updateComfort=function(dt){const r=_dfCf.apply(this,arguments);const f=DF.firePos;if(f&&dist2(P.x,P.z,f.x,f.z)<4.5&&Math.abs(P.y-f.y)<2)P.comfort=clamp((P.comfort||0)+dt*.37,0,1);return r}}
+{const _dfTp=updateTemp;updateTemp=function(dt){const r=_dfTp.apply(this,arguments);const f=DF.firePos;if(f){const dd=dist2(P.x,P.z,f.x,f.z);if(dd<5)P.temp=lerp(P.temp,P.temp+14*(1-dd/5),Math.min(1,dt*.4))}return r}}
+
+/* ---- trap panel ---- */
+function dfStatusTxt(type,st){if(type==='auto_turret')return st.on===false?'<span class="warn">OFFLINE</span>':st.act||st.tgt?'<span style="color:#ffb030">ENGAGING</span>':'<span class="good">ONLINE · scanning</span>';
+ if(type==='flame_trap')return st.fuel<1?'<span class="warn">OUT OF FUEL</span>':'<span class="good">ARMED</span>';if(type==='shock_fence')return st.charge<20?'<span class="warn">RECHARGING</span>':'<span class="good">LIVE</span>';
+ const h=st.hp/st.max;return h>.6?'<span class="good">Sturdy</span>':h>.3?'<span style="color:#e8b04a">Worn</span>':'<span class="warn">Falling apart</span>'}
+function dfOpenTrapPanel(d){if(!d||!DF_T.has(d.type))return;DF.panelDep=d;dfRenderTrapPanel()}
+function dfRenderTrapPanel(){const d=DF.panelDep;if(!d||!deps.includes(d)){DF.panelDep=null;return}const st=dfStateOf(d),T=DF_TYPES[d.type],it=ITEMS[d.type],hp=clamp(st.hp/st.max,0,1);
+ const bar=(lab,v,c,txt)=>`<div class="dfpb"><div class="dfpl"><span>${lab}</span><b>${txt}</b></div><div class="dfbar big"><i style="width:${Math.round(clamp(v,0,1)*100)}%;background:${c}"></i></div></div>`;
+ let h=`<div class="dfp-top"><div class="dfp-sw" style="background:${it.c}"></div><div><div class="dfp-n">${T.n}</div><div class="lab">${dfStatusTxt(d.type,st)}</div></div></div>`;
+ h+=bar('Durability',hp,hp>.5?'#a4c35a':hp>.25?'#e8b04a':'#e0624d',Math.ceil(st.hp)+' / '+st.max);const acts=[];
+ if(d.type==='auto_turret'){h+=`<div class="kv"><span>Range</span><div>30 m, needs line of sight</div><span>Targets</span><div>Infected, hostile players, wolves and boars. Never players.</div><span>Kills</span><div>${st.kills|0}</div><span>Power</span><div>Internal battery (training) · unlimited ammo</div></div>`;
+   acts.push(`<button class="btn ${st.on===false?'':'red'}" data-dfa="power">${st.on===false?'Switch ON':'Switch OFF'}</button>`)}
+ if(d.type==='flame_trap'){const lg=P.inv.lgf||0;h+=bar('Fuel',st.fuel/100,'#e07a2a',Math.floor(st.fuel)+' / 100');const ok=lg>0&&st.fuel<=99;
+   acts.push(`<button class="btn" data-dfa="fuel10" ${ok?'':'disabled'}>Add 10 Low Grade Fuel</button>`,`<button class="btn" data-dfa="fuelmax" ${ok?'':'disabled'}>Fill tank</button>`);h+=`<p class="dfp-note">Each 3-second burst burns 10 fuel. You carry ${lg} Low Grade Fuel. Kills so far: ${st.kills|0}.</p>`}
+ if(d.type==='shock_fence'){h+=bar('Charge',st.charge/100,'#7fc8ff',Math.floor(st.charge)+'%');if(ITEMS.battery)acts.push(`<button class="btn" data-dfa="battery" ${has('battery')&&st.charge<99?'':'disabled'}>Insert ${ITEMS.battery.n} (full charge)</button>`);
+   h+=`<p class="dfp-note">Each zap costs 20% charge; the charger refills about 3% per second on its own. Kills so far: ${st.kills|0}.</p>`}
+ if(d.type==='spike_trap')h+=`<p class="dfp-note">Hostiles that cross it move at a third of their speed and take 25 damage per second. Every second of contact wears it down. Kills so far: ${st.kills|0}.</p>`;
+ acts.push(`<button class="btn gray" data-dfa="repair" ${st.hp<st.max-.5&&canAfford(T.rep)?'':'disabled'}>Repair +${Math.round(T.repAmt*100)}% (${dfCostTxt(T.rep)})</button>`,`<button class="btn gray" data-dfa="pickup">Pick up</button>`);
+ h+=`<div class="actions">${acts.join('')}</div>`;openPanel(T.n,h);document.querySelectorAll('#panelBody [data-dfa]').forEach(b=>b.onclick=()=>dfTrapAct(b.dataset.dfa))}
+function dfTrapAct(act){const d=DF.panelDep;if(!d||!deps.includes(d)){closeAll();return}const st=dfStateOf(d),T=DF_TYPES[d.type],key=dfKeyOfDep(d),cl=NET.role==='client';
+ if(act==='power'){st.on=st.on===false;if(cl)hostSend({k:'d_set',key,on:st.on?1:0});sfx(st.on?'df_on':'df_off',.9,d);feedMsg(T.n+': '+(st.on?'ONLINE':'OFFLINE'))}
+ else if(act==='fuel10'||act==='fuelmax'){const room=Math.floor(100-st.fuel),n=Math.min(room,act==='fuel10'?10:room,P.inv.lgf||0);if(n>0){take('lgf',n);feed('lgf',-n);st.fuel+=n;if(cl)hostSend({k:'d_fuel',key,n});sfx('df_fill',.8,d)}}
+ else if(act==='battery'){if(has('battery')){take('battery',1);feed('battery',-1);st.charge=100;if(cl)hostSend({k:'d_bat',key});sfx('df_zap',.5,d)}}
+ else if(act==='repair'){if(st.hp<st.max-.5&&canAfford(T.rep)){pay(T.rep);for(const [k,v] of Object.entries(T.rep))feed(k,-v);const add=Math.min(st.max*T.repAmt,st.max-st.hp);st.hp+=add;if(cl)hostSend({k:'d_rep',key,n:add});sfx('df_repair',.9,d)}}
+ else if(act==='pickup'){const fuel=d.type==='flame_trap'?Math.floor(st.fuel):0;dfRemoveDep(d);gain(d.type,1);if(fuel>0)gain('lgf',fuel);delete DF.cs[key];sfx('pick');feedMsg('Picked up '+T.n);DF.colT=0;DF.visT=0;closeAll();return}
+ dfRenderTrapPanel()}
+
+/* ---- trader ---- */
+const DF_BUY=[{id:'bandage',q:1,p:6,s:8},{id:'arrow',q:10,p:12,s:6},{id:'pistol_ammo',q:8,p:24,s:5},{id:'lgf',q:25,p:10,s:6},{id:'cooked_meat',q:2,p:8,s:6},
+ {id:'molotov',q:1,p:30,s:3},{id:'uv_flare',q:1,p:22,s:3},{id:'duct_tape',q:2,p:14,s:4},{id:'battery',q:1,p:28,s:2},{id:'nails',q:20,p:12,s:5},
+ {id:'fishing_rod',q:1,p:35,s:1},{id:'bait',q:10,p:8,s:5},{id:'glider',q:1,p:160,s:1}];
+const DF_SELL=[{id:'fish_perch',l:1,p:4,c:12},{id:'fish_trout',l:1,p:6,c:10},{id:'fish_catfish',l:1,p:8,c:8},{id:'fish_pike',l:1,p:9,c:8},{id:'fish_mackerel',l:1,p:6,c:10},{id:'fish_bass',l:1,p:7,c:10},
+ {id:'fish_flounder',l:1,p:7,c:10},{id:'fish_goldfin',l:1,p:45,c:2},{id:'cooked_fish',l:1,p:5,c:10},{id:'wool',l:5,p:4,c:8},{id:'milk',l:1,p:4,c:6},{id:'cloth',l:20,p:4,c:8},
+ {id:'leather',l:10,p:5,c:6},{id:'animal_fat',l:20,p:4,c:6},{id:'bone',l:25,p:3,c:5},{id:'rope',l:1,p:3,c:6},{id:'tarp',l:1,p:6,c:6},{id:'sewing_kit',l:1,p:5,c:6},
+ {id:'metal_pipe',l:1,p:7,c:6},{id:'gears',l:1,p:9,c:6},{id:'metal_blade',l:1,p:4,c:6},{id:'road_sign',l:1,p:5,c:6},{id:'sheet_metal',l:1,p:6,c:6},{id:'chemicals',l:1,p:6,c:6},{id:'alcohol',l:1,p:3,c:6}];
+const DF_LINES={greet:['Scrap talks. What\'ll it be?','Fresh stock came in at dawn.','Wipe your boots, friend. What do you need?','You look like you could use a bandage or six.'],
+ buy:['Pleasure doing business.','Spend it wisely out there.','That\'ll keep you breathing.','Good choice.'],sell:['I can use that. Here\'s your scrap.','Fair trade.','Bring me more of those.'],
+ broke:['Come back with more scrap.','Fish, parts, wool - I buy all of it. Then we talk.'],sold:['Sold out. New stock in the morning.','That\'s the last of it today.'],full:['I\'ve got enough of those for today.'],
+ hit:['Hey! Put that away!','Easy! I\'m the one with the bandages.','Do that again and the guards will hear about it.']};
+function dfTraderBark(kind){const L=DF_LINES[kind]||DF_LINES.greet;DF.say=pick(L);if(kind==='hit')feedMsg('Mags: "'+DF.say+'"');sfx('df_chirp',.7,DF.trader||null)}
+function dfTradeDay(){const day=Math.floor(S.time/S.dayLen);if(!S.dfTrade||S.dfTrade.day!==day)S.dfTrade={day,b:{},s:{}};return S.dfTrade}
+function dfGive(id,n){const g0=S.gathered[id];gain(id,n,true);feed(id,n);if(g0===undefined)delete S.gathered[id];else S.gathered[id]=g0}
+function dfModBps(){const out=[];for(const r of RECIPES){const it=ITEMS[r.id];if(!r.bp||!it||S.bps.includes(r.id))continue;if(/mod/i.test(it.cat||'')||/(^|_)mod(_|$)/.test(r.id))out.push(r)}return out}
+function dfOpenTrader(){dfTradeDay();DF.say=pick(DF_LINES.greet);if(DF.trader){DF.trader.nod=.6;DF.trader.greetT=S.time+45}sfx('df_chirp',.9,DF.trader||null);dfRenderTrader();
+ tip('dftrader','Trading','Mags buys and sells for <b>scrap</b>. Each item has limited stock and Mags only buys so much of each thing per day; both refresh every morning at 06:00. Selling fish, wool, milk and spare components is a steady way to earn scrap.')}
+function dfRenderTrader(){const T=dfTradeDay(),sc=P.inv.scrap||0;let buy='';
+ DF_BUY.forEach((b,i)=>{const it=ITEMS[b.id];if(!it)return;const left=b.s-(T.b[b.id]||0),ok=left>0&&sc>=b.p;
+   buy+=`<div class="recipe"><div class="dfsw" style="background:${it.c}"></div><div class="nm"><b>${it.n}${b.q>1?' ×'+b.q:''}</b><small>${left>0?left+' left today':'<span class="warn">Sold out until morning</span>'}</small></div><div class="cost"><span class="${sc>=b.p?'':'no'}">${b.p} Scrap</span></div><button class="btn sm" data-dfb="${i}" ${ok?'':'disabled'}>Buy</button></div>`});
+ for(const r of dfModBps()){const it=ITEMS[r.id],p=Math.round((r.rc||75)*1.6);buy+=`<div class="recipe"><div class="dfsw" style="background:${it.c}"></div><div class="nm"><b>Blueprint: ${it.n}</b><small>Learn it for good</small></div><div class="cost"><span class="${sc>=p?'':'no'}">${p} Scrap</span></div><button class="btn sm" data-dfp="${r.id}" ${sc>=p?'':'disabled'}>Learn</button></div>`}
+ let sell='';const also=[];DF_SELL.forEach((s,i)=>{const it=ITEMS[s.id];if(!it)return;const have=P.inv[s.id]||0,capLeft=s.c-(T.s[s.id]||0);if(have<s.l){also.push(it.n);return}const lots=Math.max(0,Math.min(Math.floor(have/s.l),capLeft));
+   sell+=`<div class="recipe"><div class="dfsw" style="background:${it.c}"></div><div class="nm"><b>${it.n}</b><small>You have ${have} · ${capLeft>0?'buys '+capLeft*s.l+' more today':'<span class="warn">enough for today</span>'}</small></div><div class="cost">${s.l>1?s.l+' for ':''}${s.p} Scrap</div><div class="dfbtns"><button class="btn sm" data-dfs="${i}" ${lots>0?'':'disabled'}>Sell</button><button class="btn sm gray" data-dfsa="${i}" ${lots>1?'':'disabled'}>All ×${lots}</button></div></div>`});
+ const html=`<div class="dft-top"><div class="dft-face"></div><div><b>Mags</b> <span class="lab">· ${CAMP.name} quartermaster</span><div class="dft-say">"${DF.say}"</div></div><div class="dft-scrap">${sc}<small>SCRAP</small></div></div>
+<div class="cols"><div><div class="sec">Buy</div>${buy}</div><div><div class="sec">Sell</div>${sell||'<p class="lab">Nothing Mags wants in your pockets right now.</p>'}${also.length?`<p class="dft-also"><b>Also buys:</b> ${also.join(', ')}</p>`:''}</div></div>
+<p class="dft-foot">Stock and buying limits reset every morning at 06:00 · Prices in scrap · Purchases are yours alone, even in co-op.</p>`;
+ openPanel('Mags\' Barter · '+CAMP.name,html);const q=s=>document.querySelectorAll('#panelBody '+s);
+ q('[data-dfb]').forEach(b=>b.onclick=()=>dfBuy(+b.dataset.dfb));q('[data-dfp]').forEach(b=>b.onclick=()=>dfBuyBp(b.dataset.dfp));q('[data-dfs]').forEach(b=>b.onclick=()=>dfSell(+b.dataset.dfs,false));q('[data-dfsa]').forEach(b=>b.onclick=()=>dfSell(+b.dataset.dfsa,true))}
+function dfBuy(i){const b=DF_BUY[i],it=b&&ITEMS[b.id];if(!it)return;const T=dfTradeDay();if(b.s-(T.b[b.id]||0)<=0){DF.say=pick(DF_LINES.sold);dfRenderTrader();return}
+ if(!has('scrap',b.p)){DF.say=pick(DF_LINES.broke);sfx('click');dfRenderTrader();return}
+ take('scrap',b.p);feed('scrap',-b.p);dfGive(b.id,b.q);T.b[b.id]=(T.b[b.id]||0)+1;DF.say=pick(DF_LINES.buy);sfx('df_coin',.9);if(DF.trader)DF.trader.use=.9;dfRenderTrader()}
+function dfBuyBp(id){const r=recipeOf(id),it=ITEMS[id];if(!r||!it||S.bps.includes(id))return;const p=Math.round((r.rc||75)*1.6);if(!has('scrap',p)){DF.say=pick(DF_LINES.broke);dfRenderTrader();return}
+ take('scrap',p);feed('scrap',-p);S.bps.push(id);sfx('craft');feedMsg('Blueprint learned: '+it.n);DF.say=pick(DF_LINES.buy);if(DF.trader)DF.trader.use=.9;dfRenderTrader()}
+function dfSell(i,all){const s=DF_SELL[i],it=s&&ITEMS[s.id];if(!it)return;const T=dfTradeDay(),capLeft=s.c-(T.s[s.id]||0);
+ if(capLeft<=0){DF.say=pick(DF_LINES.full);dfRenderTrader();return}const lots=Math.min(Math.floor((P.inv[s.id]||0)/s.l),capLeft,all?999:1);if(lots<=0)return;
+ take(s.id,lots*s.l);feed(s.id,-lots*s.l);dfGive('scrap',lots*s.p);T.s[s.id]=(T.s[s.id]||0)+lots;DF.say=pick(DF_LINES.sell);sfx('df_coin',.9);if(DF.trader)DF.trader.nod=.6;dfRenderTrader()}
+
+/* ---- HUD: banner, trap status chip, safe-zone chip, map markers ---- */
+{const css=document.createElement('style');css.textContent=`
+#dfBanner{position:absolute;left:50%;top:27%;transform:translate(-50%,-10px);text-align:center;opacity:0;transition:opacity .7s,transform .7s;pointer-events:none;text-shadow:0 2px 10px rgba(0,0,0,.85);white-space:nowrap}
+#dfBanner.on{opacity:1;transform:translate(-50%,0)}
+#dfBanner .t{font-size:34px;font-weight:700;letter-spacing:.3em;color:#e8f2dc}#dfBanner .t.sm{font-size:21px;color:#e8cfb0}
+#dfBanner .t:before,#dfBanner .t:after{content:'';display:inline-block;width:46px;height:2px;background:currentColor;opacity:.55;vertical-align:middle;margin:0 16px}
+#dfBanner .s{font-size:12.5px;letter-spacing:.22em;color:#9fe08a;margin-top:3px;text-transform:uppercase}
+#dfStat{position:absolute;left:50%;top:calc(50% + 66px);transform:translateX(-50%);background:rgba(20,20,18,.78);padding:6px 10px 7px;min-width:200px;font-size:12px;border-left:3px solid #7fd0ff;white-space:nowrap}
+#dfStat b{font-size:13px;letter-spacing:.03em}#dfStat .st{float:right;font-weight:700;margin-left:12px;font-size:11px;letter-spacing:.08em}
+.dfbar{height:5px;background:rgba(255,255,255,.1);margin-top:4px;position:relative}.dfbar.big{height:9px}.dfbar i{position:absolute;left:0;top:0;bottom:0}
+.dfrow{display:flex;align-items:center;gap:6px;margin-top:3px;font-size:10.5px;color:#bdb5a8;text-transform:uppercase;letter-spacing:.06em}.dfrow .dfbar{flex:1;margin:0}
+.dfsw{width:12px;height:30px;flex:none}.dfbtns{display:flex;flex-direction:column;gap:3px}
+.dfp-top{display:flex;gap:10px;align-items:center;margin-bottom:10px}.dfp-sw{width:30px;height:30px}.dfp-n{font-size:18px;font-weight:700}
+.dfpb{margin:6px 0 10px}.dfpl{display:flex;justify-content:space-between;font-size:12px;color:var(--dim);text-transform:uppercase;letter-spacing:.06em}.dfpl b{color:#e3dccf}
+.dfp-note{color:var(--dim);font-size:13px;margin:6px 0}
+.dft-top{display:flex;align-items:center;gap:12px;background:rgba(0,0,0,.25);padding:10px 12px;margin-bottom:12px;border-left:3px solid var(--yellow)}
+.dft-face{width:44px;height:44px;border-radius:50%;flex:none;background:radial-gradient(circle at 50% 46%,#c99d7b 0 34%,#8f8b84 35% 52%,#4d3826 53% 70%,rgba(0,0,0,0) 71%)}
+.dft-say{font-style:italic;color:#e8dcc0;margin-top:3px}.dft-scrap{margin-left:auto;text-align:right;font-size:24px;font-weight:700;color:#d8b24a}.dft-scrap small{display:block;font-size:10px;letter-spacing:.15em;color:var(--dim)}
+.dft-also{font-size:12.5px;color:var(--dim);margin-top:8px}.dft-foot{font-size:12px;color:var(--dim);margin-top:10px}`;document.head.appendChild(css);
+ const b=document.createElement('div');b.id='dfBanner';$('#hud').appendChild(b);const s=document.createElement('div');s.id='dfStat';s.className='hidden';$('#hud').appendChild(s)}
+// queued: waits while the day/night banner or an event announcement is on screen (max 8 s), so they never stack
+function dfBanner(inside){DF.banQ=inside;DF.banQT=S?S.time:0}
+function dfOtherBanner(){try{if(typeof ZMS!=='undefined'&&ZMS&&ZMS.el&&ZMS.el.ban&&ZMS.el.ban.classList&&ZMS.el.ban.classList.contains('on')===true)return true;const t=$('#evToast');return !!(t&&t.classList&&t.classList.contains('on')===true)}catch(e){return false}}
+function dfBannerTick(){if(DF.banQ===undefined||!S)return;if(dfOtherBanner()&&S.time-DF.banQT<8)return;const v=DF.banQ;DF.banQ=undefined;dfBannerShow(v)}
+function dfBannerShow(inside){const el=$('#dfBanner');if(!el)return;el.innerHTML=inside?`<div class="t">${CAMP.name.toUpperCase()}</div><div class="s">Safe zone · hostiles can't follow you in</div>`:`<div class="t sm">LEAVING ${CAMP.name.toUpperCase()}</div><div class="s" style="color:#e8a87a">You're on your own out there</div>`;
+ el.classList.remove('on');void el.offsetWidth;el.classList.add('on');clearTimeout(DF.banT);DF.banT=setTimeout(()=>el.classList.remove('on'),3400);if(inside)sfx('df_on',.35)}
+onHook('hud',()=>{DF.hudN++;if(DF.hudN%4)return;const el=$('#dfStat');if(!el||!P)return;let d=null;if(P.alive&&S.active){const a=aim(5);if(a.kind==='dep'&&a.e&&DF_T.has(a.e.type))d=a.e}
+ if(!d){if(DF.statOn){DF.statOn=0;el.classList.add('hidden')}return}
+ const st=dfStateOf(d),T=DF_TYPES[d.type],hp=clamp(st.hp/st.max,0,1);const row=(lab,v,c)=>`<div class="dfrow"><span>${lab}</span><div class="dfbar"><i style="width:${Math.round(clamp(v,0,1)*100)}%;background:${c}"></i></div></div>`;
+ let h=`<b>${T.n}</b><span class="st">${dfStatusTxt(d.type,st)}</span>`+row('HP',hp,hp>.5?'#a4c35a':hp>.25?'#e8b04a':'#e0624d');
+ if(d.type==='flame_trap')h+=row('Fuel',st.fuel/100,'#e07a2a');if(d.type==='shock_fence')h+=row('Charge',st.charge/100,'#7fc8ff');
+ el.innerHTML=h;el.style.borderLeftColor=T.mm;const fc=freeCursor()&&S.active&&mouseX>=0;el.style.left=fc?mouseX+'px':'50%';el.style.top=fc?(mouseY+62)+'px':'calc(50% + 66px)';if(!DF.statOn){DF.statOn=1;el.classList.remove('hidden')}});
+onHook('status',o=>{if(P&&P.alive&&safeZone(P.x,P.z)){const h=(S.dfHostT||0)-S.time;o.push(h>0?`<span style="color:#ff7a5a">HOSTILE ${Math.ceil(h)}s</span>`:'<span style="color:#8fe08a">SAFE ZONE</span>')}});
+onHook('minimap',(m,s)=>{if(!CAMP.ready||!P)return;const x=CAMP.x*s,y=CAMP.z*s;m.save();m.strokeStyle='rgba(143,224,138,.6)';m.lineWidth=1;m.setLineDash([2,2]);m.beginPath();m.arc(x,y,Math.max(3,CAMP.r*s),0,7);m.stroke();m.setLineDash([]);
+ m.fillStyle='#8fe08a';m.strokeStyle='#10200f';m.beginPath();m.moveTo(x,y-5);m.lineTo(x+5,y+3.5);m.lineTo(x-5,y+3.5);m.closePath();m.fill();m.stroke();
+ for(const d of deps)if(DF_T.has(d.type)){m.fillStyle=DF_TYPES[d.type].mm;m.fillRect(d.x*s-1.5,d.z*s-1.5,3,3)}m.restore()});
+onHook('bigmap',(g,s)=>{if(!CAMP.ready)return;const x=CAMP.x*s,y=CAMP.z*s;g.save();g.fillStyle='rgba(143,224,138,.12)';g.strokeStyle='rgba(143,224,138,.85)';g.lineWidth=2;g.beginPath();g.arc(x,y,CAMP.r*s,0,7);g.fill();g.stroke();
+ g.fillStyle='#8fe08a';g.beginPath();g.moveTo(x,y-8);g.lineTo(x+8,y+6);g.lineTo(x-8,y+6);g.closePath();g.fill();const t=CAMP.name+' (safe zone · trader)';g.font='bold 14px Roboto Condensed,Arial';
+ g.fillStyle='rgba(0,0,0,.6)';g.fillText(t,x+12,y+5);g.fillStyle='#bff0b8';g.fillText(t,x+11,y+4);for(const d of deps)if(DF_T.has(d.type)){g.fillStyle=DF_TYPES[d.type].mm;g.fillRect(d.x*s-3,d.z*s-3,6,6)}g.restore()});
+onHook('craft',id=>{if(DF_T.has(id))tip('dfdefcraft','Base defenses','Defenses only hurt hostiles: the infected, hostile players, wolves and boars. Place them on the routes into your base and layer them: spikes slow attackers down while the fence, flames and turret do the damage. Press <b>E</b> on one to manage it.')});
+
+/* ---- respawn at the camp (after you have found it) ---- */
+{const _dfRS=renderSpawns;renderSpawns=function(){const r=_dfRS.apply(this,arguments);try{if(P&&!P.alive&&CAMP.ready&&S.dfFound){const cd=Math.max(0,(S.dfRespT||0)-S.time);
+   $('#dSpawns').insertAdjacentHTML('beforeend',`<button class="btn" ${cd>0?'disabled':''} onclick="respawn(-2)"><span>${CAMP.name} (safe zone)</span><span>${cd>0?Math.ceil(cd)+'s':'ready'}</span></button>`)}}catch(e){}return r}}
+{const _dfRespawn=respawn;respawn=function(i){if(i!==-2)return _dfRespawn.apply(this,arguments);if(!CAMP.ready||!S.dfFound||(S.dfRespT||0)>S.time||!DF.respPt)return;S.dfRespT=S.time+180;
+  const bs=beachSpawn,on=S.npcOn,pt=DF.respPt;beachSpawn=()=>({x:pt.x+R(-1.5,1.5),z:pt.z+R(-1.5,1.5)});S.npcOn=false;try{_dfRespawn.call(this,-1)}finally{beachSpawn=bs;S.npcOn=on}feedMsg('You wake up in '+CAMP.name)}}
+
+/* ---- sounds (synth, wrapped into sfx) ---- */
+const DF_SND={
+ df_zap:{rv:.2,f:(t,d)=>{nz(t,.2,'highpass',2400,.7,.9,.001,.18,d);for(let i=0;i<7;i++)tn(t+i*.022,'square',R(70,160),0,.22,.001,.025,d);tn(t,'sawtooth',180,55,.35,.002,.2,bp(d,1100,2))}},
+ df_crackle:{f:(t,d)=>{for(let i=0;i<4;i++)nz(t+i*.03+R(0,.02),.02,'highpass',3500,.7,.3,.001,.02,d)}},
+ df_flame:{rv:.15,f:(t,d)=>{nz(t,.7,'bandpass',500,.7,1,.06,.6,d,1900);nz(t,.9,'lowpass',380,.7,.7,.03,.8,d)}},
+ df_roar:{f:(t,d)=>{nz(t,.26,'lowpass',R(420,700),.7,.45,.04,.2,d)}},
+ df_tshot:{rv:.5,f:(t,d)=>{nz(t,.05,'highpass',2800,.7,.8,.001,.045,d);nz(t,.2,'lowpass',1300,.7,.75,.002,.18,d);tn(t,'square',230,70,.3,.002,.07,d);tn(t,'sine',1250,900,.08,.001,.04,d)}},
+ df_gshot:{rv:.9,f:(t,d)=>{nz(t,.12,'highpass',1500,.7,.9,.002,.1,d);nz(t,.6,'lowpass',650,.7,1,.004,.55,d);tn(t,'sine',105,34,1,.003,.32,d)}},
+ df_beep:{f:(t,d)=>{tn(t,'square',1750,1750,.1,.003,.05,d);tn(t+.08,'square',2350,2350,.1,.003,.06,d)}},
+ df_on:{f:(t,d)=>{tn(t,'sine',520,1040,.3,.01,.18,d);tn(t+.12,'square',1560,1560,.08,.003,.05,d)}},
+ df_off:{f:(t,d)=>{tn(t,'sine',900,260,.3,.01,.3,d)}},
+ df_spike:{f:(t,d)=>{tn(t,'sine',150,70,.5,.002,.12,d);nz(t,.1,'bandpass',900,1.2,.5,.002,.09,d);tn(t,'sawtooth',95,80,.15,.02,.15,bp(d,600,4))}},
+ df_break:{rv:.3,f:(t,d)=>{nz(t,.45,'highpass',900,.7,.8,.002,.4,d);for(let i=0;i<6;i++)tn(t+i*.05,'triangle',R(500,1500),R(300,800),.18,.001,.08,d);tn(t,'sine',90,40,.7,.003,.3,d)}},
+ df_chirp:{f:(t,d)=>{let tt=t;const n=RI(4,7),base=R(250,330);for(let i=0;i<n;i++){const f=base*R(.85,1.35),l=R(.05,.11);tn(tt,'triangle',f,f*R(.8,1.25),.32,.012,l,bp(d,R(900,1700),2.5));tn(tt,'sine',f*2,f*2*R(.9,1.1),.08,.01,l*.8,d);tt+=l+R(.03,.07)}}},
+ df_coin:{f:(t,d)=>{tn(t,'triangle',1320,1320,.28,.002,.12,d);tn(t+.07,'triangle',1760,1760,.28,.002,.3,d);nz(t,.05,'highpass',5000,.7,.2,.001,.05,d)}},
+ df_fill:{f:(t,d)=>{for(let i=0;i<5;i++)tn(t+i*.09,'sine',R(160,240),R(90,130),.25,.01,.07,d);nz(t,.5,'lowpass',700,.7,.25,.05,.4,d)}},
+ df_repair:{f:(t,d)=>{for(let i=0;i<3;i++){tn(t+i*.16,'triangle',R(800,1100),R(500,700),.3,.001,.08,d);nz(t+i*.16,.05,'highpass',3000,.7,.3,.001,.04,d)}}},
+ df_hammer:{f:(t,d)=>{tn(t,'triangle',950,700,.25,.001,.06,d);nz(t,.04,'highpass',3200,.7,.25,.001,.035,d)}}};
+{const _dfSfx=sfx;sfx=function(type,vol,pos){const S_=DF_SND[type];if(!S_)return _dfSfx.apply(this,arguments);if(muted||!ac())return;if(AC.state==='suspended')AC.resume();const t=AC.currentTime+.005;S_.f(t,bus(pos,vol===undefined?1:vol,S_.rv||0))}}
+
 /* ================= RENDER ================= */
 const tmpC=new THREE.Color(),tmpC2=new THREE.Color();
 const SKY={dayTop:new THREE.Color('#4a82c4'),dayBot:new THREE.Color('#bcd2de'),setTop:new THREE.Color('#3b4f7a'),setBot:new THREE.Color('#e8a26a'),nightTop:new THREE.Color('#03050b'),nightBot:new THREE.Color('#080b12'),
