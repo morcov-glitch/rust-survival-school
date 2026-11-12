@@ -5549,9 +5549,54 @@ const VH_K={
   aim:[{minx:-.33,maxx:.33,miny:.12,maxy:1.25,minz:-1.0,maxz:1.12}],
   wpos:[[0,.72],[0,-.66]],seat:[0,.05,-.15],eye:[0,1.72,-.04],camD:5,camH:1.35,
   exits:[[1.0,-.1],[-1.0,-.1],[0,-1.7],[0,1.8]],gears:[0,6,11,16,21,27,33],idleHz:44,maxHz:185,vol:.15,cut:2400,gmax:120,spotI:2.6,
-  lgf:4,use:.16,idle:.015,ram:4.2,ramSelf:2.2,crash:3,shield:0,exhaust:[-.15,.7,-.74],fire:[0,.85,.15],spot:[0,1.1,.7],flood:-.35}
+  lgf:4,use:.16,idle:.015,ram:4.2,ramSelf:2.2,crash:3,shield:0,exhaust:[-.15,.7,-.74],fire:[0,.85,.15],spot:[0,1.1,.7],flood:-.35},
+ sports:{n:'Street Racer',d:'A low, loud two-door built for speed. Huge top speed and a nitro bottle (Shift), but it is fragile and bottoms out on rough ground.',
+  hp:70,mass:1250,vmax:36,boost:44,rev:6,acc:12.5,racc:4,brake:19,drag:.0019,roll:.7,ebrake:1.2,hbrake:5,grip:15,hgrip:1.5,steer:.55,steerHi:.09,aLat:18,wb:2.7,track:1.6,wr:.36,
+  circ:[[0,1.55,.88],[0,.5,.9],[0,-.5,.9],[0,-1.55,.88]],rad:2.4,height:1.25,
+  parts:[{x:.92,z0:-2.2,z1:2.2,top:.9},{x:.75,z0:-1.2,z1:.4,top:1.25}],
+  aim:[{minx:-.92,maxx:.92,miny:.2,maxy:.92,minz:-2.2,maxz:2.2},{minx:-.75,maxx:.75,miny:.9,maxy:1.25,minz:-1.2,maxz:.4}],
+  wpos:[[.8,1.38],[-.8,1.38],[.8,-1.32],[-.8,-1.32]],seat:[.4,-.3,-.35],eye:[.4,1.12,-.3],camD:7,camH:1.3,rider:'pickup',roff:[-.02,-.38,-.4],
+  exits:[[1.7,-.3],[-1.7,-.3],[0,-3.2],[0,3.2]],gears:[0,7,13,20,27,34,45],idleHz:34,maxHz:150,vol:.2,cut:2600,gmax:180,spotI:3.6,
+  lgf:2,use:.3,idle:.02,ram:4.6,ramSelf:1,crash:2.6,shield:.5,exhaust:[.45,.34,-2.25],fire:[0,.95,1.5],spot:[0,.7,2.2],flood:-.3},
+ sedan:{n:'Family Sedan',d:'A dented four-door from before the outbreak. Comfortable, average at everything and easy on fuel.',
+  hp:85,mass:1450,vmax:27,rev:6.5,acc:9,racc:4,brake:16,drag:.0024,roll:.75,ebrake:1.1,hbrake:5.2,grip:13,hgrip:1.4,steer:.6,steerHi:.11,aLat:16,wb:2.8,track:1.62,wr:.38,
+  circ:[[0,1.6,.9],[0,.55,.92],[0,-.55,.92],[0,-1.6,.9]],rad:2.5,height:1.55,
+  parts:[{x:.92,z0:-2.3,z1:2.3,top:1.0},{x:.82,z0:-1.1,z1:.65,top:1.55}],
+  aim:[{minx:-.92,maxx:.92,miny:.25,maxy:1.02,minz:-2.3,maxz:2.3},{minx:-.82,maxx:.82,miny:1,maxy:1.56,minz:-1.1,maxz:.65}],
+  wpos:[[.8,1.45],[-.8,1.45],[.8,-1.38],[-.8,-1.38]],seat:[.4,-.18,-.2],eye:[.4,1.36,-.15],camD:7.5,camH:1.5,rider:'pickup',roff:[-.02,-.22,-.25],
+  exits:[[1.75,-.2],[-1.75,-.2],[0,-3.3],[0,3.3]],gears:[0,6,11,17,23,28],idleHz:30,maxHz:105,vol:.18,cut:1700,gmax:120,spotI:3.2,
+  lgf:3,use:.17,idle:.015,ram:5,ramSelf:.8,crash:2.4,shield:.6,exhaust:[-.5,.32,-2.32],fire:[0,1.05,1.6],spot:[0,.8,2.3],flood:-.4},
+ van:{n:'Box Van',d:'A slow delivery van with a big cargo box. It wallows in corners, but it is a rolling wall: claws barely scratch it and it shoves crowds aside.',
+  hp:150,mass:2800,vmax:19,rev:5,acc:6,racc:3.5,brake:12,drag:.0034,roll:.9,ebrake:1,hbrake:4.5,grip:11,hgrip:1.2,steer:.55,steerHi:.13,aLat:12,wb:3.4,track:1.8,wr:.44,
+  circ:[[0,2.0,1.02],[0,.7,1.05],[0,-.6,1.05],[0,-1.9,1.05]],rad:2.95,height:2.65,
+  parts:[{x:1.0,z0:1.0,z1:2.7,top:2.05},{x:1.05,z0:-2.55,z1:1.0,top:2.65}],
+  aim:[{minx:-1,maxx:1,miny:.35,maxy:2.06,minz:1,maxz:2.72},{minx:-1.05,maxx:1.05,miny:.35,maxy:2.66,minz:-2.55,maxz:1}],
+  wpos:[[.9,1.75],[-.9,1.75],[.9,-1.65],[-.9,-1.65]],seat:[.45,.25,1.6],eye:[.45,1.9,1.65],camD:9.5,camH:2.3,rider:'pickup',roff:[.03,.22,1.55],
+  exits:[[1.9,1.6],[-1.9,1.6],[0,-3.6],[0,3.6]],gears:[0,5,9,14,20],idleHz:24,maxHz:80,vol:.22,cut:1200,gmax:90,spotI:3.4,
+  lgf:2.2,use:.26,idle:.025,ram:7.5,ramSelf:.35,crash:2,shield:.75,exhaust:[-.7,.42,-2.6],fire:[0,1.7,2.2],spot:[0,1.0,2.75],flood:-.7},
+ buggy:{n:'Dune Buggy',d:'A home-made roll-cage buggy on fat tyres. Light, bouncy and brilliant off-road and over jumps, but the open frame lets claws and bullets in.',
+  hp:65,mass:800,vmax:30,rev:6,acc:11.5,racc:4,brake:15,drag:.0022,roll:.85,ebrake:1.3,hbrake:4.6,grip:14,hgrip:1.8,steer:.62,steerHi:.12,aLat:17,wb:2.3,track:1.62,wr:.5,
+  circ:[[0,1.1,.95],[0,0,.98],[0,-1.1,.95]],rad:2.0,height:1.85,
+  parts:[{x:.9,z0:-1.75,z1:1.8,top:1.0},{x:.65,z0:-.7,z1:.45,top:1.82}],
+  aim:[{minx:-.9,maxx:.9,miny:.3,maxy:1.02,minz:-1.75,maxz:1.8},{minx:-.66,maxx:.66,miny:1,maxy:1.84,minz:-.7,maxz:.45}],
+  wpos:[[.82,1.15],[-.82,1.15],[.82,-1.15],[-.82,-1.15]],seat:[0,-.2,-.25],eye:[0,1.42,-.2],camD:7,camH:1.6,rider:'pickup',roff:[-.42,-.24,-.3],
+  exits:[[1.6,-.2],[-1.6,-.2],[0,-2.8],[0,2.8]],gears:[0,7,13,19,25,31],idleHz:38,maxHz:150,vol:.19,cut:2200,gmax:130,spotI:3,
+  lgf:3,use:.2,idle:.018,ram:4.8,ramSelf:.9,crash:1.7,shield:.2,exhaust:[.25,.75,-1.6],fire:[0,1.1,-1.0],spot:[0,1.8,.5],flood:-.6},
+ atv:{n:'Quad ATV',d:'A four-wheeled farm quad. Small, nimble and hard to tip over on rough ground, but you sit right out in the open.',
+  hp:50,mass:330,vmax:24,rev:5,acc:10.5,racc:3.5,brake:14,drag:.0026,roll:.95,ebrake:1.3,hbrake:4.6,grip:14,hgrip:2,steer:.66,steerHi:.14,aLat:15,wb:1.3,track:1.02,wr:.34,
+  circ:[[0,.55,.62],[0,-.5,.62]],rad:1.25,height:1.3,
+  parts:[{x:.6,z0:-1.05,z1:1.05,top:1.05}],
+  aim:[{minx:-.6,maxx:.6,miny:.2,maxy:1.2,minz:-1.05,maxz:1.05}],
+  wpos:[[.5,.65],[-.5,.65],[.5,-.65],[-.5,-.65]],seat:[0,.05,-.2],eye:[0,1.78,-.12],camD:5.5,camH:1.4,rider:'bike',roff:[0,.05,-.12],
+  exits:[[1.1,-.1],[-1.1,-.1],[0,-1.8],[0,1.8]],gears:[0,6,11,16,21,26],idleHz:42,maxHz:170,vol:.16,cut:2300,gmax:100,spotI:2.6,
+  lgf:3.5,use:.15,idle:.014,ram:3.6,ramSelf:1.6,crash:2.8,shield:0,exhaust:[.3,.45,-1.0],fire:[0,.9,0],spot:[0,.9,1.0],flood:-.35}
 };
 const VH_PAL={pickup:[{p:'#8a3a2b',a:'#d9cfb8'},{p:'#3d6a5b',a:'#d6d0bf'},{p:'#5a7593',a:'#e3dccb'},{p:'#b0873a',a:'#3a3632'},{p:'#6a6c57',a:'#c9c2ad'},{p:'#7b4a5f',a:'#d8d2c4'}],
+ sports:[{p:'#c4231b',a:'#f2efe6'},{p:'#e8b21c',a:'#1c1c1c'},{p:'#1f4fa8',a:'#f0f0ea'},{p:'#1c1c1e',a:'#d63a1e'},{p:'#e8e6df',a:'#2a5fb8'}],
+ sedan:[{p:'#6e7c86',a:'#d8d4ca'},{p:'#8c2f2a',a:'#d8d4ca'},{p:'#2f4f3e',a:'#d0ccc0'},{p:'#c9c3b0',a:'#5a5650'},{p:'#3b4c6e',a:'#d4d0c6'}],
+ van:[{p:'#e8e4da',a:'#d9d4c6'},{p:'#2f5f8a',a:'#e4e0d4'},{p:'#c8a23a',a:'#e8e4d8'},{p:'#5a6a3a',a:'#cfcab8'}],
+ buggy:[{p:'#e06a1c',a:'#2b2b2b'},{p:'#2fa05a',a:'#e8e4d8'},{p:'#d4b02a',a:'#262626'},{p:'#3a7fc0',a:'#ece8dc'}],
+ atv:[{p:'#c9321f',a:'#2a2a2a'},{p:'#3b6e2f',a:'#2a2a2a'},{p:'#e0a020',a:'#222222'},{p:'#2a5f9a',a:'#222222'}],
  bike:[{p:'#c8572b',a:'#ece6d8'},{p:'#2f6e9e',a:'#e6e6e0'},{p:'#6a8f2f',a:'#ebe7dc'},{p:'#a83232',a:'#e0ddd6'},{p:'#d0a52a',a:'#2b2b2b'}]};
 const VH_IDLE={thr:0,steer:0,hb:false,boost:false,brake:0},VH_COAST={thr:0,steer:0,hb:false,boost:false,brake:.55};
 const VH_C={exh:col('#5f5d5a'),dirt:col('#8a7656'),sand:col('#cdb58c'),tyre:col('#d6d3cc'),smoke:col('#7a766f'),black:col('#1f1c1a'),steam:col('#d4dde0'),foam:col('#e4f0f2')};
@@ -5691,7 +5736,82 @@ function vhBuildBike(pal){const g=new THREE.Group();g.rotation.order='YXZ';const
   const flames=[];for(let i=0;i<2;i++){const f=flameSprite(.5+i*.15);f.position.set((i-.5)*.2,.8+i*.08,.12);f.visible=false;body.add(f);flames.push(f)}
   shadowAll(g);beam.castShadow=false;beam.receiveShadow=false;
   return{obj:g,body,bodyMesh,trimMesh,glassMesh:null,headMat,tailMat,wheels,swSpin:null,rider,beam,flames,steerG,kick}}
-function vhMake(kind,x,z,yaw,pal,id){const K=VH_K[kind];if(!K.minR)K.minR=Math.min.apply(null,K.circ.map(c=>c[2]));const m=vhIso(()=>kind==='bike'?vhBuildBike(pal):vhBuildPickup(pal));
+// generic four-wheeler builder for the extra car kinds (sports, sedan, van, buggy, atv)
+function vhBuildCar(kind,pal){const K=VH_K[kind],g=new THREE.Group();g.rotation.order='YXZ';const body=new THREE.Group();g.add(body);
+  const B=(w,h,d)=>new THREE.BoxGeometry(w,h,d),Cy=(a,b,h,n,ts,tl)=>new THREE.CylinderGeometry(a,b,h,n,1,false,ts||0,tl===undefined?Math.PI*2:tl);
+  const pc=pal.p,ac=pal.a,dk='#232120',H=VH_HP;const paint=vhParts(),trim=vhParts(),glass=vhParts(),head=vhParts(),tail=vhParts();
+  const arch=(r,w,x,z)=>{for(const sx of[1,-1])for(const lz of[z,-z])paint.add(Cy(r,r,w,12,0,Math.PI),pc,[sx*x,K.wr,lz],[0,0,H])};
+  let beamP=[0,K.spot[1],K.spot[2]],glassOn=true;
+  if(kind==='sports'){
+    paint.add(B(1.7,.14,4.2),dk,[0,.3,0]);paint.add(B(1.84,.36,4.32),pc,[0,.54,0]);
+    paint.add(B(1.8,.12,1.6),pc,[0,.75,1.38],[.07,0,0]);paint.add(B(1.8,.16,1.05),pc,[0,.78,-1.62]);
+    paint.add(B(1.42,.06,1.0),pc,[0,1.22,-.42]);
+    for(const sx of[1,-1]){paint.add(B(.06,.32,.06),pc,[sx*.72,1.06,.12],[-.95,0,0]);paint.add(B(.06,.36,.06),pc,[sx*.72,1.03,-1.05],[.8,0,0]);
+      paint.add(B(.1,.18,1.3),dk,[sx*.93,.5,0]);trim.add(B(.03,.06,.5),'#1a1a1a',[sx*.925,.66,0]);
+      trim.add(Cy(.055,.055,.2,8),'#b8b8b0',[sx*.45,.34,-2.24],[H,0,0]);trim.add(B(.06,.22,.06),dk,[sx*.62,.96,-1.98]);
+      head.add(B(.38,.07,.06),'#ffffff',[sx*.6,.72,2.17]);tail.add(B(.46,.08,.05),'#ffffff',[sx*.56,.78,-2.17]);
+      glass.add(B(.03,.28,1.1),'#ffffff',[sx*.73,1.04,-.45]);paint.add(B(.3,.012,1.62),ac,[sx*.2,.83,1.38],[.07,0,0])}
+    paint.add(B(.3,.012,1.02),ac,[.2,1.255,-.42]);paint.add(B(.3,.012,1.02),ac,[-.2,1.255,-.42]);
+    glass.add(B(1.42,.6,.04),'#ffffff',[0,1.0,.32],[-.98,0,0]);glass.add(B(1.38,.52,.04),'#ffffff',[0,1.0,-1.14],[.85,0,0]);
+    trim.add(B(1.74,.05,.34),dk,[0,1.08,-2.0]);trim.add(B(.95,.1,.05),'#151515',[0,.46,2.17]);trim.add(B(1.86,.12,.16),dk,[0,.36,2.14]);trim.add(B(1.86,.12,.16),dk,[0,.38,-2.14]);
+    arch(.5,.3,.83,1.36)}
+  else if(kind==='sedan'){
+    paint.add(B(1.7,.14,4.4),dk,[0,.32,0]);paint.add(B(1.84,.5,4.5),pc,[0,.64,0]);
+    paint.add(B(1.8,.08,1.35),pc,[0,.93,1.55],[.05,0,0]);paint.add(B(1.8,.08,.9),pc,[0,.92,-1.82]);
+    paint.add(B(1.6,.07,1.7),pc,[0,1.52,-.24]);
+    for(const sx of[1,-1]){for(const pz of[.68,-.24,-1.12])paint.add(B(.07,.55,.07),pc,[sx*.8,1.22,pz],pz>.5?[-.5,0,0]:pz<-1?[.5,0,0]:[0,0,0]);
+      glass.add(B(.03,.44,1.75),'#ffffff',[sx*.81,1.22,-.24]);paint.add(B(.012,.45,.02),'#1b1a18',[sx*.922,.68,-.24],null,null,0);paint.add(B(.012,.45,.02),'#1b1a18',[sx*.922,.68,.85],null,null,0);
+      trim.add(B(.02,.035,.14),'#c9cac2',[sx*.925,.8,.25]);trim.add(B(.02,.035,.14),'#c9cac2',[sx*.925,.8,-.75]);trim.add(B(.12,.1,.18),dk,[sx*.95,1.1,.72]);
+      head.add(B(.34,.14,.05),'#ffffff',[sx*.6,.78,2.26]);tail.add(B(.3,.16,.05),'#ffffff',[sx*.66,.82,-2.26]);
+      paint.add(B(.12,.06,4.3),ac,[sx*.93,.5,0])}
+    glass.add(B(1.56,.62,.04),'#ffffff',[0,1.22,.98],[-.62,0,0]);glass.add(B(1.56,.58,.04),'#ffffff',[0,1.22,-1.38],[.62,0,0]);
+    trim.add(B(1.0,.16,.05),'#2b2b29',[0,.72,2.26]);trim.add(B(1.9,.16,.16),'#9a9b95',[0,.42,2.25]);trim.add(B(1.9,.16,.16),'#9a9b95',[0,.44,-2.25]);trim.add(B(.36,.16,.03),'#e6e2d4',[0,.6,-2.27]);
+    arch(.52,.3,.83,1.45)}
+  else if(kind==='van'){
+    paint.add(B(1.8,.2,5.1),dk,[0,.46,0]);paint.add(B(1.96,.9,1.7),pc,[0,1.06,1.82]);paint.add(B(1.94,.4,.62),pc,[0,.82,2.52]);
+    paint.add(B(1.96,.08,1.2),pc,[0,2.02,1.6]);paint.add(B(1.96,.5,.14),pc,[0,1.75,1.05]);
+    paint.add(B(2.1,2.05,3.55),ac,[0,1.62,-.8]);for(let i=0;i<5;i++)paint.add(B(2.13,.04,.04),'#9b978c',[0,.8+i*.42,-.8]);
+    paint.add(B(2.08,.05,.05),'#77746c',[0,2.66,-.8]);paint.add(B(.02,1.7,.03),'#47443f',[0,1.55,-2.585]);
+    for(const sx of[1,-1]){glass.add(B(.03,.55,.95),'#ffffff',[sx*.99,1.72,1.85]);paint.add(B(.06,.6,.06),pc,[sx*.96,1.72,2.38],[-.25,0,0]);
+      trim.add(B(.05,.2,.22),'#2a2826',[sx*1.08,1.85,2.2]);head.add(B(.32,.18,.05),'#ffffff',[sx*.66,.98,2.84]);tail.add(B(.16,.28,.05),'#ffffff',[sx*.9,.95,-2.6]);
+      paint.add(B(.06,1.92,.06),'#6f6b63',[sx*1.05,1.62,-2.56]);paint.add(B(.06,1.92,.06),'#6f6b63',[sx*1.05,1.62,.95])}
+    paint.add(B(1.88,.28,.06),'#7a1e14',[0,2.1,-2.585]);
+    glass.add(B(1.82,.72,.04),'#ffffff',[0,1.62,2.42],[-.28,0,0]);
+    trim.add(B(1.2,.3,.05),'#2b2b29',[0,.95,2.84]);trim.add(B(2.0,.2,.2),'#8d8e88',[0,.55,2.88]);trim.add(B(2.0,.2,.2),'#3a3836',[0,.55,-2.62]);
+    arch(.6,.34,.9,1.7)}
+  else if(kind==='buggy'){glassOn=false;
+    paint.add(B(1.3,.1,3.0),dk,[0,.62,0]);paint.add(B(1.2,.32,.8),pc,[0,.82,1.45],[.28,0,0]);paint.add(B(1.1,.08,.5),ac,[0,1.0,1.18],[.28,0,0]);
+    for(const sx of[1,-1]){paint.add(B(.22,.28,1.5),pc,[sx*.74,.78,-.1]);
+      trim.add(B(.06,1.12,.06),dk,[sx*.62,1.27,.4],[-.32,0,0]);trim.add(B(.06,1.12,.06),dk,[sx*.62,1.3,-.68],[.12,0,0]);trim.add(B(.06,.06,1.12),dk,[sx*.6,1.8,-.14]);
+      trim.add(B(.06,.06,1.0),dk,[sx*.62,1.1,-1.15],[.6,0,0]);trim.add(B(.06,.06,.8),dk,[sx*.55,.95,1.25],[-.4,0,0]);
+      trim.add(B(.36,.08,.5),'#3a3836',[sx*.82,K.wr+.55,1.15]);trim.add(B(.36,.08,.5),'#3a3836',[sx*.82,K.wr+.55,-1.15]);
+      head.add(Cy(.09,.09,.1,10),'#ffffff',[sx*.32,1.88,.32],[H,0,0]);tail.add(B(.1,.1,.04),'#ffffff',[sx*.4,1.02,-1.62])}
+    trim.add(B(1.3,.06,.06),dk,[0,1.82,.42]);trim.add(B(1.3,.06,.06),dk,[0,1.84,-.7]);trim.add(B(.06,.06,1.1),dk,[0,1.84,-.14]);
+    trim.add(B(.95,.48,.75),'#4a4844',[0,1.0,-1.15]);for(let i=0;i<4;i++)trim.add(B(.98,.03,.6),'#86847c',[0,1.26+i*.04,-1.15]);
+    trim.add(Cy(.07,.07,.5,8),'#a3a29b',[.25,.82,-1.55],[H,0,0]);trim.add(B(1.6,.1,.1),'#3a3836',[0,.6,1.82]);trim.add(B(1.3,.06,.08),dk,[0,1.7,.4]);
+    paint.add(B(.52,.14,.56),'#2d2b29',[0,.82,-.28]);paint.add(B(.52,.62,.12),'#2d2b29',[0,1.12,-.55],[.12,0,0]);
+    paint.add(B(.28,.28,.4),pal.can,[-.4,.85,-1.55]);beamP=[0,1.88,.38]}
+  else{glassOn=false; // atv
+    paint.add(B(.46,.36,1.3),dk,[0,.6,0]);paint.add(B(1.12,.1,.62),pc,[0,.82,.66]);paint.add(B(1.12,.1,.62),pc,[0,.82,-.64]);
+    for(const sx of[1,-1]){paint.add(B(.34,.2,.62),pc,[sx*.42,.74,.66],[0,0,-sx*.3]);paint.add(B(.34,.2,.62),pc,[sx*.42,.74,-.64],[0,0,-sx*.3]);
+      head.add(B(.16,.08,.05),'#ffffff',[sx*.22,.86,1.0]);trim.add(B(.05,.05,.12),'#141414',[sx*.4,1.24,.42])}
+    paint.add(B(.44,.22,.42),pc,[0,.98,.3]);paint.add(B(.42,.15,.82),'#1d1c1b',[0,1.0,-.22]);
+    trim.add(B(.82,.035,.035),dk,[0,1.24,.42]);trim.add(B(.05,.34,.05),dk,[0,1.08,.44],[.3,0,0]);
+    for(const z of[.66,-.64]){trim.add(B(1.0,.03,.03),'#3a3836',[0,.94,z+.25]);trim.add(B(1.0,.03,.03),'#3a3836',[0,.94,z-.25]);trim.add(B(.03,.03,.5),'#3a3836',[.48,.94,z]);trim.add(B(.03,.03,.5),'#3a3836',[-.48,.94,z])}
+    trim.add(Cy(.05,.05,.3,8),'#a3a29b',[.3,.48,-.95],[H,0,0]);trim.add(B(.6,.08,.08),'#3a3836',[0,.5,1.02]);tail.add(B(.14,.06,.04),'#ffffff',[0,.84,-.97]);beamP=[0,.86,1.02]}
+  const bodyMesh=new THREE.Mesh(vhGeo(paint,.42,pal.off),VH_BODY),trimMesh=new THREE.Mesh(vhGeo(trim,.5,0),VH_TRIM),glassMesh=glassOn?new THREE.Mesh(vhGeo(glass,1,0),VH_GLASS):null;
+  const headMat=new THREE.MeshStandardMaterial({color:col('#fff6dc'),emissive:col('#ffe2a8'),emissiveIntensity:.05,roughness:.3});
+  const tailMat=new THREE.MeshStandardMaterial({color:col('#5a0f0a'),emissive:col('#ff2414'),emissiveIntensity:.05,roughness:.4});
+  body.add(bodyMesh,trimMesh,new THREE.Mesh(vhGeo(head,1,0),headMat),new THREE.Mesh(vhGeo(tail,1,0),tailMat));if(glassMesh)body.add(glassMesh);
+  let swSpin=null;if(K.rider==='pickup'){const sw=new THREE.Group();sw.position.set(K.seat[0]+K.roff[0]+.02,1.36+K.roff[1],K.roff[2]+.62);sw.rotation.x=.45;swSpin=new THREE.Group();sw.add(swSpin);swSpin.add(new THREE.Mesh(VH_SWG,MAT.vc));body.add(sw)}
+  const ws=K.wr/.45,wx=kind==='buggy'||kind==='atv'?1.35:1;
+  const wheels=[];for(const [lx,lz] of K.wpos){const pv=new THREE.Group();pv.position.set(lx,K.wr,lz);const sp=new THREE.Group();pv.add(sp);const wm=new THREE.Mesh(VH_WHEEL.pickup,MAT.vc);wm.scale.set(ws*wx,ws,ws);sp.add(wm);g.add(pv);wheels.push({pivot:pv,spin:sp,front:lz>0,lx,lz,off:0})}
+  const rider=new THREE.Mesh(VH_RIDER[K.rider],MAT.vc);rider.position.set(K.roff[0],K.roff[1],K.roff[2]);rider.visible=false;body.add(rider);
+  const beam=new THREE.Mesh(K.rider==='bike'?VH_BEAMG.bike:VH_BEAMG.pickup,VH_BEAM);beam.position.set(beamP[0],beamP[1],beamP[2]+.05);beam.visible=false;body.add(beam);
+  const flames=[];for(let i=0;i<3;i++){const f=flameSprite(.6+i*.15);f.position.set(K.fire[0]+(i-1)*.3,K.fire[1]+i*.1,K.fire[2]+(i%2)*.25);f.visible=false;body.add(f);flames.push(f)}
+  shadowAll(g);if(glassMesh)glassMesh.castShadow=false;beam.castShadow=false;beam.receiveShadow=false;
+  return{obj:g,body,bodyMesh,trimMesh,glassMesh,headMat,tailMat,wheels,swSpin,rider,beam,flames,steerG:null,kick:null}}
+function vhMake(kind,x,z,yaw,pal,id){const K=VH_K[kind];if(!K.minR)K.minR=Math.min.apply(null,K.circ.map(c=>c[2]));const m=vhIso(()=>kind==='bike'?vhBuildBike(pal):kind==='pickup'?vhBuildPickup(pal):vhBuildCar(kind,pal));
   const v=Object.assign(m,{id,kind,K,pal,x,y:0,z,yaw,pitch:0,roll:0,vx:0,vz:0,vy:0,spd:0,yawRate:0,steer:0,thr:0,revT:0,slip:0,hp:K.hp,fuel:50,driver:null,coastBy:null,coastT:0,
     engineOn:false,air:false,airT:0,airX:0,airZ:0,comp:0,rpm:0,gear:0,wheelie:0,brk:false,boosting:false,boostE:1,boostLock:false,flooded:false,floodT:0,dead:false,resetAt:0,burnT:0,smokeT:0,
     exT:0,dustT:0,smkT:0,crashT:0,clawT:0,hopT:0,hopT0:-9,hornT:0,noiseT:0,spin:0,accVis:0,latVis:0,mdx:0,mdz:0,mdy:0,mdyaw:0,tgt:null,stT:0,lostT:0,salv:false,lightsOn:false,
@@ -5711,7 +5831,7 @@ function vhRoadSpot(K,i){const zs=[.22,.4,.58,.76,.31,.67,.49];for(let k=0;k<zs.
 function vhSpawnAll(){for(const v of vehicles){if(v.obj&&v.obj.parent)v.obj.parent.remove(v.obj)}vehicles.length=0;
   const pois=typeof POIS!=='undefined'&&Array.isArray(POIS)?POIS:[];
   const poi=ks=>{for(const k of ks){const p=pois.find(q=>q&&typeof q.id==='string'&&q.x!==undefined&&(q.id===k||q.id.indexOf(k)===0));if(p)return p}return null};
-  const slots=[['pickup',['gas','fuel']],['pickup',['ranch','farm']],['pickup',['town']],['bike',['cabin']],['bike',['radio','tower','mast']]];let n=0;
+  const slots=[['pickup',['gas','fuel']],['pickup',['ranch','farm']],['pickup',['town']],['bike',['cabin']],['bike',['radio','tower','mast']],['sports',['town']],['sedan',['town']],['sedan',['gas','fuel']],['van',['depot']],['van',['town']],['buggy',['depot']],['buggy',['road']],['atv',['ranch','farm']],['atv',['cabin2']],['sports',['road']],['sedan',['cabin3']],['atv',['tower']]];let n=0;
   for(const [kind,ks] of slots){const K=VH_K[kind],pk=ks[0];let sp=null;
     if(pk==='town'&&typeof TOWN!=='undefined'&&TOWN){if(typeof townStreetPoint==='function')for(let i=0;i<6&&!sp;i++){const q=townStreetPoint();if(q&&vhSpotOK(q.x,q.z,K))sp={x:q.x,z:q.z,yaw:R(0,6.283)}}
       if(!sp&&TOWN.x0!==undefined){for(let i=0;i<24&&!sp;i++){const side=RI(0,3),m=R(8,22);let x,z;if(side===0){x=TOWN.x0-m;z=R(TOWN.z0,TOWN.z1)}else if(side===1){x=TOWN.x1+m;z=R(TOWN.z0,TOWN.z1)}else if(side===2){z=TOWN.z0-m;x=R(TOWN.x0,TOWN.x1)}else{z=TOWN.z1+m;x=R(TOWN.x0,TOWN.x1)}
@@ -5791,7 +5911,7 @@ function vhSim(v,dt,inp){if(!(dt>0))return;const K=v.K,me=v===P.vehicle,auth=vhA
       if(me&&v.airT>.75){const dd=dist2(v.airX,v.airZ,v.x,v.z);if(dd>8){feedMsg(`Air time ${v.airT.toFixed(1)} s · ${Math.round(dd)} m`);if(typeof gainXP==='function')try{gainXP('agility',Math.min(35,Math.round(3+dd*.7)),'Vehicle jump')}catch(e){}}}
       if(me&&v.kind==='bike'&&P.vehicle===v&&(pm>.95||imp>17)){vhExitLocal('thrown');hurt(Math.round(8+imp*.8),'vehicle');vhDeathMsg('Thrown from a bike')}}}
   // suspension articulation (pickup): each wheel reaches for its own patch of ground
-  if(v.kind==='pickup'){const tp=Math.tan(v.pitch),tr=Math.tan(v.roll),k=1-Math.exp(-dt*14);for(let i=0;i<4;i++){const lx=K.wpos[i][0],lz=K.wpos[i][1];const want2=v.air?-.12:clamp(w[i]-(v.y+lz*tp+lx*tr),-.16,.16);v.wheels[i].off=lerp(v.wheels[i].off,want2,k)}}
+  if(v.wheels.length===4){const tp=Math.tan(v.pitch),tr=Math.tan(v.roll),k=1-Math.exp(-dt*14);for(let i=0;i<4;i++){const lx=K.wpos[i][0],lz=K.wpos[i][1];const want2=v.air?-.12:clamp(w[i]-(v.y+lz*tp+lx*tr),-.16,.16);v.wheels[i].off=lerp(v.wheels[i].off,want2,k)}}
   // fuel, engine noise for AI, burning engine
   if(eng&&auth)v.fuel=Math.max(0,v.fuel-(K.idle+K.use*Math.abs(v.thr)*(boost?2.2:1))*dt);
   v.noiseT-=dt;if(eng&&v.noiseT<=0){v.noiseT=.7;noise(v.x,v.z,(v.kind==='bike'?16:22)+Math.abs(vF)*.9)}
@@ -5982,13 +6102,13 @@ function vhCard(){const v=vhLookV,kind=v?v.kind:'pickup',K=VH_K[kind];
   return{k:'Vehicle',t:K.n,d:K.d,rows,g:'vehicles'}}
 for(const k of['vehicle','vrefuel','vrepair','vwreck'])Object.defineProperty(INFO,k,{get:vhCard,enumerable:true,configurable:true});
 function vhRepairMat(){if(ITEMS.duct_tape&&has('duct_tape'))return'duct_tape';if(has('metal_frag',20))return'metal_frag';return null}
-Object.defineProperty(PROMPTS,'vehicle',{get:()=>{const v=vhLookV;if(!v)return'Drive';return(v.kind==='bike'?'Ride ':'Drive ')+v.K.n+(v.fuel<=0?' (no fuel)':'')},enumerable:true,configurable:true});
+Object.defineProperty(PROMPTS,'vehicle',{get:()=>{const v=vhLookV;if(!v)return'Drive';return(v.kind==='bike'||v.kind==='atv'?'Ride ':'Drive ')+v.K.n+(v.fuel<=0?' (no fuel)':'')},enumerable:true,configurable:true});
 Object.defineProperty(PROMPTS,'vrefuel',{get:()=>{const v=vhLookV;if(!v)return'Refuel';const n=Math.min(Math.ceil((100-v.fuel)/v.K.lgf),P&&P.inv?P.inv.lgf||0:0,10);return`Refuel (${n} Low Grade Fuel)`},enumerable:true,configurable:true});
 Object.defineProperty(PROMPTS,'vrepair',{get:()=>vhRepairMat()==='duct_tape'?'Repair engine (1 Duct Tape)':'Repair engine (20 Metal Fragments)',enumerable:true,configurable:true});
 Object.defineProperty(PROMPTS,'vwreck',{get:()=>vhLookV&&vhLookV.salv?'Burnt-out wreck (stripped)':'Strip the wreck for parts',enumerable:true,configurable:true});
 // which part of the vehicle you are looking at (fuel cap / engine / seat)
 function vhZone(v,pt){if(!pt)return'mid';const s=Math.sin(v.yaw),c=Math.cos(v.yaw),dx=pt.x-v.x,dz=pt.z-v.z,lz=dx*s+dz*c,ly=pt.y-v.y;
-  if(v.kind==='bike')return lz>-.05&&ly>.8?'fuel':lz>-.3&&ly<=.8?'engine':'mid';return lz>1?'engine':lz<-.6?'fuel':'mid'}
+  if(v.kind==='bike')return lz>-.05&&ly>.8?'fuel':lz>-.3&&ly<=.8?'engine':'mid';return lz>v.K.wb*.32?'engine':lz<-v.K.wb*.2?'fuel':'mid'}
 INTERACT_EXT.push(a=>{if(!a||a.kind!=='vehicle'||!a.e||(P&&P.vehicle))return null;const v=a.e;vhLookV=v;if(v.dead)return{kind:'vwreck',e:v};const z=vhZone(v,a.point);
   if(z==='fuel'&&v.fuel<99.5&&has('lgf'))return{kind:'vrefuel',e:v};if(z==='engine'&&v.hp<v.K.hp-.5&&vhRepairMat())return{kind:'vrepair',e:v};return{kind:'vehicle',e:v}});
 INTERACT_DO.vehicle=t=>vhTryEnter(t.e);
@@ -6139,7 +6259,7 @@ function vhAudio(dt){if(!AC||!MASTER||!S||!P)return;vhAud.t-=dt;if(vhAud.t>0)ret
   for(const vo of vhAud.voices)if(vo.v&&want.indexOf(vo.v)<0)vo.v=null;for(const v of want)if(!vhAud.voices.some(vo=>vo.v===v)){const fr=vhAud.voices.find(vo=>!vo.v);if(fr)fr.v=v}
   for(const vo of vhAud.voices){const v=vo.v;if(!v){vo.g.gain.setTargetAtTime(0,t,.08);continue}const K=v.K,mine=v===P.vehicle,rpm=clamp(v.rpm,0,1),thr=Math.abs(v.thr);
     const f0=K.idleHz+(K.maxHz-K.idleHz)*rpm;vo.o1.frequency.setTargetAtTime(f0,t,.04);vo.o2.frequency.setTargetAtTime(f0*.5,t,.04);vo.lfo.frequency.setTargetAtTime(f0*.5,t,.04);
-    vo.f.frequency.setTargetAtTime((220+K.cut*(.25+.75*thr)*(.35+.65*rpm))*(mine&&!vhCam.mode&&v.kind==='pickup'?.7:1)*(v.boosting?1.35:1),t,.05);
+    vo.f.frequency.setTargetAtTime((220+K.cut*(.25+.75*thr)*(.35+.65*rpm))*(mine&&!vhCam.mode&&v.K.shield>.3?.7:1)*(v.boosting?1.35:1),t,.05);
     const dx=v.x-P.x,dz=v.z-P.z,d=Math.hypot(dx,dz),att=mine?1:1/(1+d*d*.004);vo.g.gain.setTargetAtTime(on*K.vol*(.45+.55*thr)*att*(v.flooded?.3:1),t,.06);
     if(vo.pan){const rx=Math.cos(P.yaw),rz=-Math.sin(P.yaw);vo.pan.pan.setTargetAtTime(mine||d<.5?0:clamp((dx*rx+dz*rz)/d,-1,1)*.8,t,.08)}}
   const pv=P.vehicle;if(vhAud.skid){const sl=pv&&!pv.air&&pv.surf!=='water'?clamp((pv.slip-2.5)/6,0,1)*(Math.abs(pv.spd)>3?1:0):0;vhAud.skid.g.gain.setTargetAtTime(on*sl*(pv&&pv.surf==='road'?.22:.12),t,.06);vhAud.skid.f.frequency.setTargetAtTime(pv&&pv.surf==='road'?1300:650,t,.1)}}
