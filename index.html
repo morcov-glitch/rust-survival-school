@@ -1833,6 +1833,637 @@ function updateScreenFX(){const D=S.dayF||0;const el=$('#glare');const sd=skyU.s
   if(dp>0&&_sunV.z<1&&D>.05){const x=(_sunV.x*.5+.5)*innerWidth,y=(-_sunV.y*.5+.5)*innerHeight;el.style.left=x+'px';el.style.top=y+'px';el.style.opacity=(Math.pow(Math.max(0,dp),6)*D*(1-(S.rain||0))*.8).toFixed(3)}else el.style.opacity=0;
   const uw=camera.position.y<-.02;$('#uw').style.opacity=uw?.6:0;if(uw){scene.fog.color.set(0x0a3440);scene.fog.near=0;scene.fog.far=18}}
 
+/* ================= WEAPONS CRAFTING MODS AND THROWABLES ================= */
+// Items module: scavenged crafting materials, durable melee weapons (stamina + durability + repairs), blueprint-gated
+// elemental weapon mods, status effects (burn/shock/bleed/toxin), throwables with a live trajectory preview,
+// explosions and UV gear (flashlight on V, UV lamp deployable).
+// Public API (fixed contract): rollLoot(kind,mult) · explode(pos,radius,dmg,src,opts) · applyStatus(t,type,secs,src) · uvSources() · weaponDurability(id)
+// Net messages: i_thr (throw, relayed) · i_st (client→host status) · i_kb (client→host knockback) · i_boom (explosion visual, relayed) · i_uv (UV beam state, relayed) · i_pst (host→client status on that player)
+const IX={stSet:new Set(),thr:[],fires:[],shoves:[],timers:[],taken:{},pool:{},durBusy:0,crafting:0,aim:null,chg:null,thrAnim:0,thrHide:0,
+  uv:{on:false,bat:100,k:0,sendT:0},uvR:{},uvCache:[],uvT:-1,uvPos:{x:0,y:0,z:0},uvDir:{x:0,y:0,z:-1},lamps:[],lampT:-9,flashT:9,ft:0,vmFxT:0,
+  hud:{},v1:new V3(),v2:new V3(),pt:{x:0,y:0,z:0},cones:{},vt:{px:0,py:0,pz:0,rx:0,ry:0,rz:0},bmT:9,boomP:{x:0,y:0,z:0}};
+const IX_STK=['burn','shock','bleed','toxin'],IX_DPS={burn:7,shock:2,bleed:4,toxin:4.5},IX_G=15,IX_BNC=.38;
+const ixPerk=id=>typeof hasPerk==='function'&&!!hasPerk(id);
+const ixAuth=()=>!NET.role||NET.role==='host';
+const ixZ=()=>typeof zombies!=='undefined'&&Array.isArray(zombies)?zombies:[];
+const ixLow=()=>typeof POSTFX!=='undefined'&&!!POSTFX&&POSTFX.quality==='low';
+function ixXP(tree,n,why){if(typeof gainXP==='function'){try{gainXP(tree,n,why)}catch(e){console.error('gainXP',e)}}}
+const ixRGBc={};function ixRGB(h){return ixRGBc[h]||(ixRGBc[h]=(c=>[c.r,c.g,c.b])(col(h)))}
+const ixC=(rt,rb,h,mat,x,y,z,seg=8)=>{const m=new THREE.Mesh(new THREE.CylinderGeometry(rt,rb,h,seg),mat);m.position.set(x,y,z);return m};
+const ixPlain=s=>String(s).replace(/<[^>]*>/g,'');
+
+// ---------- shared materials & textures (built once) ----------
+const IXM={steel:M('#b9c2c7',{metalness:.85,roughness:.28,flatShading:true}),edge:M('#f2f6f8',{metalness:.9,roughness:.12,flatShading:true}),dsteel:M('#4f555a',{metalness:.75,roughness:.42}),
+ pipe:M('#7f878b',{metalness:.7,roughness:.42}),rust:M('#8a5634',{metalness:.3,roughness:.85}),rubber:M('#232224',{roughness:.95}),tape:M('#5d6166',{roughness:.85}),
+ red:M('#a3302a',{roughness:.5,flatShading:true}),wood:M('#7a5a35',{roughness:.8}),bat:M('#c99e62',{roughness:.55}),dark:M('#1c1a19',{roughness:.7}),gold:M('#6a5530',{metalness:.7,roughness:.35}),
+ wrap:M('#d6cdbd',{roughness:.9}),nail:M('#c7c9cc',{metalness:.8,roughness:.35}),wire:M('#7a7d80',{metalness:.7,roughness:.5}),copper:M('#c27a3e',{metalness:.85,roughness:.3}),
+ batt:M('#2c3f8f',{roughness:.5}),can:M('#c4502c',{roughness:.6,metalness:.3}),glass:M('#7fe06a',{roughness:.12,transparent:true,opacity:.62,emissive:col('#2f8a1a'),emissiveIntensity:.7}),
+ bottle:M('#4f7a3a',{roughness:.1,metalness:.1,transparent:true,opacity:.72}),liquid:M('#c8963c',{roughness:.2,transparent:true,opacity:.85}),rag:M('#b9a27e',{roughness:1}),
+ redp:M('#b8322c',{roughness:.6}),paper:M('#e8dcc0',{roughness:.9}),fuse:M('#3a2c1e',{roughness:1}),flare:M('#5b2a90',{roughness:.5}),cap:M('#e8e0f0',{roughness:.4}),bp:M('#3d6fa8',{roughness:.8}),white:M('#e8eef4',{roughness:.8})};
+const ixGlowTex=canvasTex(64,(g,s)=>{g.clearRect(0,0,s,s);const gr=g.createRadialGradient(s/2,s/2,0,s/2,s/2,s/2);gr.addColorStop(0,'rgba(255,255,255,1)');gr.addColorStop(.18,'rgba(255,255,255,.8)');gr.addColorStop(.45,'rgba(255,255,255,.22)');gr.addColorStop(1,'rgba(255,255,255,0)');g.fillStyle=gr;g.fillRect(0,0,s,s)});
+const ixSmokeTex=canvasTex(64,(g,s)=>{g.clearRect(0,0,s,s);for(let i=0;i<18;i++){const x=s/2+R(-s*.17,s*.17),y=s/2+R(-s*.17,s*.17),r=R(s*.12,s*.3);const gr=g.createRadialGradient(x,y,0,x,y,r);gr.addColorStop(0,'rgba(255,255,255,.32)');gr.addColorStop(1,'rgba(255,255,255,0)');g.fillStyle=gr;g.beginPath();g.arc(x,y,r,0,7);g.fill()}});
+const IXB={uvTube:new THREE.MeshBasicMaterial({color:0xd7a8ff}),lens:new THREE.MeshBasicMaterial({color:0xc89cff}),
+ lampGlow:new THREE.SpriteMaterial({map:ixGlowTex,color:0xb070ff,transparent:true,depthWrite:false,blending:THREE.AdditiveBlending,opacity:.8})};
+
+// ---------- crafting materials ----------
+Object.assign(ITEMS,{
+ duct_tape:{n:'Duct Tape',c:'#8d9196',cat:'Material',d:'A roll of silver tape that holds a broken world together.',f:'Town cabinets, car trunks and toolboxes, barrels, crates and infected bodies. Craft: 10 cloth + 5 low grade fuel.',u:'Melee weapons, mod kits and weapon repairs.'},
+ nails:{n:'Nails',c:'#b4b7bb',cat:'Material',d:'A fistful of bent nails.',f:'Toolboxes, crates, barrels and infected bodies. Craft: 10 metal fragments → 5 nails.',u:'Baseball bats, Nail Wrap kits, pipe bombs and repairs.'},
+ alcohol:{n:'Alcohol',c:'#cfe8ee',cat:'Material',d:'A bottle of strong spirits. It burns well.',f:'Cabinets and town loot, sometimes infected bodies.',u:'Molotovs and Fire Kits.'},
+ battery:{n:'Battery',c:'#d8b24a',cat:'Material',d:'An old battery that still holds a charge.',f:'Car trunks, toolboxes, crates and supply drops.',u:'Shock Coils, the UV flashlight, UV flares and UV lamps.'},
+ chemicals:{n:'Chemicals',c:'#8fd05a',cat:'Material',d:'Unlabelled bottles of something nasty.',f:'Cabinets, town loot and infected bodies.',u:'Toxin Vials, firecrackers, UV flares and UV lamps.'},
+});
+const IX_MATS=['duct_tape','nails','alcohol','battery','chemicals'];
+
+// ---------- melee weapons ----------
+const IX_W={
+ lead_pipe:   {n:'Lead Pipe',   c:'#7f878b',dmg:24,reach:2.5, rate:.62,stam:8, dmax:120,knock:3,  sharp:0,two:0,style:'swing',tilt:[-.5,.1,0],  vmb:[.3,-.3,-.25], d:'A length of heavy plumbing. Not fast, but it lasts forever.',f:'Craft: 1 metal pipe + 1 duct tape. Also found in town.'},
+ machete:     {n:'Machete',     c:'#b9c2c7',dmg:28,reach:2.55,rate:.5, stam:7, dmax:80, knock:1.4,sharp:1,two:0,style:'swing',tilt:[-.6,.45,0], vmb:[.3,-.3,-.24], d:'A fast, light blade. Quick cuts, but it dulls quickly.',f:'Craft: 1 metal blade + 1 duct tape + 50 wood.'},
+ baseball_bat:{n:'Baseball Bat',c:'#c99e62',dmg:26,reach:2.75,rate:.66,stam:9, dmax:70, knock:4.5,sharp:0,two:1,style:'swing',tilt:[-.5,.15,0], vmb:[.31,-.31,-.23],d:'Long reach and a big knockback. The wood splinters fast.',f:'Craft: 150 wood + 5 nails.'},
+ fire_axe:    {n:'Fire Axe',    c:'#a3302a',dmg:42,reach:2.7, rate:.9, stam:13,dmax:100,knock:3.5,sharp:1,two:1,style:'swing',tilt:[-.55,.35,0],vmb:[.31,-.32,-.22],d:'A heavy chopping axe. Brutal damage — and it fells trees too.',f:'Craft at a Workbench: 1 metal blade + 60 metal fragments + 100 wood.'},
+ katana:      {n:'Katana',      c:'#d0d8dc',dmg:38,reach:2.95,rate:.48,stam:8, dmax:90, knock:1.4,sharp:1,two:1,style:'swing',tilt:[-.75,.5,0], vmb:[.29,-.33,-.2], d:'A rare, razor-sharp long blade. Fast, long and deadly.',f:'Loot only: supply drops and rare town finds.'},
+ sledgehammer:{n:'Sledgehammer',c:'#50565b',dmg:60,reach:2.8, rate:1.3,stam:20,dmax:140,knock:8,  sharp:0,two:1,style:'slam', tilt:[-.38,.1,0], vmb:[.32,-.36,-.22],d:'Crushes what it lands on and hurts anything next to it. Very slow, very tiring.',f:'Loot only: toolboxes, car trunks and supply drops.',aoe:1.7},
+};
+// ---------- mods ----------
+const IX_MODS={
+ nail_wrap:{n:'Nail Wrap',tag:'Nailed',c:'#c9c9c9',hc:'#e8e8e8',st:'bleed',secs:6,eff:'Every hit makes the target bleed',hint:'hits cause bleeding',d:'Nails and barbed wire to wrap around a weapon head.',cost:{nails:10,duct_tape:1,metal_frag:10}},
+ shock_coil:{n:'Shock Coil',tag:'Shock',c:'#5fc8ff',hc:'#8fdcff',st:'shock',secs:2.5,eff:'Hits stun the target and arc to up to two enemies nearby',hint:'hits stun and arc',d:'A battery-powered coil that discharges on impact.',cost:{battery:1,duct_tape:1,metal_frag:15}},
+ fire_kit:{n:'Fire Kit',tag:'Blaze',c:'#ff8a3a',hc:'#ffa060',st:'burn',secs:5,eff:'Hits set the target on fire and make it panic',hint:'hits set enemies on fire',d:'A fuel canister and wick that coat the weapon in flames.',cost:{alcohol:2,cloth:5,duct_tape:1}},
+ toxin_vial:{n:'Toxin Vial',tag:'Toxic',c:'#8fe05a',hc:'#a8f070',st:'toxin',secs:7,eff:'Hits poison the target, slowing it down',hint:'hits poison and slow',d:'A dripping vial of chemicals strapped to the weapon.',cost:{chemicals:2,duct_tape:1,cloth:3}},
+};
+for(const [id,w] of Object.entries(IX_W)){ITEMS[id]={n:w.n,c:w.c,cat:'Weapon',hot:1,melee:{dmg:w.dmg,reach:w.reach,rate:w.rate},stam:w.stam,dmax:w.dmax,ixW:w,ixBase:id,style:w.style,twoHand:!!w.two,
+  d:w.d,f:w.f,u:`${w.dmg} damage · ${w.sharp?'sharp':'blunt'} · ${(1/w.rate).toFixed(1)} swings/s · ${w.stam} stamina a swing. Wears out — repair it in the inventory.`,onUse:ixMeleeUse};VMB[id]=w.vmb}
+for(const [m,M0] of Object.entries(IX_MODS)){
+  ITEMS[m]={n:M0.n,c:M0.c,cat:'Mod kit',ixKit:m,d:M0.d+' '+M0.eff+'.',f:`Craft (blueprint needed): ${Object.entries(M0.cost).map(([k,v])=>v+' '+ITEMS[k].n).join(', ')}. Also found in town.`,u:'Combine it with a melee weapon in the crafting menu (Weapon mods).'};
+  ITEMS['bp_'+m]={n:'Blueprint: '+M0.n,c:'#3d6fa8',cat:'Blueprint',hot:1,ixBp:m,d:`Instructions for building ${M0.n} kits.`,f:'Town containers, infected bodies, crates and supply drops.',u:`Select it and left click (or use the inventory button) to learn the ${M0.n} recipe.`,onUse:ixBpUse};
+  for(const [w,W] of Object.entries(IX_W)){const id=w+'__'+m;ITEMS[id]=Object.assign({},ITEMS[w],{n:`${W.n} <span style='color:${M0.hc}'>${M0.tag}</span>`,c:M0.c,mod:m,ixBase:w,
+    d:`${W.n} fitted with a ${M0.n}. ${M0.eff}.`,f:`Craft: 1 ${W.n} + 1 ${M0.n} (keeps the weapon's condition).`,u:`${M0.eff}. ${ITEMS[w].u}`});VMB[id]=W.vmb}}
+// ---------- throwables & UV gear ----------
+const IX_T={
+ molotov:{n:'Molotov',c:'#c8963c',r:.05,ring:4,ringC:0xffa040,d:'A bottle of alcohol with a burning rag. It bursts into a 4 m pool of fire that burns for 8 seconds.',f:'Craft: 1 alcohol + 2 cloth.',u:'Hold left click to aim, release to throw. Anything in the fire catches fire.'},
+ firecracker:{n:'Firecracker',c:'#d8443a',r:.04,ring:1,ringC:0xffe070,d:'A string of loud bangers. For 8 seconds the noise pulls the infected and hostile players toward it.',f:'Craft: 1 chemicals + 5 gunpowder.',u:'Throw it away from you to lure enemies, then slip past or ambush them.'},
+ uv_flare:{n:'UV Flare',c:'#a05cff',r:.03,ring:1.2,ringC:0xc08cff,d:'Burns with an ultraviolet glow for 12 seconds. Night Stalkers keep out of its light.',f:'Craft: 1 chemicals + 1 battery.',u:'Throw it between you and a chase at night.'},
+ pipe_bomb:{n:'Pipe Bomb',c:'#6e7478',r:.035,ring:6,ringC:0xff6040,d:'A sealed pipe packed with powder and nails. Explodes 2.5 s after the throw, hurting everything within 6 m.',f:'Craft: 1 metal pipe + 20 gunpowder + 5 nails.',u:'Throw it into a crowd — and stay clear yourself.'},
+};
+for(const [id,T] of Object.entries(IX_T)){ITEMS[id]={n:T.n,c:T.c,cat:'Throwable',hot:1,ixThrow:1,d:T.d,f:T.f,u:T.u,onUse:ixThrowUse,onSecondary:ixThrowCancel};VMB[id]=[.27,-.29,-.3]}
+Object.assign(ITEMS,{
+ uv_flashlight:{n:'UV Flashlight',c:'#7d4fd0',cat:'Equipment',d:'An ultraviolet torch. Its beam stuns and repels Night Stalkers.',f:'Craft: 1 battery + 1 metal pipe + 1 chemicals. Also in supply drops.',u:'Keep it in your inventory and press V to switch it on. The battery drains fast and recharges while it is off.'},
+ uv_lamp:{n:'UV Lamp',c:'#9a5cf0',cat:'Deployable',hot:1,dep:'uv_lamp',d:'A battery-powered ultraviolet lamp. Night Stalkers avoid the 14 m circle around it.',f:'Craft at a Workbench: 2 batteries, 2 chemicals, 50 metal fragments, 50 wood.',u:'Place it in or next to your base to keep stalkers away at night.'},
+});
+VMB.uv_lamp=[.27,-.3,-.28];for(const m of Object.keys(IX_MODS))VMB['bp_'+m]=[.26,-.28,-.28];
+DEPS.uv_lamp={size:[.5,1.8,.5],solid:1};
+// gathering & harvesting with the new weapons
+{const TE={tree:{fire_axe:30,machete:14,katana:10,sledgehammer:6,lead_pipe:5,baseball_bat:5},node:{sledgehammer:30,fire_axe:12,lead_pipe:8,baseball_bat:5,machete:4,katana:3},corpse:{machete:1.1,katana:1,fire_axe:.9,lead_pipe:.5,baseball_bat:.5,sledgehammer:.6}};
+ for(const k of Object.keys(TE))for(const [w,v] of Object.entries(TE[k])){TOOLEFF[k][w]=v;for(const m of Object.keys(IX_MODS))TOOLEFF[k][w+'__'+m]=v}}
+// ---------- recipes: one contiguous block before the first workbench recipe ----------
+{const blk=[{id:'duct_tape',cost:{cloth:10,lgf:5},time:6,cat:'Infected gear'},{id:'nails',cost:{metal_frag:10},out:5,time:4,cat:'Infected gear'},
+  {id:'lead_pipe',cost:{metal_pipe:1,duct_tape:1},time:8,cat:'Infected gear'},{id:'machete',cost:{metal_blade:1,duct_tape:1,wood:50},time:10,cat:'Infected gear'},
+  {id:'baseball_bat',cost:{wood:150,nails:5},time:8,cat:'Infected gear'},{id:'uv_flashlight',cost:{battery:1,metal_pipe:1,chemicals:1},time:15,cat:'Infected gear'}];
+ for(const [m,M0] of Object.entries(IX_MODS))blk.push({id:m,cost:M0.cost,time:10,cat:'Weapon mods',bp:1,rc:90});
+ for(const w of Object.keys(IX_W))for(const m of Object.keys(IX_MODS))blk.push({id:w+'__'+m,cost:{[w]:1,[m]:1},time:4,cat:'Weapon mods',ixApp:[w,m]});
+ blk.push({id:'molotov',cost:{alcohol:1,cloth:2},time:5,cat:'Throwables'},{id:'firecracker',cost:{chemicals:1,gunpowder:5},time:5,cat:'Throwables'},
+  {id:'uv_flare',cost:{chemicals:1,battery:1},time:6,cat:'Throwables'},{id:'pipe_bomb',cost:{metal_pipe:1,gunpowder:20,nails:5},time:10,cat:'Throwables'},
+  {id:'fire_axe',cost:{metal_blade:1,metal_frag:60,wood:100},time:20,wb:1},{id:'uv_lamp',cost:{battery:2,chemicals:2,metal_frag:50,wood:50},time:20,wb:1});
+ const at=RECIPES.findIndex(r=>r.wb);RECIPES.splice(at<0?RECIPES.length:at,0,...blk)}
+const IX_APPS=RECIPES.filter(r=>r.ixApp);
+// ---------- look-at info, lessons ----------
+for(const id of [...IX_MATS,...Object.keys(IX_W),...Object.keys(IX_MODS),...Object.keys(IX_MODS).map(m=>'bp_'+m),...Object.keys(IX_T),'uv_flashlight'])
+  INFO[id]={k:ITEMS[id].cat,t:ixPlain(ITEMS[id].n),d:ITEMS[id].d,rows:[['Found',ITEMS[id].f],['Use',ITEMS[id].u]],g:'infected-crafting'};
+INFO.uv_lamp={k:'Deployable',t:'UV Lamp',d:'Ultraviolet lamp. Night Stalkers avoid the 14 m circle around it.',rows:[['Tip','Place one inside or beside your base before night falls.']],g:'infected-night'};
+LESSONS.burn='Fire killed you. Fire keeps burning for a few seconds after you step out of it — jump into water to put it out, and keep molotovs away from your own feet.';
+LESSONS.explosion='An explosion killed you. Throw explosives far, take cover behind walls or rocks, and stay away from gas canisters when the shooting starts.';
+
+// ---------- loot ----------
+const IX_LOOT={
+ infected:{n:[1,2],t:[['cloth',4,2,6],['scrap',3,2,6],['duct_tape',2,1,1],['nails',2,2,5],['alcohol',1.4,1,1],['chemicals',1.1,1,1],['battery',.8,1,1],['metal_frag',1.6,4,10],['bandage',1.2,1,1],['firecracker',.4,1,1],['molotov',.25,1,1],['bp',.12,1,1]]},
+ town:{n:[2,3],t:[['duct_tape',3,1,2],['nails',3,3,8],['alcohol',2.4,1,2],['chemicals',2.2,1,2],['battery',2,1,1],['cloth',2,4,10],['scrap',2.5,4,10],['metal_pipe',1,1,1],['metal_blade',.9,1,1],['rope',.8,1,1],['gunpowder',.5,5,12],['lead_pipe',.35,1,1],['baseball_bat',.35,1,1],['machete',.22,1,1],['katana',.06,1,1],['firecracker',.5,1,2],['molotov',.4,1,1],['uv_flare',.3,1,1],['bp',.25,1,1]]},
+ cabinet:{n:[1,3],t:[['alcohol',4,1,2],['chemicals',3,1,2],['bandage',3,1,2],['cloth',2,3,8],['duct_tape',1.4,1,1],['battery',1.2,1,1],['medical_syringe',.25,1,1],['uv_flare',.4,1,1],['bp',.22,1,1]]},
+ trunk:{n:[2,3],t:[['duct_tape',3,1,2],['battery',3,1,2],['metal_pipe',2,1,1],['lgf',2,8,20],['metal_frag',2,10,25],['rope',1.5,1,1],['gears',1,1,1],['nails',1.5,4,10],['baseball_bat',.4,1,1],['lead_pipe',.4,1,1],['fire_axe',.15,1,1],['sledgehammer',.1,1,1],['pipe_bomb',.15,1,1],['bp',.2,1,1]]},
+ toolbox:{n:[2,3],t:[['nails',4,5,12],['duct_tape',3,1,2],['metal_frag',3,10,30],['gears',2,1,1],['metal_blade',1.5,1,1],['metal_pipe',1.5,1,1],['battery',1,1,1],['machete',.3,1,1],['lead_pipe',.3,1,1],['fire_axe',.12,1,1],['sledgehammer',.15,1,1],['bp',.3,1,1]]},
+ barrel:{n:[0,1],t:[['duct_tape',2,1,1],['nails',2,2,5],['alcohol',1.2,1,1],['chemicals',1,1,1],['battery',.8,1,1]]},
+ crate:{n:[1,2],t:[['duct_tape',2.5,1,2],['nails',2,4,8],['battery',2,1,1],['chemicals',1.6,1,2],['alcohol',1.4,1,2],['metal_pipe',1,1,1],['molotov',.4,1,1],['pipe_bomb',.2,1,1],['machete',.2,1,1],['fire_axe',.1,1,1],['bp',.3,1,1]]},
+ airdrop:{n:[3,4],t:[['katana',1.2,1,1],['sledgehammer',.6,1,1],['fire_axe',.6,1,1],['pipe_bomb',1.2,1,2],['molotov',1.2,2,3],['uv_flare',1,2,3],['uv_flashlight',.6,1,1],['battery',1,2,3],['bp',1.4,1,1]]},
+};
+function rollLoot(kind,mult){mult=mult>0?mult:1;if(ixPerk('sv_scavenge'))mult*=1.5;const T=IX_LOOT[kind]||IX_LOOT.town;const out={};
+  let n=RI(T.n[0],T.n[1]);if(mult>1&&Math.random()<Math.min(1,mult-1))n++;const tot=T.t.reduce((a,e)=>a+e[1],0);
+  for(let i=0;i<n;i++){let r=Math.random()*tot,e=T.t[T.t.length-1];for(const x of T.t){r-=x[1];if(r<=0){e=x;break}}
+    let id=e[0];if(id==='bp')id=ixPickBp();if(!ITEMS[id])continue;let q=RI(e[2],e[3]);if(e[3]>1)q=Math.max(1,Math.round(q*mult));out[id]=(out[id]||0)+q}
+  return out}
+function ixPickBp(){const ms=Object.keys(IX_MODS);const unk=ms.filter(m=>!(S&&S.bps.includes(m)));return 'bp_'+pick(unk.length&&Math.random()<.8?unk:ms)}
+function ixGrant(L){for(const [k,v] of Object.entries(L||{}))if(v>0&&ITEMS[k])gain(k,v)}
+const _ixLootBarrel=lootBarrel;lootBarrel=function(...a){const r=_ixLootBarrel(...a);ixGrant(rollLoot('barrel'));return r};
+const _ixLootCrate=lootCrate;lootCrate=function(...a){const r=_ixLootCrate(...a);ixGrant(rollLoot('crate'));return r};
+const _ixDropCrate=spawnDropCrate;spawnDropCrate=function(...a){const r=_ixDropCrate(...a);if(drop&&drop.loot){const L=rollLoot('airdrop');for(const [k,v] of Object.entries(L))drop.loot[k]=(drop.loot[k]||0)+v}return r};
+
+// ---------- durability: per-copy {d,r} arrays on P.ixDur, kept in step with the inventory ----------
+const ixDurable=id=>!!(ITEMS[id]&&ITEMS[id].ixW);
+function ixNewCopy(id){const it=ITEMS[id];const tk=IX.taken[id];if(tk&&tk.length)return tk.pop();
+  if(it.mod){const tb=IX.taken[it.ixBase];if(tb&&tb.length)return tb.pop()}
+  if(!IX.crafting){const pl=IX.pool[id];if(pl&&pl.length)return pl.pop()}return{d:it.dmax,r:3}}
+function ixDurArr(id){if(!P)return[];const D=P.ixDur||(P.ixDur={});const a=D[id]||(D[id]=[]);if(IX.durBusy)return a;const n=Math.max(0,P.inv[id]||0);
+  if(a.length>n){const ex=a.splice(n);const pl=IX.pool[id]||(IX.pool[id]=[]);pl.push(...ex);if(pl.length>10)pl.splice(0,pl.length-10)}
+  else while(a.length<n)a.push(ixNewCopy(id));return a}
+function ixActiveIdx(id){const a=ixDurArr(id);for(let i=0;i<a.length;i++)if(a[i].d>0)return i;return 0}
+function weaponDurability(id){if(!ixDurable(id)||!P||!(P.inv[id]>0))return null;const c=ixDurArr(id)[ixActiveIdx(id)];return c?{cur:Math.ceil(c.d),max:ITEMS[id].dmax}:null}
+const ixDurCol=f=>f>.5?'#8fc04a':f>.25?'#d8b24a':'#e0624d';
+const _ixGain=gain;gain=function(id,n,silent){if(!ixDurable(id)||!(n>0)||!P)return _ixGain(id,n,silent);const a=ixDurArr(id);IX.durBusy++;
+  try{for(let i=0;i<n;i++)a.push(ixNewCopy(id));return _ixGain(id,n,silent)}finally{IX.durBusy--}};
+const _ixTake=take;take=function(id,n){if(!ixDurable(id)||!(n>0)||!P)return _ixTake(id,n);const a=ixDurArr(id);IX.durBusy++;
+  try{const rem=a.splice(Math.max(0,a.length-n));const tk=IX.taken[id]||(IX.taken[id]=[]);tk.push(...rem);if(tk.length>12)tk.splice(0,tk.length-12);return _ixTake(id,n)}finally{IX.durBusy--}};
+const _ixUpdateQueue=updateQueue;updateQueue=function(dt){IX.crafting++;try{return _ixUpdateQueue(dt)}finally{IX.crafting--}};
+const _ixCraft=craft;craft=function(id,n){const len=S?S.queue.length:0;const r=_ixCraft(id,n);if(S&&S.queue.length>len&&IX_T[id]&&ixPerk('sv_crafter')){const q=S.queue[S.queue.length-1];if(q&&q.id===id)q.out*=2}return r};
+function ixWear(id,amt){const a=ixDurArr(id);if(!a.length)return;const c=a[ixActiveIdx(id)];const mx=ITEMS[id].dmax;const b=c.d;c.d=Math.max(0,c.d-amt);
+  if(b>0&&c.d<=0){sfx('ixbreak',.8);feedMsg(`Your ${ITEMS[id].n} broke!`);tip('ix_broken','Broken weapon','A broken weapon only does 30% damage. Open the inventory (<b>Tab</b>), select it and <b>repair</b> it with duct tape plus metal fragments or nails — every weapon can be repaired 3 times.',true)}
+  else if(b>mx*.25&&c.d<=mx*.25)tip('ix_worn','Badly worn','Your weapon is close to breaking. Repair it in the inventory (Tab) while you still can.');
+  if(Math.ceil(b)!==Math.ceil(c.d))updateHotbar()}
+function ixRepair(id,i,how){const a=ixDurArr(id);const c=a[i];if(!c||c.r<=0||c.d>=ITEMS[id].dmax)return;const cost=how==='nails'?{duct_tape:1,nails:4}:{duct_tape:1,metal_frag:15};if(!canAfford(cost))return;
+  pay(cost);c.d=ITEMS[id].dmax;c.r--;sfx('ixtape',.8);feedMsg(`Repaired ${ITEMS[id].n} (${c.r} repair${c.r===1?'':'s'} left)`);ixXP('survivor',4,'repair');updateHotbar();renderInv()}
+function ixLearn(id){const it=ITEMS[id];if(!it||!it.ixBp||!has(id))return;const m=it.ixBp,M0=IX_MODS[m];take(id,1);
+  if(S.bps.includes(m)){gain('scrap',25);feedMsg(`You already know ${M0.n} — blueprint scrapped for 25 scrap`)}
+  else{S.bps.push(m);sfx('ixlearn',.8);feedMsg('Blueprint learned: '+M0.n);ixXP('survivor',15,'blueprint');
+    tip('ix_bp','Blueprint learned',`You can now craft <b>${M0.n}</b> kits (Tab → Weapon mods). Combine a kit with a melee weapon to add its effect to every hit.`,true)}
+  if(!$('#inv').classList.contains('hidden'))renderInv()}
+function ixBpUse(id){if(P.cd>0||!P.alive)return;P.cd=.6;mouseL=false;startAnim('use',.5);ixLearn(id)}
+
+// ---------- inventory panel: durability, repairs, blueprints, filtered mod recipes ----------
+const _ixRenderInv=renderInv;renderInv=function(){const rm=[];
+  for(const r of IX_APPS)if(!(P&&has(r.ixApp[0]))){const i=RECIPES.indexOf(r);if(i>=0)rm.push([i,r])}
+  rm.sort((a,b)=>b[0]-a[0]);for(const [i] of rm)RECIPES.splice(i,1);
+  try{_ixRenderInv()}finally{for(let k=rm.length-1;k>=0;k--)RECIPES.splice(rm[k][0],0,rm[k][1])}
+  ixInvExtras()};
+function ixInvExtras(){if(!P)return;
+  document.querySelectorAll('#invGrid .slot[data-id]').forEach(s=>{const id=s.dataset.id;if(!ixDurable(id))return;const w=weaponDurability(id);if(!w)return;const f=w.cur/w.max;s.insertAdjacentHTML('beforeend',`<i class="ixdur2"><b style="width:${Math.max(3,f*100).toFixed(0)}%;background:${ixDurCol(f)}"></b></i>`)});
+  const id=selItem;if(!id||!P.inv[id]||!ITEMS[id])return;const it=ITEMS[id];let h='';
+  if(ixDurable(id)){const a=ixDurArr(id),mx=it.dmax,ai=ixActiveIdx(id);h+=`<div class="sec" style="margin:10px 0 4px">Condition</div>`;
+    a.forEach((c,i)=>{const f=c.d/mx,full=c.d>=mx,okF=canAfford({duct_tape:1,metal_frag:15}),okN=canAfford({duct_tape:1,nails:4});
+      h+=`<div class="ixcopy"><div class="ixcb"><b style="width:${Math.max(2,f*100).toFixed(0)}%;background:${ixDurCol(f)}"></b></div><span>${a.length>1?`#${i+1}${i===ai?' (in use)':''} · `:''}${Math.ceil(c.d)}/${mx}${c.d<=0?' · <span class="warn">broken</span>':''} · ${c.r} repair${c.r===1?'':'s'} left</span></div>`;
+      if(!full&&c.r>0)h+=`<div class="actions" style="margin:2px 0 6px"><button class="btn sm" ${okF?'':'disabled'} onclick="ixRepair('${id}',${i},'frag')">Repair · 1 Duct Tape + 15 Frags</button><button class="btn sm" ${okN?'':'disabled'} onclick="ixRepair('${id}',${i},'nails')">Repair · 1 Duct Tape + 4 Nails</button></div>`;
+      else if(c.r<=0&&!full)h+=`<div class="lab" style="margin:2px 0 6px">No repairs left — this one is worn out for good.</div>`});
+    if(it.mod)h+=`<div style="margin-top:4px;color:${IX_MODS[it.mod].hc}">${IX_MODS[it.mod].eff}.</div>`}
+  if(it.ixBp)h+=`<div class="actions"><button class="btn" onclick="ixLearn('${id}')">${S.bps.includes(it.ixBp)?'Already known — scrap it (25 scrap)':'Learn blueprint'}</button></div>`;
+  if(it.ixKit)h+=`<div style="margin-top:6px" class="lab">${S.bps.includes(it.ixKit)?'Blueprint known — you can craft more kits.':'Blueprint not known yet — find one in town to craft more.'}</div>`;
+  if(id==='uv_flashlight')h+=`<div style="margin-top:6px"><span class="lab">Battery</span> ${Math.round(IX.uv.bat)}% · press <b>V</b> in game to switch it ${IX.uv.on?'off':'on'}</div>`;
+  if(h)$('#invDesc').insertAdjacentHTML('beforeend',h)}
+const _ixUpdateHotbar=updateHotbar;updateHotbar=function(){_ixUpdateHotbar();if(!P||!P.hot)return;let slots=null;
+  for(let i=0;i<P.hot.length;i++){const id=P.hot[i];if(!id||!ixDurable(id))continue;const w=weaponDurability(id);if(!w)continue;if(!slots)slots=document.querySelectorAll('#hotbar .hslot');const el=slots[i];if(!el)continue;
+    const f=w.cur/w.max;el.insertAdjacentHTML('beforeend',`<i class="ixdur${w.cur<=0?' brk':''}"><b style="width:${Math.max(3,f*100).toFixed(0)}%;background:${ixDurCol(f)}"></b></i>`)}};
+const _ixHintFor=hintFor;hintFor=function(id){const it=ITEMS[id];
+  if(it&&it.ixW){let h='Left click to swing';if(ixPerk('pw_heavy'))h+=' · hold to wind up a heavy blow';const w=weaponDurability(id);if(w)h+=` · condition ${Math.round(100*w.cur/w.max)}%`;if(it.mod)h+=' · '+IX_MODS[it.mod].hint;return h}
+  if(it&&it.ixThrow)return 'Hold left click to aim, release to throw · R cancels';if(it&&it.ixBp)return 'Left click to learn this blueprint';return _ixHintFor(id)};
+
+// ---------- melee combat ----------
+function ixMeleeUse(id){if(!P.alive)return;if(ixPerk('pw_heavy')){if(IX.chg&&IX.chg.id===id)IX.chg.lastT=S.time;else if(P.cd<=0)IX.chg={id,t:0,ready:false,lastT:S.time};return}
+  if(P.cd>0)return;ixSwing(id,false)}
+function ixSwing(id,heavy){const it=ITEMS[id];if(!it||!it.ixW||!P.alive)return;const w=it.ixW;const cost=(it.stam||w.stam)*(heavy?1.8:1);
+  const ok=typeof useStamina==='function'?!!useStamina(cost):true;const weak=!ok;if(weak){heavy=false;tip('ix_exhaust','Out of breath','With no stamina left your swings are slow and weak. Back off for a moment and let your stamina recover.')}
+  const rate=w.rate*(weak?1.6:1)*(heavy?1.45:1);P.cd=rate;startAnim('swing',rate*.92,{ixHeavy:heavy,ixWeak:weak,ixW:id});
+  P.pending={fn:()=>ixDoHit(id,heavy,weak),at:heavy?.45:.4,done:false};sfx(heavy?'ixheavy':'swish',heavy?.75:.35+(w.two?.1:0));if(heavy)P.camShake=Math.max(P.camShake||0,.1)}
+function ixDoHit(id,heavy,weak){const it=ITEMS[id];if(!P.alive||!it||!it.ixW||!has(id))return;const w=it.ixW;const cp=ixDurArr(id)[ixActiveIdx(id)];const broken=!!cp&&cp.d<=0;
+  let dmg=w.dmg*(heavy?2:1)*(weak?.45:1)*(broken?.3:1);if(ixPerk('pw_tough'))dmg*=1.15;dmg=Math.max(1,Math.round(dmg));
+  const reach=w.reach+(heavy?.35:0);const m={dmg,reach,rate:w.rate,knock:w.knock*(heavy?1.8:1)*(weak?.3:1),heavy,sharp:!!w.sharp,mod:it.mod||null,id};
+  const a=aim(reach+.6);const hit=meleeHit(m,id);if(!hit)return;if(P.anim)P.anim.impact=1;
+  const t=a.e,cre=t&&(a.kind==='z'||a.kind==='npc'||a.kind==='animal');ixWear(id,cre?1:.5);
+  if(!cre){if(heavy||w.style==='slam')P.camShake=Math.max(P.camShake||0,.12);return}
+  P.camShake=Math.max(P.camShake||0,heavy?.32:w.two?.12:.06);ixXP('power',heavy?6:3,'melee');if(broken)tip('ix_broken0','Broken weapon','This weapon is broken and only does 30% damage. Repair it in the inventory (Tab).');
+  if(!w.sharp&&a.point)ixSparks(a.point.x,a.point.y,a.point.z,'#fff0c0',heavy?6:3,2.2,1,8,.18,.035);
+  if(!t.dead){const dx=t.x-P.x,dz=t.z-P.z,dl=Math.hypot(dx,dz)||1;ixKnock(t,dx/dl,dz/dl,m.knock);if(it.mod)ixModHit(it.mod,t,a.point||IX.pt,dmg)}
+  if(w.aoe&&a.point){const pt=a.point;ixPuff(pt.x,groundH(pt.x,pt.z)+.2,pt.z,'#8a7a62',.6,1,.4,.35,2.4);
+    for(const o of ixFoesNear(pt.x,pt.z,w.aoe)){if(o===t||o.dead)continue;damageAny(o,Math.round(dmg*.4),'player',{wname:ixPlain(it.n)});const ox=o.x-P.x,oz=o.z-P.z,ol=Math.hypot(ox,oz)||1;ixKnock(o,ox/ol,oz/ol,m.knock*.6)}}}
+function ixModHit(mod,t,pt,dmg){const M0=IX_MODS[mod];applyStatus(t,M0.st,M0.secs,'player');
+  tip('ix_status','Status effects','<b>Bleeding</b> and <b>toxin</b> drain health over time (toxin also slows), <b>fire</b> burns and causes panic, <b>shock</b> stuns and jumps to nearby enemies.');
+  if(mod==='shock_coil'){sfx('ixzap',.8,pt);ixSparks(pt.x,pt.y,pt.z,'#9fe6ff',16,3.5,1.5,6,.35);let n=0;
+    for(const o of ixFoesNear(t.x,t.z,5)){if(o===t||o.dead)continue;ixBolt(pt,{x:o.x,y:o.y+1.1,z:o.z});damageAny(o,Math.max(6,Math.round(dmg*.3)),'player',{wname:'Shock Coil'});applyStatus(o,'shock',1.4,'player');ixSparks(o.x,o.y+1.1,o.z,'#9fe6ff',8,2.5,1,6,.3);if(++n>=2)break}}
+  else if(mod==='fire_kit'){sfx('ixwhoosh',.45,pt);ixSparks(pt.x,pt.y,pt.z,'#ffb050',12,2.5,1.5,4,.5)}
+  else if(mod==='nail_wrap'){burst(pt,CHIP.flesh,10,2.4,1.4)}
+  else if(mod==='toxin_vial'){for(let i=0;i<3;i++)ixPuff(pt.x+R(-.2,.2),pt.y+R(-.1,.2),pt.z+R(-.2,.2),'#7fd04a',.35,R(.9,1.4),.4,.4,2.2);sfx('ixsizzle',.35,pt)}}
+function ixFoesNear(x,z,r){const out=[];const zs=typeof infectedNear==='function'?(infectedNear(x,z,r)||[]):ixZ().filter(q=>q&&!q.dead&&dist2(q.x,q.z,x,z)<r);
+  for(const q of zs)if(q&&!q.dead)out.push(q);for(const n of npcs)if(!n.dead&&dist2(n.x,n.z,x,z)<r)out.push(n);for(const a of animals)if(!a.dead&&dist2(a.x,a.z,x,z)<r)out.push(a);
+  out.sort((a,b)=>dist2(a.x,a.z,x,z)-dist2(b.x,b.z,x,z));return out}
+function ixFind(id){return npcs.find(n=>n.id===id)||animals.find(a=>a.id===id)||ixZ().find(q=>q&&q.id===id)||null}
+function ixKnock(t,dx,dz,p){if(!t||!(p>0))return;if(t===P||KNOCK_EXT[t.t]||!(t.t==='npc'||ANIM[t.t]))return knockback(t,dx,dz,p);
+  if(NET.role==='client'){if(t.id!==undefined)hostSend({k:'i_kb',id:t.id,dx:+dx.toFixed(2),dz:+dz.toFixed(2),p:+p.toFixed(1)});return}ixShove(t,dx,dz,p)}
+function ixShove(t,dx,dz,p){IX.shoves.push({t,vx:dx*p*.9,vz:dz*p*.9,l:.4});if(t.t==='npc')t.cd=Math.max(t.cd||0,.35)}
+function ixShoveTick(dt){for(let i=IX.shoves.length-1;i>=0;i--){const s=IX.shoves[i],t=s.t;s.l-=dt;if(s.l<=0||t.dead){IX.shoves.splice(i,1);continue}
+  const o={x:t.x+s.vx*dt,z:t.z+s.vz*dt};collide(o,.4,t.y,1.6);t.x=clamp(o.x,8,WS-8);t.z=clamp(o.z,8,WS-8);t.y=supportH(t.x,t.z,t.y+.5,.4);const f=Math.exp(-dt*7);s.vx*=f;s.vz*=f}}
+// shocked creatures can't move, poisoned ones are slowed, burning hostile players run erratically
+const _ixMoveCreature=moveCreature;moveCreature=function(c,tx,tz,speed,dt,rad){const st=c&&c.st;
+  if(st){if(st.shock>0){c.speed=0;return Math.hypot(tx-c.x,tz-c.z)}if(st.toxin>0)speed*=.55;if(st.burn>0&&c.t==='npc'){const ph=S.time*2.1+(c.x||0)*.3;tx+=Math.sin(ph)*6;tz+=Math.cos(ph*1.3)*6}}
+  return _ixMoveCreature(c,tx,tz,speed,dt,rad)};
+// a UV beam at night gives your position away to hostile players
+const _ixNpcVision=npcVision;npcVision=function(n,t){let v=_ixNpcVision(n,t);if(isNight()){if(t===P&&IX.uv.on)v=Math.max(v,70);else if(t&&t.t==='rplayer'&&IX.uvR[t.id]&&IX.uvR[t.id].on)v=Math.max(v,70)}return v};
+
+// ---------- status effects ----------
+function applyStatus(t,type,secs,src){if(!t||IX_STK.indexOf(type)<0||!(secs>0))return;if(t===P)return ixPStatus(type,secs);if(t.dead)return;
+  if(t.t==='rplayer'){if(NET.role==='host'&&t.id)sendTo(t.id,{k:'i_pst',ty:type,s:+secs.toFixed(1)});return}
+  const st=t.st||(t.st={});st[type]=Math.max(st[type]||0,secs);if(src)t.ixSrc=src;IX.stSet.add(t);
+  if(NET.role==='client'){t.ixLocalT=S.time;if(t.id!==undefined)hostSend({k:'i_st',id:t.id,ty:type,s:+secs.toFixed(1)});return}
+  if(type==='shock'&&(t.t==='npc'||ANIM[t.t]))t.cd=Math.max(t.cd||0,secs);
+  if(type==='burn'&&ANIM[t.t]){t.state='flee';t.tt=Math.max(t.tt||0,secs);t.fleeFrom=src&&src!=='player'&&src.x!==undefined?src:P}
+  if(type==='burn'&&t.t==='npc')t.aimT=Math.max(t.aimT||0,.6)}
+function ixPStatus(type,secs){if(!P||!P.alive)return;const s=P.ixSt||(P.ixSt={});
+  if(type==='bleed'){if(!P.bleed){P.bleed=1;tip('bleed','You\'re bleeding','Bleeding drains your health until you use a <b>Bandage</b> (4 cloth) or a Medical Syringe.',true)}return}
+  if(type==='toxin'){P.poison=(P.poison||0)+secs*1.5;s.toxin=Math.max(s.toxin||0,secs);return}
+  s[type]=Math.max(s[type]||0,secs);if(type==='burn')tip('ix_burn','You\'re on fire!','Fire keeps burning you for a few seconds after you step out of it. Jump into water to put it out.')}
+function ixPTick(dt){const s=P.ixSt;if(!s)return;
+  if(s.burn>0){if(P.y<-.3){s.burn=0;sfx('ixsizzle',.6);ixPuff(P.x,.3,P.z,'#d8dde0',.6,1.2,1,.4,2)}else{s.burn-=dt;IX.pBurn=(IX.pBurn||0)+dt;if(IX.pBurn>=.5){IX.pBurn=0;hurt(2,'burn');if(!P.alive){$('#dCause').textContent='Burned to death';return}}}}
+  if(s.shock>0){s.shock-=dt;const f=Math.max(0,1-dt*8);P.vx*=f;P.vz*=f;P.camShake=Math.max(P.camShake||0,.12)}
+  if(s.toxin>0)s.toxin-=dt}
+function ixValid(t){if(!t||t.dead)return false;if(t.t==='npc')return npcs.includes(t);if(t.t==='z')return ixZ().includes(t);if(ANIM[t.t])return animals.includes(t);return true}
+function ixStClear(t){if(t.ixFl){t.ixFl.forEach(ixFlPut);t.ixFl=null}if(t.st)for(const k of IX_STK)if(t.st[k])t.st[k]=0;t.ixAcc=0}
+function ixStatusTick(dt,auth){for(const t of IX.stSet){if(t===P){IX.stSet.delete(t);continue}if(!ixValid(t)||!t.st){ixStClear(t);IX.stSet.delete(t);continue}
+  const st=t.st;let dps=0;for(const k of IX_STK)if(st[k]>0){st[k]=Math.max(0,st[k]-dt);if(st[k]>0)dps+=IX_DPS[k]}
+  if(dps<=0){ixStClear(t);IX.stSet.delete(t);continue}
+  if(auth){t.ixAcc=(t.ixAcc||0)+dt;if(t.ixAcc>=.5){t.ixAcc-=.5;const src=t.ixSrc||'player';const wn=st.burn>0?'Fire':st.toxin>0?'Toxin':st.bleed>0?'Bleeding':'Shock';
+    damageAny(t,dps*.5,src,{wname:wn,dot:true,status:wn});if(st.burn>0&&ANIM[t.t]&&!t.dead){t.state='flee';t.tt=Math.max(t.tt||0,1);t.fleeFrom=src!=='player'&&src&&src.x!==undefined?src:P}}}}}
+
+// ---------- FX pools (created once; never add lights after start) ----------
+const IX_SPN=360,ixSpPos=new Float32Array(IX_SPN*3),ixSpCol=new Float32Array(IX_SPN*3),ixSpSz=new Float32Array(IX_SPN),ixSpGeo=new THREE.BufferGeometry();
+ixSpGeo.setAttribute('position',new THREE.BufferAttribute(ixSpPos,3));ixSpGeo.setAttribute('aC',new THREE.BufferAttribute(ixSpCol,3));ixSpGeo.setAttribute('aS',new THREE.BufferAttribute(ixSpSz,1));
+const ixSpU={map:{value:ixGlowTex},uScale:{value:360}};
+const ixSpMesh=new THREE.Points(ixSpGeo,new THREE.ShaderMaterial({uniforms:ixSpU,transparent:true,depthWrite:false,blending:THREE.AdditiveBlending,
+  vertexShader:'attribute float aS;attribute vec3 aC;varying vec3 vC;uniform float uScale;void main(){vC=aC;vec4 mv=modelViewMatrix*vec4(position,1.);gl_PointSize=aS*uScale/max(.05,-mv.z);gl_Position=projectionMatrix*mv;}',
+  fragmentShader:'uniform sampler2D map;varying vec3 vC;void main(){float a=texture2D(map,gl_PointCoord).a;gl_FragColor=vec4(vC,a);}'}));
+ixSpMesh.frustumCulled=false;scene.add(ixSpMesh);const ixSp=[];
+function ixSparks(x,y,z,hex,n,spd=2,up=1,grav=9,life=.5,size=.06){if(ixLow())n=Math.ceil(n*.5);const c=ixRGB(hex);
+  for(let i=0;i<n&&ixSp.length<IX_SPN;i++){const l=life*R(.6,1.2);ixSp.push({x,y,z,vx:R(-1,1)*spd,vy:R(-.3,1)*spd*.6+up*R(.4,1),vz:R(-1,1)*spd,g:grav,l,ml:l,r:c[0],gg:c[1],b:c[2],s:size*R(.7,1.3)})}}
+function ixSparkTick(dt){for(let i=ixSp.length-1;i>=0;i--){const p=ixSp[i];p.l-=dt;if(p.l<=0){ixSp[i]=ixSp[ixSp.length-1];ixSp.pop();continue}p.vy-=p.g*dt;const f=Math.exp(-dt*1.5);p.vx*=f;p.vz*=f;p.x+=p.vx*dt;p.y+=p.vy*dt;p.z+=p.vz*dt}
+  let n=0;for(const p of ixSp){const k=Math.min(1,p.l/p.ml*1.6);ixSpPos[n*3]=p.x;ixSpPos[n*3+1]=p.y;ixSpPos[n*3+2]=p.z;ixSpCol[n*3]=p.r*k;ixSpCol[n*3+1]=p.gg*k;ixSpCol[n*3+2]=p.b*k;ixSpSz[n]=p.s;n++}
+  ixSpGeo.setDrawRange(0,n);ixSpGeo.attributes.position.needsUpdate=true;ixSpGeo.attributes.aC.needsUpdate=true;ixSpGeo.attributes.aS.needsUpdate=true;ixSpU.uScale.value=innerHeight*Math.min(window.devicePixelRatio||1,2)*.5}
+const IX_SMN=56,ixSm=[];let ixSmI=0;
+for(let i=0;i<IX_SMN;i++){const m=new THREE.SpriteMaterial({map:ixSmokeTex,transparent:true,depthWrite:false,opacity:0});const s=new THREE.Sprite(m);s.visible=false;scene.add(s);ixSm.push({s,m,l:0,ml:1,vx:0,vy:0,vz:0,s0:1,s1:2,a:.5,rs:0,add:false})}
+function ixPuff(x,y,z,hex,size,life,vy,a=.45,grow=2.2,vx=0,vz=0){if(ixLow()&&Math.random()<.4)return;const p=ixSm[ixSmI];ixSmI=(ixSmI+1)%IX_SMN;p.s.visible=true;p.s.position.set(x,y,z);p.l=p.ml=life;p.vx=vx;p.vy=vy;p.vz=vz;p.s0=size;p.s1=size*grow;p.a=a;
+  const L=.25+.75*(S&&S.light!==undefined?S.light:1);const c=ixRGB(hex);p.m.color.setRGB(c[0]*L,c[1]*L,c[2]*L);p.m.rotation=R(0,6.28);p.rs=R(-.6,.6);p.m.opacity=0;p.s.scale.set(size,size,1)}
+function ixPuffTick(dt){for(const p of ixSm){if(p.l<=0)continue;p.l-=dt;if(p.l<=0){p.s.visible=false;continue}const k=1-p.l/p.ml;const f=Math.exp(-dt*1.2);p.vx*=f;p.vz*=f;
+  p.s.position.x+=p.vx*dt;p.s.position.y+=p.vy*dt;p.s.position.z+=p.vz*dt;const sc=lerp(p.s0,p.s1,1-(1-k)*(1-k));p.s.scale.set(sc,sc,1);p.m.rotation+=p.rs*dt;p.m.opacity=p.a*(k<.12?k/.12:1-(k-.12)/.88)}}
+const IX_FLN=44,ixFl=[];for(let i=0;i<IX_FLN;i++){const m=new THREE.SpriteMaterial({map:fireTex,transparent:true,depthWrite:false,blending:THREE.AdditiveBlending});const s=new THREE.Sprite(m);s.visible=false;scene.add(s);ixFl.push({s,m,busy:false})}
+function ixFlGet(){for(const f of ixFl)if(!f.busy){f.busy=true;f.s.visible=true;f.m.opacity=1;return f}return null}
+function ixFlPut(f){if(!f)return;f.busy=false;f.s.visible=false}
+const ixGl=[];for(let i=0;i<8;i++){const m=new THREE.SpriteMaterial({map:ixGlowTex,color:0xb478ff,transparent:true,depthWrite:false,blending:THREE.AdditiveBlending});const s=new THREE.Sprite(m);s.visible=false;scene.add(s);ixGl.push({s,m,busy:false})}
+function ixGlGet(){for(const g of ixGl)if(!g.busy){g.busy=true;g.s.visible=true;return g}return null}
+function ixGlPut(g){if(!g)return;g.busy=false;g.s.visible=false}
+const ixFb=[];for(let i=0;i<6;i++){const m=new THREE.SpriteMaterial({map:ixSmokeTex,color:0xffa050,transparent:true,depthWrite:false,blending:THREE.AdditiveBlending,opacity:0});const s=new THREE.Sprite(m);s.visible=false;scene.add(s);ixFb.push({s,m,l:0,ml:1,s0:1,s1:3,vy:0})}
+const ixFlash=new THREE.Sprite(new THREE.SpriteMaterial({map:ixGlowTex,color:0xffe2b8,transparent:true,depthWrite:false,blending:THREE.AdditiveBlending,opacity:0}));ixFlash.visible=false;scene.add(ixFlash);
+const ixRings=[];for(let i=0;i<2;i++){const m=new THREE.MeshBasicMaterial({color:0xffd8a0,transparent:true,opacity:0,depthWrite:false,blending:THREE.AdditiveBlending,side:THREE.DoubleSide});const r=new THREE.Mesh(new THREE.RingGeometry(.82,1,48).rotateX(-Math.PI/2),m);r.visible=false;scene.add(r);ixRings.push({r,m,l:0,ml:.45,R:6})}
+const ixBolts=[];for(let i=0;i<3;i++){const pos=new Float32Array(30),g=new THREE.BufferGeometry();g.setAttribute('position',new THREE.BufferAttribute(pos,3));const m=new THREE.LineBasicMaterial({color:0xaee9ff,transparent:true,opacity:0,blending:THREE.AdditiveBlending,depthWrite:false});const l=new THREE.Line(g,m);l.frustumCulled=false;l.visible=false;scene.add(l);ixBolts.push({l,m,pos,g,life:0,a:{x:0,y:0,z:0},b:{x:0,y:0,z:0}})}
+function ixBolt(a,b){let B=ixBolts[0];for(const q of ixBolts)if(q.life<B.life)B=q;B.life=.2;B.a.x=a.x;B.a.y=a.y;B.a.z=a.z;B.b.x=b.x;B.b.y=b.y;B.b.z=b.z;B.l.visible=true;ixBoltShape(B)}
+function ixBoltShape(B){for(let i=0;i<10;i++){const t=i/9,j=i===0||i===9?0:.28*Math.sin(t*Math.PI);B.pos[i*3]=lerp(B.a.x,B.b.x,t)+R(-j,j);B.pos[i*3+1]=lerp(B.a.y,B.b.y,t)+R(-j,j);B.pos[i*3+2]=lerp(B.a.z,B.b.z,t)+R(-j,j)}B.g.attributes.position.needsUpdate=true}
+// the four pooled lights of this module (fixed count, toggled by intensity)
+const ixBoomL=new THREE.PointLight(0xffa860,0,45,2);scene.add(ixBoomL);
+const ixFireL=new THREE.PointLight(0xff7a2a,0,18,2);scene.add(ixFireL);
+const ixUvL=new THREE.PointLight(0xa45cff,0,16,2);scene.add(ixUvL);
+const ixSpot=new THREE.SpotLight(0xa86bff,0,28,.42,.55,1.4);scene.add(ixSpot);scene.add(ixSpot.target);
+// UV beam cone (soft additive shader) + hand-held flashlight model
+const ixConeGeo=new THREE.CylinderGeometry(.03,2.6,13,18,1,true).translate(0,-6.5,0).rotateX(-Math.PI/2);
+const ixConeMat=a=>new THREE.ShaderMaterial({uniforms:{uC:{value:new THREE.Color(0xb27aff)},uA:{value:a}},transparent:true,depthWrite:false,blending:THREE.AdditiveBlending,side:THREE.DoubleSide,fog:false,
+  vertexShader:'varying float vH;varying vec3 vN;varying vec3 vV;void main(){vH=uv.y;vec4 mv=modelViewMatrix*vec4(position,1.);vN=normalize(normalMatrix*normal);vV=normalize(-mv.xyz);gl_Position=projectionMatrix*mv;}',
+  fragmentShader:'uniform vec3 uC;uniform float uA;varying float vH;varying vec3 vN;varying vec3 vV;void main(){float f=pow(abs(dot(normalize(vN),normalize(vV))),1.6);float a=uA*f*pow(vH,1.5);gl_FragColor=vec4(uC,a);}'});
+const ixCone=new THREE.Mesh(ixConeGeo,ixConeMat(.05));ixCone.visible=false;ixCone.frustumCulled=false;scene.add(ixCone);const ixConeMatR=ixConeMat(.11);
+const ixHand=new THREE.Group();{const body=ixC(.017,.017,.14,IXM.dark,0,0,0,10);body.rotation.x=Math.PI/2;ixHand.add(body);const head=ixC(.027,.019,.045,IXM.dsteel,0,0,-.085,10);head.rotation.x=Math.PI/2;ixHand.add(head);
+  const lens=new THREE.Mesh(new THREE.CircleGeometry(.023,14),IXB.lens);lens.position.z=-.1085;lens.rotation.y=Math.PI;ixHand.add(lens);ixHand.add(box(.008,.012,.03,IXM.batt,0,.019,.02));
+  const gs=new THREE.Sprite(new THREE.SpriteMaterial({map:ixGlowTex,color:0xb47cff,transparent:true,depthWrite:false,blending:THREE.AdditiveBlending,opacity:.9}));gs.scale.set(.09,.09,1);gs.position.z=-.118;ixHand.add(gs);ixHand.userData.glow=gs;
+  const arm=armMesh();arm.position.set(0,-.012,.07);ixHand.add(arm);const lp=new THREE.Object3D();lp.position.z=-.12;ixHand.add(lp);ixHand.userData.lens=lp}
+ixHand.position.set(-.27,-.26,-.42);ixHand.visible=false;camera.add(ixHand);
+// trajectory preview: one reusable dashed line + landing ring
+const IX_TRN=64,ixTrPos=new Float32Array(IX_TRN*3),ixTrDist=new Float32Array(IX_TRN),ixTrGeo=new THREE.BufferGeometry();
+ixTrGeo.setAttribute('position',new THREE.BufferAttribute(ixTrPos,3));ixTrGeo.setAttribute('lineDistance',new THREE.BufferAttribute(ixTrDist,1));
+const ixTrLine=new THREE.Line(ixTrGeo,new THREE.LineDashedMaterial({color:0xfff2d0,dashSize:.22,gapSize:.16,transparent:true,opacity:.85,depthTest:false,depthWrite:false}));ixTrLine.frustumCulled=false;ixTrLine.visible=false;ixTrLine.renderOrder=999;scene.add(ixTrLine);
+const ixTrRing=new THREE.Mesh(new THREE.RingGeometry(.88,1,48).rotateX(-Math.PI/2),new THREE.MeshBasicMaterial({color:0xffd27a,transparent:true,opacity:.5,depthTest:false,depthWrite:false,side:THREE.DoubleSide}));ixTrRing.visible=false;ixTrRing.renderOrder=999;scene.add(ixTrRing);
+
+// ---------- viewmodels (same root → g → armMesh() + it structure as the core) ----------
+function ixBlade(pts,th,mats){const s=new THREE.Shape();s.moveTo(pts[0][0],pts[0][1]);for(let i=1;i<pts.length;i++)s.lineTo(pts[i][0],pts[i][1]);
+  const geo=new THREE.ExtrudeGeometry(s,{depth:th,bevelEnabled:false,steps:1});geo.translate(0,0,-th/2);geo.rotateY(Math.PI/2);return new THREE.Mesh(geo,mats)}
+const IX_BUILD={
+ lead_pipe(g){g.add(ixC(.019,.019,.6,IXM.pipe,0,.2,0,9));g.add(ixC(.0235,.0235,.17,IXM.tape,0,-.005,0,9));g.add(ixC(.0198,.0198,.06,IXM.rust,0,.31,0,9));g.add(ixC(.0265,.0265,.03,IXM.dsteel,0,.475,0,9));
+   const t=ixC(.024,.024,.12,IXM.pipe,0,.52,0,9);t.rotation.z=Math.PI/2;g.add(t);for(const s of[-1,1]){const c=ixC(.028,.028,.02,IXM.dsteel,s*.06,.52,0,9);c.rotation.z=Math.PI/2;g.add(c)}},
+ machete(g){g.add(box(.03,.15,.04,IXM.rubber,0,.01,0));for(const y of[-.03,.04])g.add(box(.034,.008,.008,IXM.nail,0,y,0));g.add(box(.052,.014,.05,IXM.dsteel,0,.09,0));
+   const b=ixBlade([[-.004,0],[.05,0],[.056,.14],[.063,.3],[.054,.39],[.03,.44],[.004,.43],[-.006,.3],[-.008,.12]],.007,[IXM.steel,IXM.edge]);b.position.set(0,.095,.006);b.rotation.x=-.05;g.add(b)},
+ baseball_bat(g){const pts=[[0,-.075],[.026,-.075],[.026,-.06],[.016,-.052],[.016,.08],[.019,.22],[.026,.36],[.033,.5],[.035,.58],[.031,.62],[.02,.635],[0,.637]].map(p=>new THREE.Vector2(p[0],p[1]));
+   g.add(new THREE.Mesh(new THREE.LatheGeometry(pts,12),IXM.bat));g.add(ixC(.0175,.0175,.13,IXM.tape,0,0,0,10));g.add(ixC(.0262,.0262,.012,IXM.red,0,.43,0,12))},
+ fire_axe(g){g.add(ixC(.016,.021,.66,IXM.red,0,.24,0,8));g.add(ixC(.0225,.0225,.14,IXM.rubber,0,-.01,0,8));
+   g.add(ixBlade([[-.022,.46],[.03,.468],[.1,.43],[.122,.5],[.104,.585],[.03,.552],[-.022,.56],[-.03,.52],[-.13,.515],[-.03,.497]],.024,[IXM.red,IXM.steel]));
+   g.add(ixBlade([[.1,.432],[.125,.5],[.106,.584],[.096,.578],[.112,.5],[.09,.44]],.026,[IXM.edge,IXM.edge]))},
+ katana(g){g.add(box(.026,.21,.032,IXM.dark,0,-.005,0));for(let i=0;i<5;i++){const d=box(.029,.016,.034,IXM.wrap,0,-.09+i*.042,0);d.rotation.y=.785;g.add(d)}g.add(ixC(.024,.024,.012,IXM.gold,0,-.115,0,8));
+   g.add(ixC(.046,.046,.01,IXM.gold,0,.11,0,12));g.add(box(.03,.03,.038,IXM.gold,0,.125,0));
+   const b=ixBlade([[.016,0],[.016,.24],[.012,.46],[.004,.6],[-.012,.672],[-.019,.64],[-.016,.46],[-.011,.24],[-.012,0]],.006,[IXM.steel,IXM.edge]);b.position.y=.13;g.add(b)},
+ sledgehammer(g){g.add(ixC(.019,.023,.74,IXM.wood,0,.27,0,8));g.add(ixC(.025,.025,.15,IXM.rubber,0,-.01,0,8));g.add(box(.05,.07,.06,IXM.dsteel,0,.6,0));
+   g.add(box(.08,.085,.25,IXM.dsteel,0,.665,0));for(const s of[-1,1])g.add(box(.088,.093,.016,IXM.steel,0,.665,s*.128))},
+};
+const IX_HEAD={lead_pipe:{y:.36,r:.02},machete:{y:.28,r:.03,blade:1},baseball_bat:{y:.45,r:.032},fire_axe:{y:.38,r:.02},katana:{y:.34,r:.02,blade:1},sledgehammer:{y:.52,r:.022}};
+function ixModVis(it,U,base,mod){const H=IX_HEAD[base],y=H.y,r=H.r;const up=new V3(0,1,0);
+  if(mod==='nail_wrap'){for(let i=0;i<10;i++){const a=i*2.4+R(-.3,.3),yy=y+R(-.09,.09);const n=ixC(.0035,.0035,.065,IXM.nail,0,0,0,4);let dir;
+      if(H.blade){dir=new V3(R(-.5,.5),R(-.2,.3),1).normalize();n.position.set(0,yy,.008)}else{dir=new V3(Math.cos(a),R(-.25,.25),Math.sin(a)).normalize();n.position.set(Math.cos(a)*r,yy,Math.sin(a)*r)}
+      n.quaternion.setFromUnitVectors(up,dir);n.position.addScaledVector(dir,.026);it.add(n)}
+    for(let i=0;i<3;i++){const w=new THREE.Mesh(new THREE.TorusGeometry(r+.006,.0028,4,14),IXM.wire);w.rotation.x=Math.PI/2+R(-.25,.25);w.position.y=y-.06+i*.06;it.add(w)}}
+  else if(mod==='shock_coil'){for(let i=0;i<5;i++){const c=new THREE.Mesh(new THREE.TorusGeometry(r+.01,.0045,5,16),IXM.copper);c.rotation.x=Math.PI/2+.12;c.position.y=y-.1+i*.022;it.add(c)}
+    it.add(box(.034,.06,.028,IXM.batt,r+.024,y-.17,0));it.add(box(.036,.012,.03,IXM.dsteel,r+.024,y-.134,0));const wm=ixC(.003,.003,.08,IXM.copper,r+.012,y-.12,0,4);wm.rotation.z=.25;it.add(wm);
+    const gm=new THREE.MeshBasicMaterial({color:0x9fe6ff});const tip=new THREE.Mesh(new THREE.SphereGeometry(.011,8,6),gm);tip.position.set(0,y+.02,-(r+.012));it.add(tip);U.ixTip=tip;U.ixGlow=gm;
+    const gs=new THREE.Sprite(new THREE.SpriteMaterial({map:ixGlowTex,color:0x7fd8ff,transparent:true,depthWrite:false,blending:THREE.AdditiveBlending,opacity:.6}));gs.scale.set(.07,.07,1);tip.add(gs);U.ixGlowS=gs}
+  else if(mod==='fire_kit'){it.add(box(.04,.065,.026,IXM.can,r+.026,y-.15,0));it.add(ixC(.006,.006,.02,IXM.dsteel,r+.026,y-.11,0,5));const tb=ixC(.003,.003,.12,IXM.rubber,r+.012,y-.08,0,4);tb.rotation.z=.2;it.add(tb);
+    U.ixFlames=[];for(let i=0;i<3;i++){const f=new THREE.Sprite(new THREE.SpriteMaterial({map:fireTex,transparent:true,depthWrite:false,blending:THREE.AdditiveBlending}));f.position.set(0,y-.06+i*.07,H.blade?-.035:-(r+.01));f.userData.s=.07+i*.012;it.add(f);U.ixFlames.push(f)}U.ixTip=U.ixFlames[2]}
+  else if(mod==='toxin_vial'){it.add(ixC(.013,.013,.075,IXM.glass,r+.02,y-.1,0,8));it.add(ixC(.015,.015,.012,IXM.dsteel,r+.02,y-.058,0,8));it.add(ixC(.016,.016,.01,IXM.tape,r+.02,y-.1,0,8));
+    const tp=new THREE.Object3D();tp.position.set(H.blade?0:r*.6,y-.02,H.blade?-.045:0);it.add(tp);U.ixTip=tp;
+    const gs=new THREE.Sprite(new THREE.SpriteMaterial({map:ixGlowTex,color:0x8fff5a,transparent:true,depthWrite:false,blending:THREE.AdditiveBlending,opacity:.35}));gs.scale.set(.06,.06,1);gs.position.set(r+.02,y-.1,0);it.add(gs);U.ixGlowS=gs}}
+function ixThrowModel(ty){const g=new THREE.Group();const tip=new THREE.Object3D();tip.name='tip';
+  if(ty==='molotov'){g.add(ixC(.034,.036,.13,IXM.bottle,0,.065,0,9));g.add(ixC(.03,.031,.08,IXM.liquid,0,.045,0,9));g.add(ixC(.011,.02,.06,IXM.bottle,0,.155,0,7));const rag=box(.028,.05,.026,IXM.rag,0,.2,0);rag.rotation.z=.2;g.add(rag);g.add(box(.05,.02,.02,IXM.rag,.012,.19,.004));tip.position.y=.23}
+  else if(ty==='firecracker'){for(const [x,z] of [[0,0],[.024,0],[-.024,0],[.012,.021],[-.012,.021],[.012,-.021],[-.012,-.021]])g.add(ixC(.011,.011,.09,IXM.redp,x,.045,z,6));g.add(ixC(.04,.04,.025,IXM.paper,0,.05,0,8));const fz=ixC(.003,.003,.06,IXM.fuse,0,.115,0,4);fz.rotation.z=.4;g.add(fz);tip.position.set(-.012,.145,0)}
+  else if(ty==='uv_flare'){g.add(ixC(.017,.017,.2,IXM.flare,0,.1,0,8));g.add(ixC(.019,.019,.03,IXM.cap,0,.21,0,8));g.add(ixC(.019,.019,.02,IXM.dark,0,.005,0,8));tip.position.y=.23}
+  else if(ty==='pipe_bomb'){g.add(ixC(.027,.027,.15,IXM.pipe,0,.075,0,9));g.add(ixC(.033,.033,.026,IXM.dsteel,0,.005,0,9));g.add(ixC(.033,.033,.026,IXM.dsteel,0,.145,0,9));g.add(ixC(.028,.028,.04,IXM.tape,0,.075,0,9));const fz=ixC(.003,.003,.07,IXM.fuse,0,.19,0,4);fz.rotation.z=.3;g.add(fz);tip.position.set(-.01,.225,0)}
+  g.add(tip);return g}
+const IX_TPL={};for(const ty of Object.keys(IX_T))IX_TPL[ty]=ixThrowModel(ty);
+const _ixVmFor=vmFor;vmFor=function(id){if(vmCache[id])return vmCache[id];const it=ITEMS[id];if(!it||!(it.ixW||it.ixThrow||it.ixBp||id==='uv_lamp'))return _ixVmFor(id);
+  const root=new THREE.Group(),g=new THREE.Group();g.position.z=-.25;root.add(g);g.add(armMesh());const iv=new THREE.Group();iv.position.set(0,0,-.06);g.add(iv);const U=root.userData;U.ix=1;
+  if(it.ixW){const b=it.ixBase;IX_BUILD[b](iv);const t=it.ixW.tilt;iv.rotation.set(t[0],t[1],t[2]);if(it.mod)ixModVis(iv,U,b,it.mod)}
+  else if(it.ixThrow){const m=IX_TPL[id].clone();m.position.set(0,-.03,-.02);iv.add(m);iv.rotation.set(-.25,.2,0);U.ixThr=1;U.item=m;
+    if(id==='molotov'){const f=new THREE.Sprite(new THREE.SpriteMaterial({map:fireTex,transparent:true,depthWrite:false,blending:THREE.AdditiveBlending}));f.position.set(0,.235,0);f.scale.set(.06,.09,1);f.visible=false;m.add(f);U.ixMolFlame=f}}
+  else if(it.ixBp){const sc=ixC(.022,.022,.2,IXM.bp,0,.05,-.05,10);sc.rotation.z=Math.PI/2;iv.add(sc);const bd=ixC(.0235,.0235,.02,IXM.white,0,.05,-.05,10);bd.rotation.z=Math.PI/2;iv.add(bd)}
+  else{const lm=depMesh('uv_lamp');lm.scale.setScalar(.13);lm.position.set(0,-.04,-.06);iv.add(lm)}
+  shadowAll(root,false,false);vmCache[id]=root;return root};
+// third-person held items (other players' avatars)
+const _ixHeldMesh=heldMesh;heldMesh=function(id){const it=id&&ITEMS[id];if(!it||!(it.ixW||it.ixThrow))return _ixHeldMesh(id);const g=new THREE.Group();
+  if(it.ixW){const w=new THREE.Group();IX_BUILD[it.ixBase](w);w.rotation.x=-Math.PI/2;g.add(w)}else{const m=IX_TPL[id].clone();m.position.z=-.05;g.add(m)}return shadowAll(g)};
+// UV lamp deployable
+const _ixDepMesh=depMesh;depMesh=function(type){if(type!=='uv_lamp')return _ixDepMesh(type);const g=new THREE.Group();
+  g.add(box(.42,.06,.42,IXM.dsteel,0,.03,0));g.add(ixC(.035,.045,1.25,IXM.dsteel,0,.66,0,8));g.add(box(.2,.06,.2,IXM.dark,0,1.3,0));g.add(box(.2,.06,.2,IXM.dark,0,1.72,0));
+  g.add(ixC(.045,.045,.36,IXB.uvTube,0,1.51,0,10));for(const [x,z] of [[.08,.08],[-.08,.08],[.08,-.08],[-.08,-.08]])g.add(box(.015,.4,.015,IXM.wire,x,1.51,z));
+  g.add(box(.12,.16,.08,IXM.batt,0,.25,.1));const gl=new THREE.Sprite(IXB.lampGlow);gl.scale.set(1.7,1.7,1);gl.position.y=1.51;g.add(gl);return shadowAll(g)};
+
+// ---------- throwing ----------
+function ixThrowUse(id){if(!P.alive||P.cd>0||!has(id))return;const A=IX.aim;if(A&&A.id===id){A.lastT=S.time;return}
+  IX.aim={id,t:0,charge:0,k:0,lastT:S.time};if(id==='molotov')sfx('ixlighter',.5);
+  tip('ix_throw','Throwing','Hold <b>left click</b> to aim — the dotted arc shows where it will land. Hold longer to throw farther, release to throw. <b>R</b> cancels.')}
+function ixThrowCancel(id){const A=IX.aim;if(A&&A.id===id&&A.t>.15){IX.aim=null;sfx('click',.3)}}
+function ixThrowStart(ch){const {o,d}=aimRay();const sp=9+12*ch;const rx=Math.cos(P.yaw),rz=-Math.sin(P.yaw);let dx=d.x,dy=d.y+.18,dz=d.z;const l=Math.hypot(dx,dy,dz)||1;dx/=l;dy/=l;dz/=l;
+  return{x:o.x+d.x*.35+rx*.16,y:o.y+d.y*.35-.1,z:o.z+d.z*.35+rz*.16,vx:dx*sp+(P.vx||0)*.4,vy:dy*sp+Math.max(0,P.vy||0)*.3,vz:dz*sp+(P.vz||0)*.4}}
+function ixThrow(id,ch){if(!has(id)||!P.alive)return;const s=ixThrowStart(ch);take(id,1);ixSpawnThrow(id,s,'player',ixAuth(),true);
+  if(NET.role)netSend({k:'i_thr',ty:id,p:[+s.x.toFixed(2),+s.y.toFixed(2),+s.z.toFixed(2)],v:[+s.vx.toFixed(2),+s.vy.toFixed(2),+s.vz.toFixed(2)]});
+  P.cd=.55;IX.thrAnim=.4;IX.thrHide=has(id)?.45:0;sfx('ixthrow',.6);noise(P.x,P.z,8);ixXP('survivor',1,'throw');
+  const tt={molotov:['Molotov','It bursts into a pool of fire on impact. Anything standing in the flames catches fire — including you.'],firecracker:['Firecracker','The bangs carry far: the infected and hostile players go to check out the noise. Use it to pull a crowd away from you.'],
+    uv_flare:['UV flare','Its ultraviolet glow keeps Night Stalkers out for 12 seconds. Throw it between you and a chase.'],pipe_bomb:['Pipe bomb','It explodes 2.5 s after you throw it and hurts everything within 6 m. Gas canisters nearby go off too.']}[id];
+  if(tt)tip('ix_t_'+id,tt[0],tt[1])}
+function ixSpawnThrow(ty,s,src,auth,mine){const T=IX_T[ty];if(!T)return null;const obj=new THREE.Group();const inner=IX_TPL[ty].clone();inner.rotation.z=Math.PI/2;inner.position.x=.1;obj.add(inner);obj.rotation.order='YXZ';obj.position.set(s.x,s.y,s.z);scene.add(obj);
+  const o={ty,x:s.x,y:s.y,z:s.z,vx:s.vx,vy:s.vy,vz:s.vz,r:T.r,rf:ty==='firecracker'?4:2.2,obj,tip:inner.getObjectByName('tip'),t:0,st:'fly',src,auth,mine,sx:R(6,12)*(Math.random()<.5?-1:1),sz:R(3,8),ground:false,wet:false,fl:null,gl:null,snd:0,popT:.1,nzT:0,lit:ty==='uv_flare'};
+  if(ty==='molotov')o.fl=ixFlGet();if(ty==='uv_flare'){o.gl=ixGlGet();sfx('ixignite',.7,o)}if(ty==='pipe_bomb'||ty==='firecracker')sfx('ixfuse',.5,o);IX.thr.push(o);return o}
+function ixRemoveThr(o){scene.remove(o.obj);ixFlPut(o.fl);ixGlPut(o.gl);o.fl=o.gl=null;o.dead=true}
+// collision step shared by live throwables and the preview: terrain (with slope normal), building/map boxes, solid entities, water
+function ixStep(o,h,C,B){const inW=o.y<0&&groundH(o.x,o.z)<0;
+  if(inW){o.vy-=IX_G*.12*h;const f=Math.exp(-h*3);o.vx*=f;o.vy*=f;o.vz*=f}else o.vy-=IX_G*h;
+  o.x+=o.vx*h;o.y+=o.vy*h;o.z+=o.vz*h;o.ground=false;let hit=null;const r=o.r;
+  for(const e of C){if(!e.solid)continue;const ey=e.y||0,top=ey+(e.t==='tree'?7:(e.ph||1.5));if(o.y>top+r||o.y<ey-1)continue;const er=(e.t==='tree'?(e.r||.35)+.05:(e.r||.5)*.92)+r;const dx=o.x-e.x,dz=o.z-e.z,d=Math.hypot(dx,dz);if(d>=er||d<1e-5)continue;
+    if(o.vy<0&&o.y>top-.25&&e.t!=='tree'){o.y=top+r;const vn=-o.vy;o.vy=vn*IX_BNC;o.ground=true;ixFric(o,h,vn);hit={k:'top',vn};continue}
+    const nx=dx/d,nz=dz/d;o.x=e.x+nx*er;o.z=e.z+nz*er;const vn=-(o.vx*nx+o.vz*nz);if(vn>0){o.vx+=(1+IX_BNC)*vn*nx;o.vz+=(1+IX_BNC)*vn*nz}hit={k:'ent',e,vn:Math.max(0,vn)}}
+  for(const b of B){if(o.x<b.minx-r||o.x>b.maxx+r||o.z<b.minz-r||o.z>b.maxz+r||o.y<b.miny-r||o.y>b.maxy+r)continue;
+    const p0=o.x-(b.minx-r),p1=(b.maxx+r)-o.x,p2=o.y-(b.miny-r),p3=(b.maxy+r)-o.y,p4=o.z-(b.minz-r),p5=(b.maxz+r)-o.z;let m=p0,ax=0,sg=-1;
+    if(p1<m){m=p1;ax=0;sg=1}if(p2<m){m=p2;ax=1;sg=-1}if(p3<m){m=p3;ax=1;sg=1}if(p4<m){m=p4;ax=2;sg=-1}if(p5<m){m=p5;ax=2;sg=1}
+    let vn;if(ax===0){o.x+=sg*m;vn=-o.vx*sg;if(vn>0)o.vx+=(1+IX_BNC)*vn*sg}else if(ax===1){o.y+=sg*m;vn=-o.vy*sg;if(vn>0)o.vy+=(1+IX_BNC)*vn*sg;if(sg>0)o.ground=true}else{o.z+=sg*m;vn=-o.vz*sg;if(vn>0)o.vz+=(1+IX_BNC)*vn*sg}
+    vn=Math.max(0,vn);if(o.ground)ixFric(o,h,vn);hit={k:'box',vn}}
+  const gh=groundH(o.x,o.z);if(o.y-r<gh){const e=.35;let nx=groundH(o.x-e,o.z)-groundH(o.x+e,o.z),ny=2*e,nz=groundH(o.x,o.z-e)-groundH(o.x,o.z+e);const nl=Math.hypot(nx,ny,nz)||1;nx/=nl;ny/=nl;nz/=nl;
+    o.y=gh+r;const vn=Math.max(0,-(o.vx*nx+o.vy*ny+o.vz*nz));if(vn>0){o.vx+=(1+IX_BNC)*vn*nx;o.vy+=(1+IX_BNC)*vn*ny;o.vz+=(1+IX_BNC)*vn*nz}o.ground=true;ixFric(o,h,vn);hit={k:'ground',vn}}
+  if(inW&&!hit)hit={k:'water',vn:0};return hit}
+function ixFric(o,h,vn){const f=vn>2?.72:Math.exp(-h*(o.rf||2.2));o.vx*=f;o.vz*=f}
+function ixHitCreature(o){for(const t of ixFoesNear(o.x,o.z,1.2)){if(dist2(t.x,t.z,o.x,o.z)<.55&&o.y>t.y-.1&&o.y<t.y+(t.t==='npc'||t.t==='z'?1.9:1.2))return t}return null}
+function ixThrTick(o,dt){o.t+=dt;const ty=o.ty;
+  if(o.st!=='rest'){const sp=Math.hypot(o.vx,o.vy,o.vz);const sub=Math.min(5,Math.max(1,Math.ceil(sp*dt/.12)));const h=dt/sub;const C=nearEnts(o.x,o.z,5),B=nearBoxes(o.x,o.z,5);
+    for(let i=0;i<sub;i++){const hit=ixStep(o,h,C,B);if(!hit)continue;
+      if(hit.k==='water'){if(!o.wet){o.wet=true;burst({x:o.x,y:.05,z:o.z},['#cfe6f0','#9fc6d8'],10,1.5,2.5,9,.6);sfx('splash',.5,o);if(ty==='molotov'||ty==='firecracker'){ixFizzle(o);return false}}}
+      else{if(ty==='molotov'){ixMolotov(o,null);return false}if(hit.vn>1.5){sfx('ixclink',Math.min(.6,hit.vn*.08),o);ixPuff(o.x,o.y,o.z,'#8a7a62',.18,.6,.3,.25,2)}}}
+    if(ty==='molotov'&&o.t>.05){const c=ixHitCreature(o);if(c){ixMolotov(o,c);return false}if(o.t>8){ixMolotov(o,null);return false}}
+    const hs=Math.hypot(o.vx,o.vz);if(o.ground){o.obj.rotation.z=lerp(o.obj.rotation.z,0,Math.min(1,dt*12));if(hs>.3)o.obj.rotation.y=Math.atan2(o.vx,o.vz);o.obj.rotation.x+=hs/Math.max(.02,o.r)*dt*.5;
+      if(Math.abs(o.vy)<.6&&hs<.12){o.st='rest';o.vx=o.vy=o.vz=0}}else{o.obj.rotation.x+=o.sx*dt;o.obj.rotation.z+=o.sz*dt}
+    o.obj.position.set(o.x,o.y,o.z)}
+  if(ty==='pipe_bomb'){o.snd-=dt;if(o.snd<=0){o.snd=.3;sfx('ixfuse',.35,o)}if(o.t>=2.5){explode({x:o.x,y:o.y+.1,z:o.z},6,120,o.src,{net:false,auth:o.auth,wname:'Pipe Bomb'});ixRemoveThr(o);return false}}
+  else if(ty==='firecracker'){if(o.t>=.8&&o.t<8.8){o.popT-=dt;if(o.popT<=0){o.popT=R(.06,.28);sfx('ixpop',R(.45,.85),o);ixSparks(o.x,o.y+.1,o.z,pick(['#ffd34a','#ff6a3a','#fff2b0','#7fd8ff']),8,3,2.5,6,.35);ixPuff(o.x,o.y+.1,o.z,'#bdb6aa',.25,.9,.5,.3,2.4);
+        if(Math.random()<.35&&o.st==='rest'&&!o.wet){o.vy=R(1.2,2.6);o.vx+=R(-1,1);o.vz+=R(-1,1);o.st='fly'}}
+      if(o.auth){o.nzT-=dt;if(o.nzT<=0){o.nzT=.5;noise(o.x,o.z,60)}}}
+    else if(o.t<.8){o.snd-=dt;if(o.snd<=0){o.snd=.3;sfx('ixfuse',.3,o)}}
+    if(o.t>=8.8){ixPuff(o.x,o.y+.1,o.z,'#9a958c',.4,1.6,.6,.4,2.2);ixRemoveThr(o);return false}}
+  else if(ty==='uv_flare'){o.snd-=dt;if(o.snd<=0){o.snd=.55;sfx('ixsizzle',.16,o)}if(o.t>=12){o.lit=false;ixPuff(o.x,o.y+.1,o.z,'#b9a8d8',.3,1.4,.5,.35,2);ixRemoveThr(o);return false}}
+  return true}
+function ixFizzle(o){ixPuff(o.x,Math.max(o.y,.05)+.1,o.z,'#e0e6ea',.4,1.4,1.1,.45,2.2);sfx('ixsizzle',.6,o);ixRemoveThr(o)}
+function ixMolotov(o,hitC){const x=o.x,z=o.z;const y=hitC?Math.max(groundH(x,z),hitC.y):supportH(x,z,o.y+.3);ixRemoveThr(o);
+  if(groundH(x,z)<0&&y<.05){ixFizzle(o);return}const p={x,y,z};
+  sfx('ixglass',1,p);sfx('ixwhoosh',.9,p);debris({x,y:y+.25,z},'#4f7a3a',5,.05,'box');ixSparks(x,y+.3,z,'#ffb050',26,4,3,6,.8);
+  for(let i=0;i<4;i++)ixPuff(x+R(-1,1),y+.4,z+R(-1,1),'#ff8a30',1.2,.5,1.5,.35,2.2);
+  if(o.auth&&hitC)applyStatus(hitC,'burn',6,o.src);ixFire(x,y,z,4,8,o.auth,o.src)}
+// ---------- fire areas ----------
+function ixFire(x,y,z,r,life,auth,src){const f={x,y,z,r,life,t:0,auth,src,acc:0,pAcc:0,snd:0,smk:0,fl:[]};
+  for(let i=0;i<(ixLow()?7:11);i++){const a=R(0,6.28),rr=i===0?0:Math.sqrt(R(.05,1))*r*.85;const px=x+Math.cos(a)*rr,pz=z+Math.sin(a)*rr;if(groundH(px,pz)<0)continue;const fl=ixFlGet();if(!fl)break;
+    f.fl.push({f:fl,x:px,y:supportH(px,pz,y+.6),z:pz,s:R(.8,1.5)*(i===0?1.3:1),ph:R(0,6.28)})}
+  IX.fires.push(f);if(auth)noise(x,z,30);return f}
+function ixFireEnd(f){for(const q of f.fl)ixFlPut(q.f);f.fl.length=0;if(typeof decal==='function'){try{decal(new V3(f.x,f.y+.03,f.z),'scorch',f.r*.8)}catch(e){console.error('decal',e)}}}
+function ixFireTick(f,dt){f.t+=dt;if(f.t>=f.life){ixFireEnd(f);return false}f.acc+=dt;f.pAcc+=dt;f.snd-=dt;
+  if(f.snd<=0){f.snd=R(.18,.35);sfx('ixfire',.55,f)}
+  if(f.acc>=.5){f.acc-=.5;if(f.auth)for(const t of ixFoesNear(f.x,f.z,f.r)){if(Math.abs(t.y-f.y)>2.2||t.dead)continue;damageAny(t,6,f.src||'player',{wname:'Molotov',dot:true,status:'Fire'});applyStatus(t,'burn',3,f.src||'player')}}
+  if(f.pAcc>=.5){f.pAcc-=.5;if(P&&P.alive&&dist2(P.x,P.z,f.x,f.z)<f.r*.95&&Math.abs(P.y-f.y)<1.6&&P.y>-.3){hurt(3,'burn',f.x,f.z);if(!P.alive){$('#dCause').textContent='Burned to death';return true}applyStatus(P,'burn',2.5)}}
+  return true}
+
+// ---------- explosions ----------
+function explode(pos,radius,dmg,src,opts){opts=opts||{};if(!pos||!S)return;radius=radius>0?radius:6;dmg=dmg>0?dmg:100;
+  const x=+pos.x||0,y=+pos.y||0,z=+pos.z||0;const remote=!!opts.remote;const auth=remote?false:opts.auth!==undefined?!!opts.auth:true;const wname=opts.wname||'Explosion';
+  ixBoomFx(x,y,z,radius);sfx('ixboom',Math.min(1.6,.6+radius/8),{x,y,z});
+  if(P&&P.alive){const dx=P.x-x,dz=P.z-z,dy=(P.y+1)-y,d=Math.hypot(dx,dy,dz);P.camShake=Math.max(P.camShake||0,clamp(1.25-d/(radius*4.5),0,1.2));
+    if(d<radius*3)tip('ix_boom','Explosions','Explosions hurt everything nearby, knock you back and can be heard from far away. Walls and rocks between you and the blast soak up most of it.');
+    if(d<radius){const k=1-d/radius;let dd=dmg*(.12+.88*k*k);if(!los(x,y+.4,z,P.x,P.y+1.2,P.z))dd*=.35;const hl=Math.hypot(dx,dz)||1;knockback(P,dx/hl,dz/hl,6*k+2);P.vy=Math.max(P.vy||0,3.5*k);P.onGround=false;IX.flashT=0;
+      hurt(dd,'explosion',x,z);if(!P.alive)$('#dCause').textContent=wname==='Explosion'?'Blown up':'Blown up ('+wname+')';else applyStatus(P,'burn',k>.5?1.5:0)}}
+  if(auth){for(const t of ixFoesNear(x,z,radius+.5)){if(t.dead)continue;const dx=t.x-x,dz=t.z-z,d=Math.hypot(dx,dz,(t.y+.9)-y);if(d>radius)continue;const k=1-d/radius;
+      damageAny(t,Math.round(dmg*(.12+.88*k*k)),src||'player',{wname,explosion:true});if(!t.dead){const hl=Math.hypot(dx,dz)||1;ixKnock(t,dx/hl,dz/hl,10*k+3);if(k>.45)applyStatus(t,'burn',2.5,src||'player')}}
+    noise(x,z,120);
+    if(ENT_HIT.gascan)for(const e of nearEnts(x,z,radius*1.2)){if(e.t!=='gascan')continue;const d=Math.hypot(e.x-x,e.z-z);if(d>radius*1.15||(e._ixBoomT!==undefined&&S.time-e._ixBoomT<1.5))continue;e._ixBoomT=S.time;
+      IX.timers.push({t:.12+d*.05,fn:()=>{if(ents.includes(e)&&ENT_HIT.gascan)ENT_HIT.gascan(e,999,src||'player',new V3(e.x,(e.y||0)+.5,e.z),{explosion:true})}})}}
+  if(!remote&&opts.net!==false&&NET.role)netSend({k:'i_boom',p:[+x.toFixed(2),+y.toFixed(2),+z.toFixed(2)],r:radius,d:dmg})}
+function ixBoomFx(x,y,z,R0){const low=ixLow(),gy=groundH(x,z),wet=gy<0&&y<.6;IX.bmT=0;IX.boomP.x=x;IX.boomP.y=y;IX.boomP.z=z;IX.boomR=R0;
+  ixBoomL.position.set(x,y+1.2,z);ixBoomL.intensity=10*Math.min(1.4,R0/6);ixFlash.position.set(x,y+.8,z);ixFlash.visible=true;ixFlash.scale.set(R0*2.4,R0*2.4,1);ixFlash.material.opacity=1;
+  for(let i=0;i<(low?3:ixFb.length);i++){const b=ixFb[i];b.s.visible=true;b.s.position.set(x+R(-.5,.5)*R0*.15,y+R(.2,.9),z+R(-.5,.5)*R0*.15);b.l=b.ml=R(.45,.75);b.s0=R0*R(.2,.3);b.s1=R0*R(.75,1.05);b.vy=R(1,2.8);b.m.rotation=R(0,6.28);b.m.color.setRGB(1,R(.45,.7),R(.15,.3))}
+  for(const q of ixRings){if(q.l>0)continue;q.l=q.ml;q.R=R0*1.9;q.r.position.set(x,gy+.15,z);q.r.visible=!wet;break}
+  ixSparks(x,y+.5,z,'#ffb347',low?20:40,9,6,12,1.1,.09);ixSparks(x,y+.5,z,'#fff0c0',low?6:14,6,4,9,.5,.07);
+  for(let i=0;i<(low?6:12);i++)ixPuff(x+R(-1,1)*R0*.2,y+R(.3,1.5),z+R(-1,1)*R0*.2,'#3b3632',R0*R(.25,.4),R(2.5,4.5),R(1.2,2.8),.55,2.6,R(-1,1),R(-1,1));
+  for(let i=0;i<10;i++){const a=i/10*6.283;ixPuff(x+Math.cos(a)*R0*.3,gy+.3,z+Math.sin(a)*R0*.3,'#7a6a52',R0*.2,R(1.2,2),.3,.45,2.5,Math.cos(a)*R(3,6),Math.sin(a)*R(3,6))}
+  debris({x,y:y+.3,z},'#4a4038',low?4:8,.14,'rock');debris({x,y:y+.3,z},'#6b5a3e',low?2:4,.1,'box');
+  if(wet){burst({x,y:.1,z},['#cfe6f0','#9fc6d8','#ffffff'],40,4,8,9,1.2);sfx('splash',1.2,{x,z})}
+  else if(typeof decal==='function'){try{decal(new V3(x,gy+.05,z),'scorch',R0*.75)}catch(e){console.error('decal',e)}}}
+
+// ---------- UV light ----------
+function ixLampList(){if(S.time-IX.lampT<1&&IX.lampT<=S.time)return;IX.lampT=S.time;const L=IX.lamps;L.length=0;for(const d of deps)if(d.type==='uv_lamp')L.push({x:d.x,y:d.y,z:d.z});
+  for(const [o,b] of Object.entries(NET.builds||{})){if(o===NET.myId||!b||!Array.isArray(b.deps))continue;for(const d of b.deps)if(d.type==='uv_lamp')L.push({x:d.x,y:d.y,z:d.z})}}
+function uvSources(){if(!S)return[];if(IX.uvT===S.time)return IX.uvCache;IX.uvT=S.time;const out=IX.uvCache;out.length=0;
+  if(IX.uv.on&&P&&P.alive)out.push({x:IX.uvPos.x,y:IX.uvPos.y,z:IX.uvPos.z,dx:IX.uvDir.x,dy:IX.uvDir.y,dz:IX.uvDir.z,range:24,cos:.92,own:'local'});
+  for(const o of IX.thr)if(o.ty==='uv_flare'&&o.lit)out.push({x:o.x,y:o.y+.2,z:o.z,dx:0,dy:0,dz:0,range:9,cos:0});
+  ixLampList();for(const l of IX.lamps)out.push({x:l.x,y:l.y+1.5,z:l.z,dx:0,dy:0,dz:0,range:14,cos:0});
+  for(const [id,u] of Object.entries(IX.uvR))if(u.on&&S.time-u.t<1.5&&Array.isArray(u.p)&&Array.isArray(u.d))out.push({x:+u.p[0],y:+u.p[1],z:+u.p[2],dx:+u.d[0],dy:+u.d[1],dz:+u.d[2],range:24,cos:.92,own:id});
+  return out}
+function ixUvToggle(){const U=IX.uv;if(!U.on){if(!has('uv_flashlight')){if(!IX.uvNag){IX.uvNag=1;feedMsg('You need a UV Flashlight (craft it: battery, metal pipe, chemicals)')}return}
+    if(U.bat<5){sfx('click',.4);feedMsg('UV battery empty — it recharges while switched off');return}U.on=true;sfx('ixuvon',.6);tip('ix_uvon','UV light on','The beam drains the battery fast (gauge next to the hotbar). Switch it off to recharge. At night the light also shows hostile players where you are.')}
+  else{U.on=false;sfx('ixuvoff',.5)}ixUvSend()}
+function ixUvSend(){if(!NET.role)return;const U=IX.uv;netSend(U.on?{k:'i_uv',on:1,p:[+IX.uvPos.x.toFixed(2),+IX.uvPos.y.toFixed(2),+IX.uvPos.z.toFixed(2)],d:[+IX.uvDir.x.toFixed(3),+IX.uvDir.y.toFixed(3),+IX.uvDir.z.toFixed(3)]}:{k:'i_uv',on:0});U.sendT=.2}
+function ixUvTick(dt){const U=IX.uv;if(keyPressed('v'))ixUvToggle();if(U.on&&!has('uv_flashlight')){U.on=false;ixUvSend()}
+  if(U.on){U.bat-=8*dt;if(U.bat<=0){U.bat=0;U.on=false;sfx('ixuvoff',.5);ixUvSend();tip('ix_uvempty','Battery empty','The UV flashlight has to recharge. It refills on its own while it is switched off.',true)}}
+  else U.bat=Math.min(100,U.bat+3*dt);
+  if(U.on&&NET.role){U.sendT-=dt;if(U.sendT<=0)ixUvSend()}}
+
+// ---------- sounds (synth) ----------
+const IX_REV={ixboom:1.1,ixglass:.25,ixwhoosh:.2,ixpop:.35,ixzap:.15,ixbreak:.1,ixsizzle:.05,ixignite:.15,ixclink:.05,ixheavy:.1,ixlearn:.1};
+const IX_SFX={
+ ixboom(t,d){nz(t,.18,'highpass',900,.7,1,.002,.16,d);tn(t,'sine',95,26,1.2,.004,1.3,d);tn(t,'triangle',180,40,.6,.003,.45,d);nz(t,1.8,'lowpass',520,.7,1,.006,1.7,d,70);nz(t+.08,2.6,'lowpass',260,.7,.55,.25,2.2,d);for(let i=0;i<6;i++)nz(t+.15+Math.random()*.9,.05,'highpass',2500,.7,.12,.002,.05,d)},
+ ixglass(t,d){nz(t,.09,'highpass',4200,.7,.7,.001,.08,d);for(let i=0;i<7;i++)tn(t+Math.random()*.12,'triangle',R(2600,6200),R(2200,5200),.12,.001,R(.06,.22),d);nz(t+.02,.35,'bandpass',3000,1.2,.25,.01,.3,d)},
+ ixwhoosh(t,d){nz(t,.7,'lowpass',260,.7,.7,.06,.6,d,2200);nz(t+.05,.5,'bandpass',800,.7,.35,.05,.4,d);tn(t,'sine',70,110,.3,.08,.4,d)},
+ ixfire(t,d){for(let i=0;i<3;i++)nz(t+Math.random()*.18,.025,'highpass',R(1500,3600),.7,R(.15,.45),.001,.02,d);nz(t,.3,'lowpass',420,.7,.12,.06,.22,d)},
+ ixfuse(t,d){nz(t,.32,'highpass',4800,.7,.22,.01,.3,d);nz(t,.32,'bandpass',2600,3,.1,.01,.3,d)},
+ ixzap(t,d){tn(t,'sawtooth',1400,160,.32,.001,.14,bp(d,2400,1.2));nz(t,.12,'highpass',3500,.7,.55,.001,.1,d);tn(t+.02,'square',820,240,.18,.001,.1,d);for(let i=0;i<5;i++)nz(t+i*.025,.015,'highpass',6500,.7,.35,.001,.012,d)},
+ ixsizzle(t,d){nz(t,.45,'highpass',3200,.7,.25,.02,.4,d,6500)},
+ ixpop(t,d){nz(t,.06,'highpass',1300,.7,1,.001,.05,d);tn(t,'square',R(260,520),70,.35,.001,.05,d);nz(t,.18,'lowpass',900,.7,.25,.002,.15,d)},
+ ixignite(t,d){nz(t,.35,'bandpass',1800,1,.5,.01,.3,d,4800);tn(t,'sine',260,820,.12,.01,.25,d)},
+ ixclink(t,d){tn(t,'triangle',R(1300,2100),R(900,1500),.18,.001,.12,d);nz(t,.03,'highpass',3200,.7,.18,.001,.025,d)},
+ ixtape(t,d){nz(t,.32,'bandpass',2100,3,.45,.01,.3,d,1300);nz(t+.36,.24,'bandpass',2500,3,.4,.01,.22,d,1500);tn(t+.66,'sine',620,620,.18,.004,.1,d)},
+ ixbreak(t,d){tn(t,'square',230,80,.3,.002,.2,bp(d,900,2));nz(t,.22,'highpass',1800,.7,.55,.002,.2,d);tn(t+.04,'triangle',1900,500,.25,.001,.16,d)},
+ ixheavy(t,d){nz(t,.42,'bandpass',300,1.1,.8,.1,.3,d,1700);tn(t,'sine',85,55,.35,.06,.25,d)},
+ ixcharge(t,d){tn(t,'triangle',520,880,.18,.004,.12,d);tn(t+.07,'sine',1320,1320,.08,.003,.1,d)},
+ ixuvon(t,d){tn(t,'square',2500,2400,.12,.001,.02,d);tn(t+.01,'sine',180,180,.06,.04,.35,d)},
+ ixuvoff(t,d){tn(t,'square',1900,1800,.1,.001,.02,d)},
+ ixlearn(t,d){tn(t,'sine',523,523,.22,.005,.12,d);tn(t+.09,'sine',784,784,.22,.005,.12,d);tn(t+.18,'sine',1046,1046,.22,.005,.3,d)},
+ ixthrow(t,d){nz(t,.26,'bandpass',700,1,.55,.04,.2,d,2600)},
+ ixlighter(t,d){tn(t,'square',3100,2900,.1,.001,.02,d);nz(t+.03,.18,'bandpass',2400,1.4,.22,.005,.16,d)},
+};
+const _ixSfx=sfx;sfx=function(type,vol=1,pos){const f=IX_SFX[type];if(!f)return _ixSfx(type,vol,pos);if(muted||!ac())return;if(AC.state==='suspended')AC.resume();const t=AC.currentTime+.005;f(t,bus(pos,vol,IX_REV[type]||0))};
+
+// ---------- HUD ----------
+{const st=document.createElement('style');st.textContent=`
+#ixUv{position:absolute;left:calc(50% + 216px);bottom:16px;width:30px;height:66px;background:rgba(30,30,27,.72);display:flex;flex-direction:column;align-items:center;justify-content:flex-end;gap:3px;padding:0 0 4px;border:1px solid transparent}
+#ixUv .ixbat{position:relative;width:12px;height:34px;border:2px solid #b9a8e8;border-radius:2px}
+#ixUv .ixbat:before{content:'';position:absolute;left:2px;right:2px;top:-5px;height:3px;background:#b9a8e8}
+#ixUv .ixbat i{position:absolute;left:1px;right:1px;bottom:1px;background:#a865ff}
+#ixUv span{font-size:10px;font-weight:700;color:#cdb8ff;letter-spacing:.08em;line-height:1}
+#ixUv kbd{font-family:inherit;font-size:9px;background:#e3dccf;color:#111;padding:0 3px;line-height:1.3}
+#ixUv.on{border-color:rgba(168,101,255,.8);box-shadow:0 0 12px rgba(168,101,255,.55)}#ixUv.low .ixbat i{background:#e0624d}
+#ixChg{position:absolute;left:50%;top:50%;width:46px;height:4px;margin:16px 0 0 -23px;background:rgba(0,0,0,.45);opacity:0;transition:opacity .12s}
+#ixChg i{display:block;height:100%;width:0;background:#e8d8b0}#ixChg.rdy i{background:#ffb347;box-shadow:0 0 8px #ffb347}
+#ixFx{position:fixed;inset:0;pointer-events:none;opacity:0;background:radial-gradient(ellipse at center,rgba(0,0,0,0) 45%,rgba(255,110,20,.55) 100%)}
+#ixFl{position:fixed;inset:0;pointer-events:none;opacity:0;background:radial-gradient(ellipse at center,rgba(255,236,200,.9),rgba(255,170,90,.35) 70%)}
+.hslot .ixdur{position:absolute;left:5px;right:5px;bottom:2px;height:3px;background:rgba(0,0,0,.55)}.hslot .ixdur b{display:block;height:100%}.hslot .ixdur.brk{background:#7a2a20}
+.slot .ixdur2{position:absolute;left:5px;right:30px;bottom:6px;height:3px;background:rgba(0,0,0,.5)}.slot .ixdur2 b{display:block;height:100%}
+.ixcopy{display:flex;align-items:center;gap:8px;font-size:13px;margin:3px 0}.ixcopy .ixcb{width:90px;height:6px;background:rgba(0,0,0,.45);flex:none}.ixcopy .ixcb b{display:block;height:100%}`;document.head.appendChild(st);
+ $('#hud').insertAdjacentHTML('afterbegin','<div id="ixFx"></div><div id="ixFl"></div>');$('#hud').insertAdjacentHTML('beforeend','<div id="ixUv" class="hidden" title="UV flashlight battery"><div class="ixbat"><i></i></div><span>UV</span><kbd>V</kbd></div><div id="ixChg"><i></i></div>')}
+function ixHud(){if(!P||!S)return;const H=IX.hud;if(!H.uv){H.uv=$('#ixUv');H.bat=$('#ixUv .ixbat i');H.chg=$('#ixChg');H.chgI=$('#ixChg i');H.fx=$('#ixFx');H.fl=$('#ixFl')}
+  const own=has('uv_flashlight')||IX.uv.on;const cls=own?('ix'+(IX.uv.on?' on':'')+(IX.uv.bat<20?' low':'')):'hidden';if(H.cls!==cls){H.cls=cls;H.uv.className=cls==='hidden'?'hidden':cls.slice(3)}
+  if(own){const b=Math.round(IX.uv.bat);if(H.b!==b){H.b=b;H.bat.style.height='calc('+b+'% - 2px)'}}
+  const C=IX.chg&&IX.chg.id===P.hot[P.sel]?IX.chg:null;const cs=C?(C.ready?'rdy':'c')+Math.round(Math.min(1,C.t/.6)*20):'';
+  if(H.cs!==cs){H.cs=cs;H.chg.style.opacity=C?1:0;H.chg.className=C&&C.ready?'rdy':'';if(C)H.chgI.style.width=Math.round(Math.min(1,C.t/.6)*100)+'%'}
+  if(C){const fc=freeCursor()&&S.active&&mouseX>=0;const l=fc?mouseX+'px':'50%',tp=fc?mouseY+'px':'50%';if(H.cl!==l+tp){H.cl=l+tp;H.chg.style.left=l;H.chg.style.top=tp}}
+  const bn=P.ixSt&&P.ixSt.burn>0&&P.alive?(.35+.15*Math.sin(IX.ft*9)).toFixed(2):'0';if(H.bn!==bn){H.bn=bn;H.fx.style.opacity=bn}
+  const fo=IX.flashT<.35?(.55*(1-IX.flashT/.35)).toFixed(2):'0';if(H.fo!==fo){H.fo=fo;H.fl.style.opacity=fo}}
+
+// ---------- per-frame visuals (render hook) ----------
+function ixVmTick(dt){const r=vmCur;if(!r||!r.userData.ix)return;const U=r.userData,id=vmId,it=ITEMS[id];if(!it)return;const T=IX.vt;let px=0,py=0,pz=0,rx=0,ry=0,rz=0;
+  const C=IX.chg;if(C&&C.id===id){const k=smooth(0,1,C.t/.6);rx+=.55*k;rz+=.28*k;py+=.035*k;pz+=.09*k;px+=.02*k;if(C.ready){px+=R(-.003,.003);py+=R(-.003,.003)}}
+  const A=P.anim;if(A&&A.type==='swing'&&A.ixW===id&&it.ixW){const t=Math.min(1,A.t),s=t>.3&&t<.62?Math.sin((t-.3)/.32*Math.PI):0,w=it.ixW;
+    if(w.style==='slam'){rx-=.4*s;py-=.04*s}else if(it.ixBase==='katana'){ry-=.45*s;rz-=.3*s}else if(it.ixBase==='machete'){ry-=.2*s}if(A.ixHeavy){rx-=.35*s;pz-=.07*s;rz-=.15*s}if(A.ixWeak)rx+=.25*s}
+  if(U.ixThr){const a=IX.aim&&IX.aim.id===id?IX.aim.k*(.6+.4*IX.aim.charge):0;rx+=.8*a;py+=.06*a;pz+=.14*a;rz-=.3*a;px+=.04*a;
+    if(IX.thrAnim>0){const t=1-IX.thrAnim/.4,f=t<.35?Math.sin(t/.35*Math.PI/2):1-(t-.35)/.65;rx-=1.3*f;pz-=.18*f;py+=.02*f}
+    if(U.item)U.item.visible=!(IX.thrHide>0);if(U.ixMolFlame){const on=!!(IX.aim&&IX.aim.id===id);U.ixMolFlame.visible=on;if(on){const s=.05+Math.random()*.02+Math.sin(IX.ft*21)*.008;U.ixMolFlame.scale.set(s,s*1.5,1)}}}
+  const k=Math.min(1,dt*16);T.px=lerp(T.px,px,k);T.py=lerp(T.py,py,k);T.pz=lerp(T.pz,pz,k);T.rx=lerp(T.rx,rx,k);T.ry=lerp(T.ry,ry,k);T.rz=lerp(T.rz,rz,k);r.position.set(T.px,T.py,T.pz);r.rotation.set(T.rx,T.ry,T.rz);
+  if(U.ixFlames)U.ixFlames.forEach((f,i)=>{const s=f.userData.s*(.85+.25*Math.sin(IX.ft*(17+i*5)+i)+Math.random()*.08);f.scale.set(s,s*1.5,1)});
+  if(it.mod&&U.ixTip){IX.vmFxT-=dt;if(IX.vmFxT<=0){const tp=U.ixTip.getWorldPosition(IX.v1);
+    if(it.mod==='shock_coil'){IX.vmFxT=R(.12,.7);ixSparks(tp.x,tp.y,tp.z,'#aee9ff',RI(2,5),.8,.4,2,.18,.012);if(Math.random()<.2)sfx('ixzap',.05)}
+    else if(it.mod==='toxin_vial'){IX.vmFxT=R(.35,.8);ixSparks(tp.x,tp.y,tp.z,'#8fff5a',1,.03,0,6,.9,.01)}
+    else if(it.mod==='fire_kit'){IX.vmFxT=R(.08,.25);ixSparks(tp.x,tp.y+.03,tp.z,'#ffb050',1,.15,.5,-1,.6,.012)}else IX.vmFxT=9}}
+  if(U.ixGlow){const f=(.55+.45*Math.abs(Math.sin(IX.ft*23)))*(Math.random()<.9?1:.25);U.ixGlow.color.setRGB(.55*f+.2,.8*f+.12,f)}
+  if(U.ixGlowS)U.ixGlowS.material.opacity=.35+.3*Math.abs(Math.sin(IX.ft*(it.mod==='shock_coil'?19:3)))}
+function ixAimPreview(){const A=IX.aim;const id=P.alive&&S.active?P.hot[P.sel]:null;
+  if(!A||A.id!==id){ixTrLine.visible=false;
+    if(id==='uv_lamp'&&S.dplan&&S.dplan.point){const p=S.dplan.point;ixTrRing.visible=true;ixTrRing.position.set(p.x,p.y+.08,p.z);ixTrRing.scale.set(14,1,14);ixTrRing.material.color.setHex(S.dplan.ok?0xb478ff:0xff5a4a);ixTrRing.material.opacity=.4}else ixTrRing.visible=false;return}
+  const s=ixThrowStart(A.charge);const o={x:s.x,y:s.y,z:s.z,vx:s.vx,vy:s.vy,vz:s.vz,r:IX_T[id].r,rf:2};const h=1/30;
+  let x0=o.x,x1=o.x,z0=o.z,z1=o.z;{let x=o.x,y=o.y,z=o.z,vy=o.vy;for(let i=0;i<IX_TRN;i++){vy-=IX_G*h;x+=o.vx*h;y+=vy*h;z+=o.vz*h;x0=Math.min(x0,x);x1=Math.max(x1,x);z0=Math.min(z0,z);z1=Math.max(z1,z);if(y<groundH(x,z)-3)break}}
+  x0-=3;x1+=3;z0-=3;z1+=3;const C=ents.filter(e=>e.solid&&e.x>x0&&e.x<x1&&e.z>z0&&e.z<z1),B=boxes.filter(b=>b.maxx>x0&&b.minx<x1&&b.maxz>z0&&b.minz<z1);
+  let n=0,dist=0,px=o.x,py=o.y,pz=o.z,hit=null;ixTrPos[0]=o.x;ixTrPos[1]=o.y;ixTrPos[2]=o.z;ixTrDist[0]=0;n=1;
+  for(let i=1;i<IX_TRN&&!hit;i++){for(let k=0;k<2&&!hit;k++)hit=ixStep(o,h/2,C,B);dist+=Math.hypot(o.x-px,o.y-py,o.z-pz);px=o.x;py=o.y;pz=o.z;ixTrPos[n*3]=o.x;ixTrPos[n*3+1]=o.y;ixTrPos[n*3+2]=o.z;ixTrDist[n]=dist;n++}
+  ixTrGeo.setDrawRange(0,n);ixTrGeo.attributes.position.needsUpdate=true;ixTrGeo.attributes.lineDistance.needsUpdate=true;ixTrLine.visible=true;ixTrLine.material.opacity=.45+.4*A.k;
+  if(hit&&hit.k!=='water'){const T=IX_T[id];ixTrRing.visible=true;ixTrRing.position.set(o.x,o.y-o.r+.06,o.z);ixTrRing.scale.set(T.ring,1,T.ring);ixTrRing.material.color.setHex(T.ringC);ixTrRing.material.opacity=.32+.25*Math.abs(Math.sin(IX.ft*4))}else ixTrRing.visible=false}
+function ixLights(dt){const cx=camera.position.x,cz=camera.position.z;
+  // warm light: nearest fire / burning creature / lit molotov / popping firecracker
+  let bd=55,bx=0,by=0,bz=0,bi=0;const cand=(x,y,z,i)=>{const d=dist2(x,z,cx,cz);if(d<bd){bd=d;bx=x;by=y;bz=z;bi=i}};
+  for(const f of IX.fires){const fade=Math.min(1,f.t*3)*Math.min(1,(f.life-f.t)/1.2);cand(f.x,f.y+1,f.z,2.6*fade)}
+  for(const o of IX.thr){if(o.ty==='molotov')cand(o.x,o.y+.2,o.z,1.1);else if(o.ty==='firecracker'&&o.t>.8)cand(o.x,o.y+.3,o.z,o.popT>.2?.3:1.6)}
+  for(const t of IX.stSet)if(t.st&&t.st.burn>0)cand(t.x,t.y+1,t.z,1.3);
+  if(IX.aim&&IX.aim.id==='molotov'&&P.alive)cand(cx,camera.position.y-.2,cz,.7);
+  if(bi>0){ixFireL.position.set(bx,by,bz);ixFireL.intensity=bi*(.8+.25*Math.sin(IX.ft*17)+.12*Math.sin(IX.ft*31)+R(-.06,.06))}else ixFireL.intensity=0;
+  // purple light: nearest UV flare / lamp
+  bd=45;bi=0;for(const o of IX.thr)if(o.ty==='uv_flare'&&o.lit)cand(o.x,o.y+.4,o.z,2.2*Math.min(1,(12-o.t)/1.5));ixLampList();for(const l of IX.lamps)cand(l.x,l.y+1.5,l.z,1.5);
+  if(bi>0){ixUvL.position.set(bx,by,bz);ixUvL.intensity=bi*(.92+.08*Math.sin(IX.ft*13))}else ixUvL.intensity=0;
+  IX.bmT+=dt;ixBoomL.intensity=IX.bmT<.6?ixBoomL.intensity*Math.exp(-dt*9):0;if(ixFlash.visible){const k=IX.bmT/.18;ixFlash.material.opacity=Math.max(0,1-k);if(k>=1)ixFlash.visible=false}}
+function ixUvVis(dt){const U=IX.uv;U.k=lerp(U.k,U.on&&P.alive?1:0,Math.min(1,dt*10));ixHand.visible=U.k>.01;ixHand.position.y=-.26-(1-U.k)*.25;
+  if(ixHand.visible){const lp=ixHand.userData.lens.getWorldPosition(IX.v1);const d=aimRay().d;IX.uvPos.x=lp.x;IX.uvPos.y=lp.y;IX.uvPos.z=lp.z;IX.uvDir.x=d.x;IX.uvDir.y=d.y;IX.uvDir.z=d.z;
+    const fl=U.bat<15&&Math.random()<.15?.3:1;ixSpot.position.copy(lp);ixSpot.target.position.set(lp.x+d.x*12,lp.y+d.y*12,lp.z+d.z*12);ixSpot.intensity=3.2*U.k*fl;
+    ixCone.visible=true;ixCone.position.copy(lp);ixCone.lookAt(ixSpot.target.position);ixCone.material.uniforms.uA.value=.05*U.k*fl;ixHand.userData.glow.material.opacity=.9*U.k*fl}
+  else{ixSpot.intensity=0;ixCone.visible=false}
+  for(const [id,u] of Object.entries(IX.uvR)){let c=IX.cones[id];const on=u.on&&S.time-u.t<1.5&&Array.isArray(u.p)&&Array.isArray(u.d);
+    if(!on){if(c)c.visible=false;continue}if(!c){c=IX.cones[id]=new THREE.Mesh(ixConeGeo,ixConeMatR);c.frustumCulled=false;scene.add(c);c.position.set(+u.p[0],+u.p[1],+u.p[2])}
+    c.visible=true;const k=Math.min(1,dt*12);c.position.set(lerp(c.position.x,+u.p[0],k),lerp(c.position.y,+u.p[1],k),lerp(c.position.z,+u.p[2],k));IX.v2.set(c.position.x+(+u.d[0])*10,c.position.y+(+u.d[1])*10,c.position.z+(+u.d[2])*10);c.lookAt(IX.v2)}}
+function ixFxTick(dt){IX.ft+=dt;const low=ixLow();
+  for(const o of IX.thr){if(o.dead)continue;if(o.tip){const tp=o.tip.getWorldPosition(IX.v1);
+      if(o.fl){const s=.22+Math.random()*.06+Math.sin(IX.ft*19)*.03;o.fl.s.scale.set(s,s*1.45,1);o.fl.s.position.set(tp.x,tp.y+.08,tp.z);if(Math.random()<dt*20)ixSparks(tp.x,tp.y,tp.z,'#ffb050',1,.3,.6,-1,.5,.04)}
+      if(o.gl){const k=Math.min(1,o.t*4)*Math.min(1,(12-o.t)/1.5);const s=(1.1+.15*Math.sin(IX.ft*23)+R(-.05,.05))*Math.max(.05,k);o.gl.s.scale.set(s,s,1);o.gl.s.position.copy(tp);o.gl.m.opacity=Math.max(0,k);if(Math.random()<dt*14)ixSparks(tp.x,tp.y,tp.z,'#d6a8ff',2,.8,1,3,.5,.04)}
+      if((o.ty==='pipe_bomb'||(o.ty==='firecracker'&&o.t<.8))&&Math.random()<dt*35)ixSparks(tp.x,tp.y,tp.z,'#ffc070',1,.6,.8,4,.25,.03)}}
+  for(const f of IX.fires){const fade=Math.min(1,f.t*3)*Math.min(1,(f.life-f.t)/1.2);for(const q of f.fl){const s=q.s*(.8+.22*Math.sin(IX.ft*13+q.ph)+.08*Math.sin(IX.ft*29+q.ph*2))*fade;q.f.s.scale.set(s,s*1.45,1);q.f.s.position.set(q.x,q.y+s*.55,q.z)}
+    if(Math.random()<dt*(low?3:7)){const q=pick(f.fl);if(q)ixPuff(q.x,q.y+1.4,q.z,'#2e2a27',R(.7,1.2),R(2,3.2),R(1,1.8),.4*fade,2.6,R(-.3,.3),R(-.3,.3))}
+    if(Math.random()<dt*14){const q=pick(f.fl);if(q)ixSparks(q.x+R(-.3,.3),q.y+.3,q.z+R(-.3,.3),'#ffa040',1,.4,2.2,-.5,R(.6,1.2),.05)}}
+  for(const t of IX.stSet){const st=t.st;if(!st||t===P)continue;const hy=t.eyeH||(t.t==='npc'?1.55:ANIM[t.t]?.7:1.5);
+    if(st.burn>0){if(!t.ixFl)t.ixFl=[ixFlGet(),ixFlGet()];const k=Math.min(1,st.burn),sc=ANIM[t.t]?.8:1;t.ixFl.forEach((f,i)=>{if(!f)return;const s=(i?.55:.9)*(.85+.2*Math.sin(IX.ft*17+i*2+(t.x||0)))*Math.max(.3,k)*sc;f.s.scale.set(s,s*1.45,1);f.s.position.set(t.x+(i?.05:0),t.y+(i?hy:hy*.55)+s*.3,t.z)});
+      if(Math.random()<dt*8)ixSparks(t.x+R(-.2,.2),t.y+hy*R(.3,.9),t.z+R(-.2,.2),'#ffa040',1,.3,1.8,-.5,.8,.05);if(Math.random()<dt*2)ixPuff(t.x,t.y+hy+.4,t.z,'#2e2a27',.5,1.5,1,.3,2.2)}
+    else if(t.ixFl){t.ixFl.forEach(ixFlPut);t.ixFl=null}
+    if(st.shock>0){if(Math.random()<dt*14)ixSparks(t.x+R(-.3,.3),t.y+R(.3,hy+.1),t.z+R(-.3,.3),'#9fe6ff',4,2.5,1.5,4,.25,.05);if(t.obj&&t.obj.position){t.obj.position.x+=R(-.03,.03);t.obj.position.z+=R(-.03,.03)}if(Math.random()<dt*2.5)sfx('ixzap',.2,t)}
+    if(st.bleed>0&&Math.random()<dt*6){IX.pt.x=t.x+R(-.15,.15);IX.pt.y=t.y+hy*R(.4,.8);IX.pt.z=t.z+R(-.15,.15);burst(IX.pt,CHIP.flesh,1,.3,.1,9,.8);if(Math.random()<dt*3&&typeof decal==='function'){try{decal(new V3(t.x,groundH(t.x,t.z)+.03,t.z),'blood',R(.3,.6))}catch(e){console.error('decal',e)}}}
+    if(st.toxin>0&&Math.random()<dt*4)ixPuff(t.x+R(-.2,.2),t.y+hy*R(.5,1),t.z+R(-.2,.2),'#7fd04a',.35,R(.8,1.3),.5,.35,2)}
+  for(const b of ixFb){if(b.l<=0)continue;b.l-=dt;if(b.l<=0){b.s.visible=false;continue}const k=1-b.l/b.ml;const sc=lerp(b.s0,b.s1,1-(1-k)*(1-k)*(1-k));b.s.scale.set(sc,sc,1);b.s.position.y+=b.vy*dt;b.m.opacity=Math.max(0,1-k*k)*.95;b.m.rotation+=dt*.6}
+  for(const q of ixRings){if(q.l<=0)continue;q.l-=dt;if(q.l<=0){q.r.visible=false;continue}const k=1-q.l/q.ml;const sc=q.R*(.15+.85*Math.sqrt(k));q.r.scale.set(sc,1,sc);q.m.opacity=.55*(1-k)}
+  for(const B of ixBolts){if(B.life<=0)continue;B.life-=dt;if(B.life<=0){B.l.visible=false;continue}ixBoltShape(B);B.m.opacity=Math.min(1,B.life*7)}
+  IXB.lampGlow.opacity=.65+.12*Math.sin(IX.ft*2.2)+.05*Math.sin(IX.ft*17);
+  IX.flashT+=dt;if(IX.thrAnim>0)IX.thrAnim=Math.max(0,IX.thrAnim-dt);if(IX.thrHide>0){IX.thrHide-=dt;if(IX.thrHide<=0)P.equipT=0}
+  ixSparkTick(dt);ixPuffTick(dt)}
+
+// ---------- simulation (host/solo: worldTick · clients: clientTick) ----------
+function ixSim(dt,auth){for(let i=IX.thr.length-1;i>=0;i--){const o=IX.thr[i];if(o.dead||!ixThrTick(o,dt)){IX.thr.splice(i,1)}}
+  for(let i=IX.fires.length-1;i>=0;i--)if(!ixFireTick(IX.fires[i],dt))IX.fires.splice(i,1);
+  for(let i=IX.timers.length-1;i>=0;i--){const q=IX.timers[i];q.t-=dt;if(q.t<=0){IX.timers.splice(i,1);try{q.fn()}catch(e){console.error('ix timer',e)}}}
+  ixStatusTick(dt,auth);if(auth)ixShoveTick(dt)}
+onHook('worldTick',dt=>ixSim(dt,true));
+onHook('clientTick',dt=>ixSim(dt,false));
+onHook('playerTick',dt=>{
+  const C=IX.chg;if(C){if(P.hot[P.sel]!==C.id||!has(C.id))IX.chg=null;else if(mouseL&&S.time-C.lastT<.15){C.t+=dt;if(!C.ready&&C.t>=.6){C.ready=true;sfx('ixcharge',.5);tip('ix_heavy','Heavy blow ready','Release to swing a heavy blow: double damage, more reach and a big knockback — at almost twice the stamina.')}}
+    else{IX.chg=null;if(S.time-C.lastT<.15)ixSwing(C.id,C.ready)}}
+  const A=IX.aim;if(A){if(P.hot[P.sel]!==A.id||!has(A.id))IX.aim=null;else if(mouseL&&S.time-A.lastT<.15){A.t+=dt;A.charge=Math.min(1,A.t/.8);A.k=Math.min(1,A.k+dt*6)}
+    else{IX.aim=null;if(S.time-A.lastT<.15)ixThrow(A.id,A.charge)}}
+  ixUvTick(dt);ixPTick(dt)});
+onHook('render',dt=>{if(!S||!P)return;ixVmTick(dt);ixAimPreview();ixUvVis(dt);ixFxTick(dt);ixLights(dt)});
+onHook('hud',ixHud);
+onHook('status',o=>{const s=P&&P.ixSt;if(!s||!P.alive)return;if(s.burn>0)o.push('<span style="color:#ff9a4a">BURNING</span>');if(s.shock>0)o.push('<span style="color:#8fdcff">SHOCKED</span>');if(s.toxin>0)o.push('<span style="color:#a8f070">TOXIN</span>')});
+onHook('equip',id=>{if(IX.aim&&IX.aim.id!==id)IX.aim=null;if(IX.chg&&IX.chg.id!==id)IX.chg=null;IX.thrHide=0;const it=id&&ITEMS[id];if(!it)return;
+  if(it.ixW){tip('ix_melee','Melee weapons','Every swing costs <b>stamina</b> and every hit wears the weapon down — the bar in its hotbar slot shows its condition. Repair it in the inventory (Tab). Blunt weapons knock enemies back, blades cut faster.');
+    if(ixPerk('pw_heavy'))tip('ix_heavy0','Heavy attacks','Hold <b>left click</b> to wind up and release for a heavy blow.')}
+  else if(id==='uv_lamp')tip('ix_uvlamp','UV lamp','Place it inside or right next to your base. Night Stalkers avoid the 14 m circle around it — the purple ring shows its reach.')});
+onHook('gain',(id,n,silent)=>{if(silent)return;if(IX_MATS.includes(id))tip('ix_mat','Scavenged materials','Duct tape, nails, alcohol, batteries and chemicals turn into gear against the infected. Open crafting (<b>Tab</b>) and look for <b>Infected gear</b>, <b>Weapon mods</b> and <b>Throwables</b>.');
+  else if(ITEMS[id]&&ITEMS[id].ixKit)tip('ix_kit','Mod kit','Combine a kit with a melee weapon in the crafting menu (<b>Weapon mods</b>). The weapon keeps its condition and every hit gets the effect.');
+  else if(ITEMS[id]&&ITEMS[id].ixBp)tip('ix_bpitem','Blueprint found','Select it in your hotbar and left click — or use the button in the inventory — to learn how to craft that mod kit.');
+  else if(id==='uv_flashlight')tip('ix_uv','UV flashlight','Press <b>V</b> to switch it on. Ultraviolet light stuns and repels Night Stalkers. The battery (gauge next to the hotbar) drains fast and recharges while the light is off.',true)});
+onHook('craft',id=>{const it=ITEMS[id];if(it&&it.mod)tip('ix_modded','Modded weapon',`Your weapon now ${IX_MODS[it.mod].hint}. The mod stays with it until the weapon is gone.`,true)});
+onHook('death',()=>{if(IX.uv.on){IX.uv.on=false;ixUvSend()}IX.aim=null;IX.chg=null});
+onHook('respawn',()=>{if(P){P.ixSt={};if(P.ixDur)for(const id of Object.keys(P.ixDur))ixDurArr(id)}});
+onHook('newGame',()=>{for(const o of IX.thr)ixRemoveThr(o);IX.thr.length=0;for(const f of IX.fires){for(const q of f.fl)ixFlPut(q.f)}IX.fires.length=0;IX.shoves.length=0;IX.timers.length=0;
+  for(const t of IX.stSet)ixStClear(t);IX.stSet.clear();IX.taken={};IX.pool={};IX.aim=null;IX.chg=null;IX.thrAnim=0;IX.thrHide=0;Object.assign(IX.uv,{on:false,bat:100,k:0,sendT:0});IX.uvR={};IX.lampT=-9;IX.uvT=-1;IX.uvNag=0;
+  for(const p of ixSm){p.l=0;p.s.visible=false}ixSp.length=0;for(const f of ixFl){f.busy=false;f.s.visible=false}for(const g of ixGl){g.busy=false;g.s.visible=false}for(const b of ixFb){b.l=0;b.s.visible=false}
+  for(const q of ixRings){q.l=0;q.r.visible=false}for(const B of ixBolts){B.life=0;B.l.visible=false}for(const c of Object.values(IX.cones))c.visible=false;
+  ixBoomL.intensity=0;ixFireL.intensity=0;ixUvL.intensity=0;ixSpot.intensity=0;ixFlash.visible=false;ixTrLine.visible=false;ixTrRing.visible=false;IX.flashT=9;if(P)P.ixSt={}});
+// ---------- multiplayer ----------
+RELAY.add('i_thr');RELAY.add('i_boom');RELAY.add('i_uv');
+onHook('netMsg',m=>{if(!m||typeof m.k!=='string'||m.k.slice(0,2)!=='i_')return;
+  switch(m.k){
+   case 'i_thr':if(IX_T[m.ty]&&Array.isArray(m.p)&&Array.isArray(m.v)){const s={x:+m.p[0]||0,y:+m.p[1]||0,z:+m.p[2]||0,vx:+m.v[0]||0,vy:+m.v[1]||0,vz:+m.v[2]||0};const src=NET.role==='host'?(remotes[m.from]||{t:'rplayer',id:m.from,x:s.x,y:s.y,z:s.z}):null;ixSpawnThrow(m.ty,s,src,ixAuth(),false)}break;
+   case 'i_st':if(NET.role==='host'&&IX_STK.includes(m.ty)){const t=ixFind(m.id);if(t)applyStatus(t,m.ty,Math.min(15,+m.s||0),remotes[m.from]||'player')}break;
+   case 'i_kb':if(NET.role==='host'){const t=ixFind(m.id);if(t&&!t.dead&&(t.t==='npc'||ANIM[t.t]))ixShove(t,clamp(+m.dx||0,-1,1),clamp(+m.dz||0,-1,1),Math.min(15,+m.p||0))}break;
+   case 'i_boom':if(Array.isArray(m.p))explode({x:+m.p[0]||0,y:+m.p[1]||0,z:+m.p[2]||0},Math.min(20,+m.r||6),Math.min(400,+m.d||100),null,{remote:true});break;
+   case 'i_uv':if(m.from)IX.uvR[m.from]={on:!!m.on,p:m.p,d:m.d,t:S.time};break;
+   case 'i_pst':if(IX_STK.includes(m.ty))applyStatus(P,m.ty,Math.min(15,+m.s||0));break}});
+onHook('snapshot',m=>{const a=[];for(const t of IX.stSet){if(t===P||t.dead||t.id===undefined||!t.st)continue;const s=t.st;a.push([t.id,+(s.burn||0).toFixed(1),+(s.shock||0).toFixed(1),+(s.bleed||0).toFixed(1),+(s.toxin||0).toFixed(1)])}if(a.length)m.ist=a});
+onHook('applySnap',m=>{const seen=new Set();if(Array.isArray(m.ist))for(const r of m.ist){const t=ixFind(r[0]);if(!t)continue;seen.add(t);const s=t.st||(t.st={});s.burn=+r[1]||0;s.shock=+r[2]||0;s.bleed=+r[3]||0;s.toxin=+r[4]||0;IX.stSet.add(t)}
+  for(const t of IX.stSet){if(t===P||seen.has(t))continue;if(t.ixLocalT!==undefined&&S.time-t.ixLocalT<.6)continue;ixStClear(t);IX.stSet.delete(t)}});
+
 /* ================= STAMINA PARKOUR KICK AND GRAPPLE ================= */
 // Stamina, ledge climbing, vaulting, sliding, kicking, landing rolls and the Grapnel Line.
 // pkMove(dt) owns the player movement block of update() (called between the MOVE markers).
