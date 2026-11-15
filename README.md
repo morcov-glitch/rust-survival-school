@@ -20,4 +20,13 @@ An unofficial, fan-made first-person tutorial for the survival game Rust. Not af
 
 WASD move · Shift sprint · Space jump · Mouse look · Wheel/1–6 hotbar · Left click use · R / right click secondary & reload · E interact · Tab inventory & crafting · M map · G field guide · Enter chat (online)
 
+### Phones and tablets
+
+Touch controls switch on automatically (landscape is roomier, portrait works too):
+
+- **Left stick** move · push it all the way up to sprint
+- **Drag the view** to look around (also while holding USE)
+- **USE** = left click · **E** interact · **R** reload / secondary · **JUMP** · **DUCK** (toggle) · **F** kick
+- **Tap a hotbar slot** to select it · **BAG** inventory & crafting · **MAP** · **•••** Field Guide, skills, chat, sound, full screen
+
 Numbers follow the real game where known; Facepunch rebalances often, so treat them as approximate.

@@ -2,7 +2,10 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<script>/* phones/tablets: render at a lower pixel ratio so the 3D view stays smooth */window.PR_CAP=(window.matchMedia&&matchMedia("(pointer:coarse)").matches)?1.5:2</script>
 <title>Rust Survival School</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Roboto+Condensed:wght@400;700&display=swap" rel="stylesheet">
@@ -307,7 +310,7 @@ const forest=(x,z)=>fbm(x*.008+100,z*.008+40,3);
 /* ================= RENDERER ================= */
 const cv=$('#cv');
 const renderer=new THREE.WebGLRenderer({canvas:cv,antialias:true,powerPreference:'high-performance'});
-renderer.setPixelRatio(Math.min(window.devicePixelRatio||1,2));
+renderer.setPixelRatio(Math.min(window.devicePixelRatio||1,window.PR_CAP||2));
 renderer.outputEncoding=THREE.sRGBEncoding;renderer.toneMapping=THREE.ACESFilmicToneMapping;renderer.toneMappingExposure=1.1;
 renderer.shadowMap.enabled=true;renderer.shadowMap.type=THREE.PCFSoftShadowMap;
 const scene=new THREE.Scene();
@@ -853,6 +856,7 @@ function freeCursor(){return false}
 function updateCursorMode(){document.body.classList.toggle('freecur',!!(S&&S.active&&freeCursor()))}
 function lockFailed(){if(!S||!inGame()||anyOpen()||!P.alive)return;if(!lockFailed.retry){lockFailed.retry=1;clearTimeout(lockFailed._t);lockFailed._t=setTimeout(()=>{if(S&&S.active&&!document.pointerLockElement){try{const r=cv.requestPointerLock();if(r&&r.catch)r.catch(()=>{lockFailed.retry=2;pause()})}catch(e){pause()}}},1100);return}pause()}
 function resume(){if(!inGame()||anyOpen()||!P.alive)return;$('#pause').classList.add('hidden');S.active=true;
+  if(window.TOUCH_ON){updateCursorMode();return} // touch devices: no pointer lock, the on-screen controls drive the game (touch.js)
   lockFailed.retry=0;try{const r=cv.requestPointerLock();if(r&&r.catch)r.catch(()=>lockFailed())}catch(e){lockFailed()}clearTimeout(resume._t);resume._t=setTimeout(()=>{if(S&&S.active&&!document.pointerLockElement)lockFailed()},2600)
   updateCursorMode()}
 function pause(){if(!S)return;S.active=false;mouseL=false;mouseR=false;if(document.pointerLockElement)document.exitPointerLock();if(inGame()&&!anyOpen()&&P.alive)$('#pause').classList.remove('hidden');updateCursorMode()}
@@ -3837,7 +3841,7 @@ function ixSparks(x,y,z,hex,n,spd=2,up=1,grav=9,life=.5,size=.06){if(ixLow())n=M
   for(let i=0;i<n&&ixSp.length<IX_SPN;i++){const l=life*R(.6,1.2);ixSp.push({x,y,z,vx:R(-1,1)*spd,vy:R(-.3,1)*spd*.6+up*R(.4,1),vz:R(-1,1)*spd,g:grav,l,ml:l,r:c[0],gg:c[1],b:c[2],s:size*R(.7,1.3)})}}
 function ixSparkTick(dt){for(let i=ixSp.length-1;i>=0;i--){const p=ixSp[i];p.l-=dt;if(p.l<=0){ixSp[i]=ixSp[ixSp.length-1];ixSp.pop();continue}p.vy-=p.g*dt;const f=Math.exp(-dt*1.5);p.vx*=f;p.vz*=f;p.x+=p.vx*dt;p.y+=p.vy*dt;p.z+=p.vz*dt}
   let n=0;for(const p of ixSp){const k=Math.min(1,p.l/p.ml*1.6);ixSpPos[n*3]=p.x;ixSpPos[n*3+1]=p.y;ixSpPos[n*3+2]=p.z;ixSpCol[n*3]=p.r*k;ixSpCol[n*3+1]=p.gg*k;ixSpCol[n*3+2]=p.b*k;ixSpSz[n]=p.s;n++}
-  ixSpGeo.setDrawRange(0,n);ixSpGeo.attributes.position.needsUpdate=true;ixSpGeo.attributes.aC.needsUpdate=true;ixSpGeo.attributes.aS.needsUpdate=true;ixSpU.uScale.value=innerHeight*Math.min(window.devicePixelRatio||1,2)*.5}
+  ixSpGeo.setDrawRange(0,n);ixSpGeo.attributes.position.needsUpdate=true;ixSpGeo.attributes.aC.needsUpdate=true;ixSpGeo.attributes.aS.needsUpdate=true;ixSpU.uScale.value=innerHeight*Math.min(window.devicePixelRatio||1,window.PR_CAP||2)*.5}
 const IX_SMN=56,ixSm=[];let ixSmI=0;
 for(let i=0;i<IX_SMN;i++){const m=new THREE.SpriteMaterial({map:ixSmokeTex,transparent:true,depthWrite:false,opacity:0});const s=new THREE.Sprite(m);s.visible=false;scene.add(s);ixSm.push({s,m,l:0,ml:1,vx:0,vy:0,vz:0,s0:1,s1:2,a:.5,rs:0,add:false})}
 function ixPuff(x,y,z,hex,size,life,vy,a=.45,grow=2.2,vx=0,vz=0){if(ixLow()&&Math.random()<.4)return;const p=ixSm[ixSmI];ixSmI=(ixSmI+1)%IX_SMN;p.s.visible=true;p.s.position.set(x,y,z);p.l=p.ml=life;p.vx=vx;p.vy=vy;p.vz=vz;p.s0=size;p.s1=size*grow;p.a=a;
@@ -5330,7 +5334,7 @@ function gfxCycle(){if(POSTFX.failed){if(S)feedMsg('Post-processing is not suppo
 try{const st=document.createElement('style');st.textContent='body.gfxpp #cv{filter:none!important}body.gfxpp #vig,body.gfxpp #glare,body.gfxpp #uw{display:none!important}';document.head.appendChild(st);
   const act=document.querySelector('#pause .card .actions');if(act){const b=document.createElement('button');b.className='btn gray';b.id='pGfx';b.title='Post-processing: bloom, sun rays, colour grading';b.textContent=gfxLabel();
     b.onclick=e=>{e.stopPropagation();gfxCycle()};act.insertBefore(b,act.firstChild)}}catch(e){console.warn('[gfx] ui',e)}
-addEventListener('resize',()=>{try{const pr=Math.min(window.devicePixelRatio||1,2);if(Math.abs(pr-renderer.getPixelRatio())>.01){renderer.setPixelRatio(pr);renderer.setSize(innerWidth,innerHeight,false)}}catch(e){}});
+addEventListener('resize',()=>{try{const pr=Math.min(window.devicePixelRatio||1,window.PR_CAP||2);if(Math.abs(pr-renderer.getPixelRatio())>.01){renderer.setPixelRatio(pr);renderer.setSize(innerWidth,innerHeight,false)}}catch(e){}});
 
 /* ---- shadows: 4096 map when allowed (2048 on Low/Off), stable texel-snapped sun shadow camera ---- */
 function gfxShadowCfg(){const hi=POSTFX.enabled&&!POSTFX.failed&&POSTFX.quality!=='low'?GFX.shadowHi:2048;if(GFX.shRes===hi)return;GFX.shRes=hi;
@@ -5480,7 +5484,7 @@ function gfxSunState(){const st=GFX.st,p=dayP();let D=0,sunT=-1;if(p<.66){sunT=p
   st.p=p;st.sunT=sunT;st.D=D;st.set=sunT>=0?clamp(1-D,0,1)*smooth(0,.03,sunT)*smooth(0,.03,1-sunT):0;st.night=Math.max(0,1-D-st.set*.6);st.el=sunT>=0?Math.sin(sunT*Math.PI):-.3;return st}
 function gfxFrame(dt){gfxExtShaders();GFX.t+=dt;GFXD.t.value+=dt;const st=gfxSunState(),rn=S.rain||0;
   // keep the canvas at the display's pixel ratio (DPR can change without a resize event, e.g. moving between monitors)
-  if((GFX.dprT=(GFX.dprT||0)-dt)<=0){GFX.dprT=.5;const pr=Math.min(window.devicePixelRatio||1,2);if(Math.abs(pr-renderer.getPixelRatio())>.01){renderer.setPixelRatio(pr);renderer.setSize(innerWidth,innerHeight,false)}}
+  if((GFX.dprT=(GFX.dprT||0)-dt)<=0){GFX.dprT=.5;const pr=Math.min(window.devicePixelRatio||1,window.PR_CAP||2);if(Math.abs(pr-renderer.getPixelRatio())>.01){renderer.setPixelRatio(pr);renderer.setSize(innerWidth,innerHeight,false)}}
   // sky & stars
   const vis=st.sunT>=0?clamp(st.el*4,0,1):0,w=smooth(0,.4,st.el);skyU.uSunC.value.setRGB(1,lerp(.5,.93,w),lerp(.22,.8,w)).multiplyScalar(vis);
   skyU.uSet.value=st.set;skyU.uDay.value=st.D;skyU.uNight.value=st.night;skyU.uExpoK.value=POSTFX.exposure/.6;
@@ -9914,5 +9918,6 @@ $('#mGuide').onclick=()=>{guideSel='basics';renderGuide();$('#guide').classList.
 const _closeAll=closeAll;
 requestAnimationFrame(loop);
 </script>
+<script src="touch.js"></script>
 </body>
 </html>
