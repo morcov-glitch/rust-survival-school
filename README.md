@@ -10,6 +10,10 @@ An unofficial, fan-made first-person tutorial for the survival game Rust. Not af
 - **Field Guide** – a searchable reference: resources, cloth, sleeping bags, base defence, raid costs, crafting requirements, mid-wipe survival and more.
 - **Play with a friend** – peer-to-peer online co-op. One player hosts (their browser runs the island) and sends an invite link; the friend opens it and joins.
 
+## Look
+
+A bright, painterly style: soft cel-shaded sunlight, a vivid sky with puffy clouds, lush greens, hazy mountain ranges on the horizon and a painted landscape behind the main menu. Day, sunset, rain and night all tint the scenery.
+
 ## Online play notes
 
 - Uses WebRTC through the free PeerJS signalling server, so it works from static hosting like GitHub Pages. No game server needed.
