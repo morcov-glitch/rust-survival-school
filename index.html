@@ -9819,6 +9819,265 @@ onHook('respawn',()=>{st.hs=0;st.sw.on=false;st.rcP=st.rcY=0;for(const k in CK){
 onHook('death',()=>{st.hs=0;st.sw.on=false;st.rcP=st.rcY=0});
 return{hitStop,kick:(p,y,r)=>{kick(CK.p,+p||0);kick(CK.y,+y||0);kick(CK.r,+r||0)},flash,folScan,low}})();
 
+/* ================= BREAKABLE BUILDING PIECES & OWNER DEMOLISH ================= */
+// Every building piece and door gets health by tier (p.hp / door.hp, plain numbers for any serializer).
+// Damage: melee/tools (scaled by tool class × tier, soft side), bullets/arrows, explosives (explode(), Burster
+// blasts, lightning), molotov fire. Cracks overlay, health bar on look, debris + collapse of unsupported pieces.
+// Hammer: R = repair a damaged piece (otherwise the upgrade menu as before), hold R = demolish (50% refund);
+// the upgrade menu (LMB) gets Repair / Demolish / Pick up door.
+// Multiplayer: each player's base is simulated by its owner (like the core 'build' sync). Hits on someone
+// else's base go to the owner (wl_dmg / wl_rep / wl_dem, routed through the host), the owner applies them and
+// its normal build sync (now carrying hp) updates everyone, late joiners included. Break FX: wl_fx (relayed).
+// Public: wallsApplyHp(target,hp) · wallsMaxHp(target) · wallsDamage(p,dmg,type,opts) · buildPerm(p,who,owner)
+const WL_HP={twig:10,wood:250,stone:500,metal:1000},WL_DOORHP={wood:200,sheet:250};
+// damage multiplier: class × tier.  melee classes: blunt (rock, torch, bats, pipes, spear, kicks), axe, pick, heavy (sledge), blade
+const WL_MULT={
+ blunt:{twig:.6,wood:.2,stone:.012,metal:.005},
+ axe:{twig:.45,wood:.75,stone:.015,metal:.006},
+ pick:{twig:.6,wood:.35,stone:.03,metal:.01},
+ heavy:{twig:.7,wood:.45,stone:.02,metal:.008},
+ blade:{twig:.6,wood:.3,stone:.006,metal:.003},
+ bullet:{twig:1,wood:.06,stone:.004,metal:.002},
+ explosive:{twig:5,wood:2,stone:1.2,metal:.9},
+ fire:{twig:3,wood:1,stone:0,metal:0}};
+const WL_DMULT={wood:{blunt:.22,axe:.8,pick:.35,heavy:.5,blade:.3,bullet:.08,explosive:1.8,fire:1.2},
+ sheet:{blunt:.01,axe:.012,pick:.02,heavy:.03,blade:.005,bullet:.004,explosive:1.1,fire:0}};
+const WL_CLS={stone_hatchet:'axe',fire_axe:'axe',stone_pickaxe:'pick',sledgehammer:'heavy',machete:'blade',katana:'blade'};
+const WL_COL={twig:['#a8844f','#7a5a35','#c9a46a'],wood:['#7a5a35','#5a3f25','#a8844f'],stone:['#8f8c86','#6f6c66','#b0aca4'],metal:['#9aa0a6','#6d7378','#c8ccd0']};
+const WL_DEB={twig:'#a8844f',wood:'#6e5032',stone:'#8a8780',metal:'#8d9398'};
+const WL_HOLD=1.2,WL_REPBLOCK=8;
+const WL={q:[],rb:{},rov:{},est:{},booms:[],hold:null,rDown:false,fireT:0,hudN:0,lastHud:'',geo:new THREE.BoxGeometry(1,1,1),mats:null};
+
+/* ---- basics ---- */
+function wlMax(p){return WL_HP[p&&p.tier]||10}
+function wlDMax(d){return WL_DOORHP[d&&d.type]||200}
+function wlHp(p){if(!(p.hp>=0))p.hp=wlMax(p);return p.hp}
+function wlDHp(d){if(!(d.hp>=0))d.hp=wlDMax(d);return d.hp}
+function wlPid(p){return p.kind==='foundation'?'f'+p.gx+','+p.gz:p.kind==='roof'?'r'+p.gx+','+p.gz:'e'+p.key}
+function wlFind(id){return pieces.find(p=>wlPid(p)===id)||null}
+function wlCls(id){if(id==='kick')return'blunt';const it=ITEMS[id];const b=String((it&&it.ixBase)||id||'');return WL_CLS[b]||(/pick/.test(b)?'pick':/axe|hatchet/.test(b)?'axe':/sledge/.test(b)?'heavy':'blunt')}
+function wlMul(type,tier,doorType){if(doorType)return((WL_DMULT[doorType]||WL_DMULT.wood)[type])||0;return((WL_MULT[type]||WL_MULT.blunt)[tier])||0}
+function wlMat(tier,doorType){return doorType?(doorType==='sheet'?'metal':'wood'):(WL_COL[tier]?tier:'wood')}
+function wlBoxDist(b,x,y,z){const dx=Math.max(b.minx-x,0,x-b.maxx),dy=Math.max(b.miny-y,0,y-b.maxy),dz=Math.max(b.minz-z,0,z-b.maxz);return Math.hypot(dx,dy,dz)}
+function wlMinDist(bs,x,y,z){let d=1e9;for(const b of bs||[])if(b)d=Math.min(d,wlBoxDist(b,x,y,z));return d}
+function wlCtr(bs){let x=0,y=0,z=0,n=0;for(const b of bs||[]){x+=(b.minx+b.maxx)/2;y+=(b.miny+b.maxy)/2;z+=(b.minz+b.maxz)/2;n++}return n?{x:x/n,y:y/n,z:z/n}:{x:0,y:0,z:0}}
+function wlCentre(){if(S.tc&&deps.includes(S.tc))return{x:S.tc.x,z:S.tc.z};let n=0,x=0,z=0;for(const c of cells.values()){x+=c.gx*3+1.5;z+=c.gz*3+1.5;n++}return n?{x:x/n,z:z/n}:null}
+function wlPvp(){try{if(typeof SAVE!=='undefined'&&SAVE&&(SAVE.pvp||(SAVE.opts&&SAVE.opts.pvp)||(SAVE.settings&&SAVE.settings.pvp)))return true}catch(e){}return false}
+// may player `who` repair/demolish piece p of base `owner`? (twig is always free to demolish). Override freely.
+function buildPerm(p,who,owner){who=who||NET.myId;owner=owner||NET.myId;if(!NET.role||who===owner)return true;return !wlPvp()}
+function wlDirty(){if(NET.role&&typeof NET.buildT==='number')NET.buildT=Math.min(NET.buildT,.2)}
+function wlStage(hp,max){const f=hp/max;return f>=.75?0:f>=.45?1:f>=.2?2:3}
+
+/* ---- crack overlay (3 shared materials, one shared unit box) ---- */
+function wlCrackMats(){if(WL.mats)return WL.mats;let seed=7;const rnd=()=>(seed=(seed*16807)%2147483647)/2147483647;
+  WL.mats=[1,2,3].map(s=>{seed=7;const tex=canvasTex(256,(g,n)=>{g.clearRect(0,0,n,n);g.fillStyle=`rgba(18,13,8,${(.08+.13*s).toFixed(2)})`;g.fillRect(0,0,n,n);
+      g.lineCap='round';g.lineJoin='round';const cracks=[3,7,12][s-1];
+      for(let c=0;c<cracks;c++){let x=rnd()*n,y=rnd()*n,a=rnd()*6.283;const segs=5+Math.floor(rnd()*6);g.strokeStyle=`rgba(8,6,4,${.55+.15*s})`;g.lineWidth=1.2+rnd()*1.6+s*.4;g.beginPath();g.moveTo(x,y);
+        for(let i=0;i<segs;i++){a+=(rnd()-.5)*1.3;const L=10+rnd()*22;x+=Math.cos(a)*L;y+=Math.sin(a)*L;g.lineTo(x,y);
+          if(rnd()<.3){const bx=x,by=y,ba=a+(rnd()<.5?1:-1)*(.6+rnd()*.6);g.moveTo(bx,by);g.lineTo(bx+Math.cos(ba)*(8+rnd()*14),by+Math.sin(ba)*(8+rnd()*14));g.moveTo(x,y)}}g.stroke()}
+      if(s===3){for(let i=0;i<9;i++){g.fillStyle='rgba(6,4,3,.55)';g.beginPath();g.arc(rnd()*n,rnd()*n,3+rnd()*6,0,6.283);g.fill()}}},1,true);
+    return new THREE.MeshBasicMaterial({map:tex,transparent:true,depthWrite:false,polygonOffset:true,polygonOffsetFactor:-2,polygonOffsetUnits:-4})});return WL.mats}
+function wlOvMesh(b,s){const m=new THREE.Mesh(WL.geo,wlCrackMats()[s-1]);m.position.set((b.minx+b.maxx)/2,(b.miny+b.maxy)/2,(b.minz+b.maxz)/2);m.scale.set(b.maxx-b.minx+.03,b.maxy-b.miny+.03,b.maxz-b.minz+.03);m.renderOrder=2;m.castShadow=m.receiveShadow=false;return m}
+function wlVis(p){if(!p||!p.boxes)return;const st=wlStage(wlHp(p),wlMax(p));if(p._st===st&&(!st||p._ov))return;p._st=st;if(p._ov){world.remove(p._ov);p._ov=null}
+  if(st&&pieces.includes(p)){const g=new THREE.Group();for(const b of p.boxes)g.add(wlOvMesh(b,st));world.add(g);p._ov=g}}
+function wlDoorVis(p){const d=p&&p.door;if(!d||!d.obj)return;const st=wlStage(wlDHp(d),wlDMax(d));if(d._st===st)return;d._st=st;if(d._ov){d.obj.remove(d._ov);d._ov=null}
+  const dm=d.obj.children[0];if(!st||!dm||!dm.geometry||!dm.geometry.parameters)return;const q=dm.geometry.parameters;
+  const m=new THREE.Mesh(WL.geo,wlCrackMats()[st-1]);m.position.copy(dm.position);m.scale.set(q.width+.025,q.height+.025,q.depth+.025);m.renderOrder=2;d.obj.add(m);d._ov=m}
+
+/* ---- FX ---- */
+function wlHitFx(pt,mat,dmg){if(!pt)return;const p=pt.isVector3?pt:new V3(pt.x,pt.y,pt.z);const cols=WL_COL[mat]||CHIP.build;
+  sfx(mat==='stone'?'rockhit':mat==='metal'?'metalhit':'chop',mat==='twig'?.5:.65,p);burst(p,cols,dmg>1?9:5,2.2,1.5,9.8,.6);
+  if(mat==='stone'||mat==='metal')burst(p,['#fff3c0','#ffd27a'],dmg>1?3:2,4,1.6,5,.2);else if(dmg>3)burst(p,['#5a4a32','#7a6a4a'],4,1.2,.6,4,.9)}
+function wlBreakFx(bs,mat,net){mat=WL_COL[mat]?mat:'wood';let near=1e9;
+  for(const b of bs){const c=new V3((b.minx+b.maxx)/2,(b.miny+b.maxy)/2,(b.minz+b.maxz)/2);const vol=(b.maxx-b.minx)*(b.maxy-b.miny)*(b.maxz-b.minz);
+    debris(c,WL_DEB[mat],clamp(Math.round(vol*1.6),3,8),mat==='twig'?.16:.26,'box');burst(c,WL_COL[mat],18,3.2,2.6,9.8,.9);burst(c,['#8a8274','#6f685c','#a39a88'],10,1.4,1.2,1.5,1.6);near=Math.min(near,dist2(P.x,P.z,c.x,c.z))}
+  const c0=bs[0]?new V3((bs[0].minx+bs[0].maxx)/2,(bs[0].miny+bs[0].maxy)/2,(bs[0].minz+bs[0].maxz)/2):null;
+  if(c0){sfx(mat==='stone'?'crumble':mat==='metal'?'metalhit':'crack',1,c0);sfx('fall',.7,c0);if(mat==='metal')sfx('crumble',.6,c0)}
+  if(near<14)P.camShake=Math.max(P.camShake||0,.22*(1-near/14));
+  if(net&&NET.role)netSend({k:'wl_fx',m:mat,b:bs.slice(0,4).map(b=>[b.minx,b.miny,b.minz,b.maxx,b.maxy,b.maxz].map(v=>+v.toFixed(2)))})}
+
+/* ---- local damage / break / remove (owner side) ---- */
+function wlDamageLocal(p,dmg,o){o=o||{};if(!p||!pieces.includes(p)||!(dmg>0))return;
+  if(o.door){const d=p.door;if(!d)return;const h=wlDHp(d);let nh=h-dmg;if(o.inf)nh=Math.max(nh,Math.min(h,wlDMax(d)*.5));d.hp=Math.max(0,nh);d.dmgT=S.time;wlDoorVis(p);if(d.hp<=0)wlBreakDoor(p);wlDirty();return}
+  const h=wlHp(p);let nh=h-dmg;if(o.inf)nh=Math.max(nh,Math.min(h,wlMax(p)*.5));p.hp=Math.max(0,nh);p.dmgT=S.time;wlVis(p);if(p.hp<=0)wlBreak(p,o);wlDirty()}
+// generic entry for other modules: raw damage of a type ('blunt','axe','pick','heavy','blade','bullet','explosive','fire') to a local piece
+function wallsDamage(p,dmg,type,opts){opts=opts||{};if(!p||!pieces.includes(p))return 0;const door=!!opts.door&&p.door;const d=dmg*wlMul(type||'blunt',p.tier,door?p.door.type:null);wlDamageLocal(p,d,{door:!!door,type,inf:!!opts.inf});return d}
+function wlBreakDoor(p){const d=p.door;if(!d)return;const bx=d.open&&d.obox?d.obox:d.box;wlBreakFx([bx],d.type==='sheet'?'metal':'wood',true);p.obj.remove(d.obj);p.door=null;rebuildBoxes();wlDirty();
+  typeof checkObjective==='function'&&checkObjective()}
+function wlBreak(p,o){o=o||{};if(!pieces.includes(p))return;if(p.door){const d=p.door;wlBreakFx([d.box],d.type==='sheet'?'metal':'wood',true)}wlBreakFx(p.boxes,p.tier,true);wlRemove(p);wlSettle(o.ref||null);
+  typeof checkObjective==='function'&&checkObjective()}
+function wlRemove(p){world.remove(p.obj);if(p._ov){world.remove(p._ov);p._ov=null}pieces=pieces.filter(q=>q!==p);const k=p.gx!==undefined?ck(p.gx,p.gz):null;
+  if(p.kind==='foundation'){if(cells.get(k)===p)cells.delete(k);wlDropDeps(p)}else if(p.kind==='roof'){if(roofs.get(k)===p)roofs.delete(k)}else if(edges.get(p.key)===p)edges.delete(p.key);
+  if(upPiece===p){upPiece=null;try{if(!$('#panel').classList.contains('hidden')&&/Hammer/.test($('#panelTitle').textContent))closeAll()}catch(e){}}
+  rebuildBoxes();wlDirty()}
+// deployables standing on a destroyed foundation drop to the ground
+function wlDropDeps(p){const x0=p.gx*3,z0=p.gz*3;for(const d of deps){if(d.x<x0-.05||d.x>x0+3.05||d.z<z0-.05||d.z>z0+3.05)continue;if(cells.has(ck(Math.floor(d.x/3),Math.floor(d.z/3))))continue;
+  const ny=Math.max(groundH(d.x,d.z),-.2);const dy=ny-d.y;if(dy>-.02)continue;d.y=ny;if(d.obj)d.obj.position.y+=dy;if(d.box){d.box.miny+=dy;d.box.maxy+=dy}}}
+function wlSupported(p){if(p.kind==='foundation')return true;if(p.kind==='roof')return cells.has(ck(p.gx,p.gz))&&edgesOf(p.gx,p.gz).some(([k])=>edges.has(k));
+  if(p.key)return edgeCells(p.key).some(c=>cells.has(ck(c[0],c[1])));return true}
+function wlSettle(ref){for(const p of pieces)if(!p._doom&&!wlSupported(p)){p._doom=1;WL.q.push({p,t:.2+Math.random()*.3,ref})}}
+function wlRefund(p){const c=TIER[p.tier]&&TIER[p.tier].cost,o={};if(c)for(const [k,v] of Object.entries(c))o[k]=Math.floor(v*.5);return o}
+function wlDoorRefund(d){const o={};if(wlDHp(d)>=wlDMax(d)*.5)o[d.type==='sheet'?'sheet_door':'wooden_door']=1;else if(d.type==='sheet')o.metal_frag=75;else o.wood=150;
+  if(d.lock==='code')o.code_lock=1;else if(d.lock==='key')o.key_lock=1;return o}
+function wlGive(items,to){const keys=Object.keys(items||{}).filter(k=>ITEMS[k]&&items[k]>0);if(!keys.length)return;
+  if(to&&to!==NET.myId&&to!=='@me'){wlRoute(to,{k:'wl_ref',it:items});return}for(const k of keys)gain(k,items[k])}
+// owner-side demolish; returns the refund
+function wlDemolish(p,doorOnly){const items={},add=o=>{for(const k in o)items[k]=(items[k]||0)+o[k]};if(!pieces.includes(p))return items;
+  if(p.door){add(wlDoorRefund(p.door));const d=p.door;burst(new V3((d.box.minx+d.box.maxx)/2,d.box.miny+1.1,(d.box.minz+d.box.maxz)/2),CHIP.build,10,2,1.5);p.obj.remove(d.obj);p.door=null;rebuildBoxes()}
+  if(!doorOnly){add(wlRefund(p));wlBreakFx(p.boxes,p.tier,true);wlRemove(p)}
+  sfx('thud',.8);wlDirty();typeof checkObjective==='function'&&checkObjective();return items}
+
+/* ---- routing to a base owner (client → host → owner) ---- */
+function wlRoute(owner,m){if(!owner||!NET.role)return;if(owner===NET.myId){m.by=NET.myId;wlOnMsg(m);return}if(NET.role==='host')sendTo(owner,m);else{m.to=owner;netSend(m)}}
+function wlOnMsg(m){const by=m.by||m.from;switch(m.k){
+  case 'wl_dmg':{const p=wlFind(m.id);if(p)wlDamageLocal(p,clamp(+m.d||0,0,3000),{door:!!m.dr,type:m.ty||'melee',inf:!!m.inf});break}
+  case 'wl_rep':{const p=wlFind(m.id);if(!p||!buildPerm(p,by))break;if(m.dr&&p.door){p.door.hp=wlDMax(p.door);wlDoorVis(p)}else if(!m.dr){p.hp=wlMax(p);wlVis(p)}sfx('thud',.6,wlCtr(p.boxes));wlDirty();break}
+  case 'wl_dem':{const p=wlFind(m.id);if(!p)break;if(!(p.tier==='twig'&&!m.dr)&&!buildPerm(p,by))break;const it=wlDemolish(p,!!m.dr);if(!m.dr)wlSettle(by);wlGive(it,by);break}
+  case 'wl_ref':{if(m.it&&typeof m.it==='object'){const got=[];for(const [k,v] of Object.entries(m.it))if(ITEMS[k]&&v>0){gain(k,Math.min(v|0,2000));got.push(v+' '+ITEMS[k].n)}if(got.length)feedMsg('Refund: '+got.join(', '))}break}
+  case 'wl_fx':{if(Array.isArray(m.b))wlBreakFx(m.b.filter(a=>Array.isArray(a)&&a.length===6).map(a=>({minx:+a[0],miny:+a[1],minz:+a[2],maxx:+a[3],maxy:+a[4],maxz:+a[5]})),m.m,false);break}}}
+if(typeof RELAY!=='undefined')RELAY.add('wl_fx');
+onHook('netMsg',m=>{if(!m||typeof m.k!=='string'||m.k.slice(0,3)!=='wl_')return;if(NET.role==='host'&&m.to&&m.to!==NET.myId){m.by=m.from;sendTo(m.to,m);return}if(m.k==='wl_fx'&&m.from===NET.myId)return;wlOnMsg(m)});
+
+/* ---- remote bases: per-piece boxes for aiming / hp / cracks ---- */
+function wlPieceBoxes(pd,y){if(pd.kind==='foundation'){const h=y-(pd.min-.4);return[{minx:pd.gx*3,maxx:pd.gx*3+3,minz:pd.gz*3,maxz:pd.gz*3+3,miny:y-h,maxy:y}]}
+  if(pd.kind==='roof')return[{minx:pd.gx*3,maxx:pd.gx*3+3,minz:pd.gz*3,maxz:pd.gz*3+3,miny:y+3,maxy:y+3.25}];if(!pd.key)return[];
+  const b=wallBoxAt(pd.key,y),ax=pd.key[0];const along=(a,c,w)=>ax==='x'?{minx:b.minx,maxx:b.maxx,minz:b.minz+a,maxz:b.minz+a+w,miny:y+c[0],maxy:y+c[1]}:{minx:b.minx+a,maxx:b.minx+a+w,minz:b.minz,maxz:b.maxz,miny:y+c[0],maxy:y+c[1]};
+  return pd.kind==='wall'?[along(0,[0,3],3)]:[along(0,[0,3],.9),along(2.1,[0,3],.9),along(.9,[2.2,3],1.2),Object.assign(along(.9,[0,2.2],1.2),{gap:1})]}
+function wlRemoteIndex(owner,d){if(WL.rov[owner]){world.remove(WL.rov[owner]);delete WL.rov[owner]}for(const k in WL.est)if(k.indexOf(owner+'|')===0)delete WL.est[k];
+  if(!d||!Array.isArray(d.pieces)||typeof d.baseY!=='number'||!isFinite(d.baseY)){delete WL.rb[owner];return}const y=d.baseY,list=[];let g=null;
+  for(const pd of d.pieces){if(!pd||!WL_HP[pd.tier])continue;const all=wlPieceBoxes(pd,y);const boxes=all.filter(b=>!b.gap),gap=all.find(b=>b.gap)||null;if(!boxes.length)continue;
+    const e={pid:wlPid(pd),pd,boxes,gap,c:wlCtr(boxes)};list.push(e);
+    const st=pd.hp>=0?wlStage(pd.hp,WL_HP[pd.tier]):0;const dst=pd.door&&pd.door.hp>=0&&gap&&!pd.door.open?wlStage(pd.door.hp,WL_DOORHP[pd.door.type]||200):0;
+    if(st||dst){g=g||new THREE.Group();if(st)for(const b of boxes)g.add(wlOvMesh(b,st));if(dst)g.add(wlOvMesh({minx:gap.minx,maxx:gap.maxx,miny:gap.miny,maxy:gap.maxy,minz:gap.minz,maxz:gap.maxz},dst))}}
+  let cen=null;const tc=(d.deps||[]).find(q=>q&&q.type==='tc');if(tc)cen={x:tc.x,z:tc.z};else{let n=0,x=0,z=0;for(const pd of d.pieces)if(pd&&pd.kind==='foundation'){x+=pd.gx*3+1.5;z+=pd.gz*3+1.5;n++}if(n)cen={x:x/n,z:z/n}}
+  WL.rb[owner]={list,cen};if(g){world.add(g);WL.rov[owner]=g}}
+AIM_EXT.push((o,d,maxT,consider)=>{for(const ow in WL.rb){if(!remoteBases[ow])continue;for(const e of WL.rb[ow].list){if(Math.abs(e.c.x-o.x)>maxT+5||Math.abs(e.c.z-o.z)>maxT+5)continue;
+  for(const b of e.boxes)consider(rayBox(o,d,b,maxT),{kind:'rpiece',e,owner:ow});if(e.gap&&e.pd.door&&!e.pd.door.open)consider(rayBox(o,d,e.gap,maxT),{kind:'rdoor',e,owner:ow})}}});
+function wlRKey(owner,e,door){return owner+'|'+e.pid+(door?'|d':'')}
+function wlRHp(owner,e,door){const syn=door?(e.pd.door&&e.pd.door.hp>=0?e.pd.door.hp:WL_DOORHP[e.pd.door&&e.pd.door.type]||200):(e.pd.hp>=0?e.pd.hp:WL_HP[e.pd.tier]);const es=WL.est[wlRKey(owner,e,door)];return es&&S.time-es.t<4?Math.min(syn,es.hp):syn}
+function wlSendDmg(owner,e,dmg,door,ty){if(!(dmg>0))return;const k=wlRKey(owner,e,door);WL.est[k]={hp:Math.max(0,wlRHp(owner,e,door)-dmg),t:S.time};wlRoute(owner,{k:'wl_dmg',id:e.pid,d:+dmg.toFixed(3),dr:door?1:0,ty})}
+
+/* ---- melee ---- */
+function wlMelee(a,m,id){noise(P.x,P.z,28);const remote=a.kind==='rpiece'||a.kind==='rdoor',door=a.kind==='door'||a.kind==='rdoor';const info=remote?a.e.pd:a.e;if(!info)return true;
+  const dtype=door&&info.door?info.door.type:null;if(door&&!dtype)return true;let mul=wlMul(wlCls(id),info.tier,dtype);
+  if(info.kind==='wall'||info.kind==='doorway'){const cen=remote?(WL.rb[a.owner]&&WL.rb[a.owner].cen):wlCentre();if(cen){const c=wlCtr(remote?a.e.boxes:info.boxes);if(dist2(P.x,P.z,cen.x,cen.z)<dist2(c.x,c.z,cen.x,cen.z)-.1)mul*=.5}}
+  if(m&&m.mod==='fire_kit'&&(dtype==='wood'||(!dtype&&(info.tier==='twig'||info.tier==='wood'))))mul*=1.3;
+  const dmg=((m&&m.dmg)||5)*mul;wlHitFx(a.point,wlMat(info.tier,dtype),dmg);
+  if(remote)wlSendDmg(a.owner,a.e,dmg,door,'melee');else wlDamageLocal(a.e,dmg,{door,type:'melee'});
+  if(mul<.05)tip('wl_hard','Barely a scratch',(dtype?'Sheet metal doors':TIER[info.tier].n+' pieces')+' shrug off melee and bullets. Breaking in needs <b>explosives</b> (pipe bombs, fuel canisters, vehicle wrecks). Wood and twig can also be chopped or burned with molotovs.');
+  else if(!dtype&&info.tier==='wood'&&wlCls(id)!=='axe')tip('wl_wood','Chopping wood','Wooden walls and doors take a sustained effort — a <b>hatchet or axe</b> does far more than a rock. Molotovs burn wood too.');
+  return true}
+HIT_EXT.piece=HIT_EXT.door=HIT_EXT.rpiece=HIT_EXT.rdoor=wlMelee;
+
+/* ---- projectiles: a tiny cylinder at the box hit point so the core picks our tag ---- */
+PROJ_EXT.push((pr,o,dir,L,test)=>{let best=null;const cand=(t,tg)=>{if(t!==null&&(!best||t<best.t))best={t,tg}};
+  for(const p of pieces){const c=p.boxes[0];if(!c||Math.abs((c.minx+c.maxx)/2-o.x)>L+5||Math.abs((c.minz+c.maxz)/2-o.z)>L+5)continue;for(const b of p.boxes)cand(rayBox(o,dir,b,L),{p,door:false});
+    if(p.door&&!p.door.open&&p.door.box)cand(rayBox(o,dir,p.door.box,L),{p,door:true})}
+  for(const ow in WL.rb){if(!remoteBases[ow])continue;for(const e of WL.rb[ow].list){if(Math.abs(e.c.x-o.x)>L+5||Math.abs(e.c.z-o.z)>L+5)continue;for(const b of e.boxes)cand(rayBox(o,dir,b,L),{ow,e,door:false});
+    if(e.gap&&e.pd.door&&!e.pd.door.open)cand(rayBox(o,dir,e.gap,L),{ow,e,door:true})}}
+  if(best){const t=Math.max(0,best.t-.03);const hy=o.y+dir.y*t;test(['wlp',best.tg],{x:o.x+dir.x*t,z:o.z+dir.z*t},.06,hy-.35,hy+.35)}});
+PROJ_HIT.wlp=(pr,tg,np,src)=>{let dmg=pr.dmg||0;if(pr.kind==='bullet')dmg*=falloff(pr.dist||0);const info=tg.e?tg.e.pd:tg.p;if(!info)return;const dtype=tg.door&&info.door?info.door.type:null;
+  const d=dmg*wlMul('bullet',info.tier,dtype);burst(np,WL_COL[wlMat(info.tier,dtype)],pr.kind==='bullet'?7:4,1.6,1.2);sfx(pr.kind==='bullet'?(info.tier==='metal'||dtype==='sheet'?'metalhit':'rockhit'):'arrowhit',.45,np);
+  if(tg.e)wlSendDmg(tg.ow,tg.e,d,tg.door,'bullet');else wlDamageLocal(tg.p,d,{door:tg.door,type:'bullet'})};
+
+/* ---- explosions & fire (every machine applies blasts to the base it owns) ---- */
+function wlBlast(x,y,z,r,dmg,o){o=o||{};if(!S||!pieces.length||!(r>0)||!(dmg>0))return;
+  for(const b of WL.booms)if(S.time-b.t<1&&S.time>=b.t&&dist2(b.x,b.z,x,z)<1.5)return;WL.booms.push({x,z,t:S.time});if(WL.booms.length>12)WL.booms.shift();
+  const k0=o.mul||1;for(const p of [...pieces]){const dd=wlMinDist(p.boxes,x,y,z);if(dd<r)wlDamageLocal(p,dmg*(.3+.7*(1-dd/r))*wlMul('explosive',p.tier)*k0,{type:'explosive',inf:o.inf});
+    if(p.door&&pieces.includes(p)){const bx=p.door.open&&p.door.obox?p.door.obox:p.door.box;const de=wlBoxDist(bx,x,y,z);if(de<r)wlDamageLocal(p,dmg*(.3+.7*(1-de/r))*wlMul('explosive',null,p.door.type)*k0,{door:true,type:'explosive',inf:o.inf})}}}
+if(typeof explode==='function'){const _wlEx=explode;explode=function(pos,radius,dmg){const r=_wlEx.apply(this,arguments);try{if(pos&&S)wlBlast(+pos.x||0,+pos.y||0,+pos.z||0,radius>0?radius:6,dmg>0?dmg:100,{})}catch(e){console.error('walls blast',e)}return r}}
+// Burster blasts only dent pieces: infected damage can never take a piece or door below half health
+if(typeof zmBurstFX==='function'){const _wlZB=zmBurstFX;zmBurstFX=function(x,y,z){const r=_wlZB.apply(this,arguments);try{wlBlast(+x||0,+y||0,+z||0,4.5,48,{inf:true,mul:.35})}catch(e){}return r}}
+if(typeof evBolt==='function'){const _wlEB=evBolt;evBolt=function(m){const r=_wlEB.apply(this,arguments);try{if(m&&isFinite(m.x)&&isFinite(m.z)&&!m.ms){const gy=isFinite(m.g)?m.g:Math.max(groundH(m.x,m.z),0);wlBlast(m.x,m.tr!=null?m.y:gy,m.z,m.tr!=null?5:7,70,{mul:.6})}}catch(e){}return r}}
+function wlFireTick(){const F=typeof IX!=='undefined'&&IX&&IX.fires;if(!F||!F.length||!pieces.length)return;
+  for(const f of F){if(!(f.t<f.life))continue;const r=(f.r||4)*.9;for(const p of [...pieces]){if(Math.abs((p.boxes[0]?p.boxes[0].minx:0)-f.x)>r+6)continue;
+    if(p.tier==='twig'||p.tier==='wood'){if(wlMinDist(p.boxes,f.x,f.y+.4,f.z)<r)wlDamageLocal(p,5*wlMul('fire',p.tier),{type:'fire'})}
+    if(p.door&&pieces.includes(p)&&p.door.type==='wood'&&wlBoxDist(p.door.box,f.x,f.y+.4,f.z)<r)wlDamageLocal(p,5*wlMul('fire',null,'wood'),{door:true,type:'fire'})}}}
+
+/* ---- wrappers: hp on create / upgrade / doors / net data ---- */
+{const _ap=addPiece;addPiece=function(p){const r=_ap.apply(this,arguments);try{if(!(p.hp>=0))p.hp=wlMax(p);else{p.hp=Math.min(p.hp,wlMax(p));p._st=-1;wlVis(p)}}catch(e){}return r}}
+{const _spt=setPieceTier;setPieceTier=function(p,t){const keep=[];const d=p&&p.door;if(d&&d.obj)d.obj.traverse(c=>{if(c.isMesh)keep.push([c,c.material])});const r=_spt.apply(this,arguments);
+  for(const [c,m] of keep)c.material=m;try{if(p){p.hp=wlMax(p);p._st=-1;wlVis(p)}}catch(e){}return r}}
+{const _pd=placeDoor;placeDoor=function(){const r=_pd.apply(this,arguments);try{for(const p of pieces)if(p.door&&!(p.door.hp>=0))p.door.hp=wlDMax(p.door)}catch(e){}return r}}
+{const _mbd=myBuildData;myBuildData=function(){const d=_mbd.apply(this,arguments);try{d.pieces.forEach((q,i)=>{const p=pieces[i];if(!p||!q)return;q.hp=Math.ceil(wlHp(p));if(p.dmgT!==undefined&&S.time-p.dmgT<WL_REPBLOCK)q.rd=1;
+  if(q.door&&p.door){q.door.hp=Math.ceil(wlDHp(p.door));if(p.door.dmgT!==undefined&&S.time-p.door.dmgT<WL_REPBLOCK)q.door.rd=1}})}catch(e){}return d}}
+{const _br=buildRemote;buildRemote=function(owner,d){const r=_br.apply(this,arguments);try{wlRemoteIndex(owner,d)}catch(e){console.error('walls remote',e)}return r}}
+{const _rp=removePeer;removePeer=function(id){if(WL.rov[id]){world.remove(WL.rov[id]);delete WL.rov[id]}delete WL.rb[id];return _rp.apply(this,arguments)}}
+// restore hook for a save module: piece or door object, plain number
+function wallsApplyHp(t,hp){if(!t)return;hp=+hp;if(!isFinite(hp))return;const isDoor=!t.kind&&t.type&&t.box;
+  if(isDoor){t.hp=clamp(hp,1,wlDMax(t));t._st=-1;const p=pieces.find(q=>q.door===t);if(p)wlDoorVis(p);return}t.hp=clamp(hp,1,wlMax(t));t._st=-1;wlVis(t)}
+function wallsMaxHp(t){return t&&!t.kind&&t.type?wlDMax(t):wlMax(t)}
+
+/* ---- hammer: repair / demolish (hold R) / menu ---- */
+function wlIsPiece(a){return !!a&&(a.kind==='piece'||a.kind==='door'||a.kind==='rpiece'||a.kind==='rdoor')&&!!a.e}
+function wlRepCost(info,door){let k,v,max,hp;if(door){const d=info.door;k=d.type==='sheet'?'metal_frag':'wood';v=d.type==='sheet'?150:300;max=WL_DOORHP[d.type]||200;hp=d.hp>=0?d.hp:max}
+  else{const c=Object.entries(TIER[info.tier].cost)[0];k=c[0];v=c[1];max=WL_HP[info.tier];hp=info.hp>=0?info.hp:max}const miss=clamp(1-hp/max,0,1);return{k,n:miss>0?Math.max(1,Math.ceil(v*miss*.5)):0,miss}}
+function wlTargetInfo(a){if(a.kind==='rpiece'||a.kind==='rdoor'){const door=a.kind==='rdoor';const pd=a.e.pd;return{remote:1,door,info:pd,owner:a.owner,e:a.e,hp:wlRHp(a.owner,a.e,door),max:door?(WL_DOORHP[pd.door.type]||200):WL_HP[pd.tier],recent:door?!!(pd.door&&pd.door.rd):!!pd.rd}}
+  const door=a.kind==='door'&&!!a.e.door;const p=a.e;return{remote:0,door,info:p,p,hp:door?wlDHp(p.door):wlHp(p),max:door?wlDMax(p.door):wlMax(p),recent:(door?p.door.dmgT:p.dmgT)!==undefined&&S.time-(door?p.door.dmgT:p.dmgT)<WL_REPBLOCK}}
+function wlRepair(a,silent){const T=wlTargetInfo(a);if(T.hp>=T.max-.01){if(!silent)feedMsg('Not damaged');return false}if(T.recent){feedMsg('Recently damaged — repair blocked for a few seconds');sfx('click');return true}
+  const info=T.remote?Object.assign({},T.info,T.door?{door:Object.assign({},T.info.door,{hp:T.hp})}:{hp:T.hp}):T.info;const c=wlRepCost(info,T.door);
+  if(!T.remote&&!buildPerm(T.p,NET.myId)){feedMsg('No building privilege');return true}if(T.remote&&!buildPerm(T.info,NET.myId,T.owner)){feedMsg('No building privilege');return true}
+  if(c.n&&!has(c.k,c.n)){feedMsg(`Repair needs ${c.n} ${ITEMS[c.k].n}`);return true}if(c.n)pay({[c.k]:c.n});
+  if(T.remote){WL.est[wlRKey(T.owner,T.e,T.door)]={hp:T.max,t:S.time-3.6};wlRoute(T.owner,{k:'wl_rep',id:T.e.pid,dr:T.door?1:0})}
+  else if(T.door){T.p.door.hp=wlDMax(T.p.door);wlDoorVis(T.p);wlDirty()}else{T.p.hp=wlMax(T.p);wlVis(T.p);wlDirty()}
+  sfx('thud',.8,a.point);if(a.point)burst(a.point,CHIP.build,10,2,1.6);startAnim('swing',.5);feedMsg(`Repaired${c.n?` (−${c.n} ${ITEMS[c.k].n})`:''}`);return true}
+function wlDemolishAim(a){const T=wlTargetInfo(a);const pd=T.info;const name=T.door?(pd.door.type==='sheet'?'Sheet Metal Door':'Wooden Door'):`${TIER[pd.tier].n} ${PIECE_N[pd.kind]||'piece'}`;
+  if(T.remote){if(!(pd.tier==='twig'&&!T.door)&&!buildPerm(pd,NET.myId,T.owner)){feedMsg('No building privilege');return}wlRoute(T.owner,{k:'wl_dem',id:T.e.pid,dr:T.door?1:0});feedMsg((T.door?'Picked up ':'Demolished ')+name);return}
+  if(!buildPerm(T.p,NET.myId)){feedMsg('No building privilege');return}const it=wlDemolish(T.p,T.door);if(!T.door)wlSettle(NET.myId||'@me');wlGive(it,null);
+  feedMsg((T.door?'Picked up ':'Demolished ')+name)}
+{const _sec=secondary;secondary=function(){try{if(S&&P&&P.alive&&P.hot[P.sel]==='hammer'){if(WL.hold)return;const a=aim(4);if(wlIsPiece(a)){WL.hold={a,t:0};return}}}catch(e){console.error('walls',e)}return _sec.apply(this,arguments)}}
+addEventListener('mousedown',e=>{if(e.button===2)WL.rDown=true},true);addEventListener('mouseup',e=>{if(e.button===2)WL.rDown=false},true);addEventListener('blur',()=>{WL.rDown=false});
+function wlTap(a){const T=wlTargetInfo(a);if(T.hp<T.max-.01){wlRepair(a);return}if(!T.remote){upPiece=null;openUpgrade(a.e);return}
+  feedMsg(`${(NET.names&&NET.names[T.owner])||'Teammate'}'s ${TIER[T.info.tier].n} ${PIECE_N[T.info.kind]||'piece'} — hold R to ${T.door?'pick up':'demolish'}`)}
+onHook('playerTick',dt=>{const h=WL.hold;if(!h)return;if(P.hot[P.sel]!=='hammer'||!S.active){WL.hold=null;return}const held=WL.rDown||!!keys.r;
+  if(held){h.t+=dt;if(h.t>.25){const a=aim(4);if(!wlIsPiece(a)||a.e!==h.a.e||a.kind!==h.a.kind){WL.hold=null;feedMsg('Demolish cancelled');return}}if(h.t>=WL_HOLD){WL.hold=null;wlDemolishAim(h.a)}return}
+  WL.hold=null;if(h.t<.35)wlTap(h.a)});
+// upgrade menu additions
+function wlUiRepair(){if(!upPiece)return;const door=!!(upPiece.door&&WL.menuDoor);wlRepair({kind:door?'door':'piece',e:upPiece,point:null});if(upPiece&&pieces.includes(upPiece))openUpgrade(upPiece)}
+function wlUiDemolish(door){const p=upPiece;if(!p||!pieces.includes(p))return;const it=wlDemolish(p,!!door);if(!door)wlSettle(NET.myId||'@me');wlGive(it,null);
+  feedMsg(door?'Door picked up':'Demolished '+PIECE_N[p.kind]);if(door&&pieces.includes(p))openUpgrade(p);else closeAll()}
+{const _ou=openUpgrade;openUpgrade=function(p){const r=_ou.apply(this,arguments);try{if(!p||!pieces.includes(p))return r;const a=aim(4);WL.menuDoor=a&&a.kind==='door'&&a.e===p;
+  const hp=wlHp(p),mx=wlMax(p),c=wlRepCost(p,false),ref=wlRefund(p),rk=Object.keys(ref)[0];const recent=p.dmgT!==undefined&&S.time-p.dmgT<WL_REPBLOCK;
+  const bar=(h,m)=>`<div style="height:7px;background:rgba(255,255,255,.12);margin:4px 0 2px"><div style="height:100%;width:${(100*h/m).toFixed(1)}%;background:${h/m>.5?'#7fc06a':h/m>.25?'#e0b040':'#d0503a'}"></div></div>`;
+  let h=`<div class="sec" style="margin-top:14px">Condition</div><div class="kv"><span>This piece</span><div>${Math.ceil(hp)} / ${mx} HP</div></div>${bar(hp,mx)}`;
+  if(p.door){const dh=wlDHp(p.door),dm=wlDMax(p.door);h+=`<div class="kv"><span>Door</span><div>${Math.ceil(dh)} / ${dm} HP</div></div>${bar(dh,dm)}`}
+  h+=`<div class="actions"><button class="btn" ${c.n&&!recent&&has(c.k,c.n)?'':'disabled'} onclick="wlUiRepair()">${recent?'Repair (recently damaged)':c.n?`Repair (${c.n} ${ITEMS[c.k].n})`:'Repair (not damaged)'}</button>`+
+    (p.door?`<button class="btn" onclick="wlUiDemolish(true)">Pick up door</button>`:'')+`<button class="btn red" onclick="wlUiDemolish(false)">Demolish this piece (+${ref[rk]||0} ${rk?ITEMS[rk].n:''})</button></div>`+
+    `<p style="font-size:13px;color:var(--dim);margin-top:8px">With the Hammer: <b>R</b> repairs a damaged piece, <b>hold R</b> demolishes it (50% refund). Pieces resting on a demolished foundation or wall collapse.</p>`;
+  $('#panelBody').insertAdjacentHTML('beforeend',h)}catch(e){console.error('walls menu',e)}return r}}
+
+/* ---- HUD: health bar on look + demolish progress ---- */
+{const st=document.createElement('style');st.textContent=`#wlHp{position:absolute;left:50%;top:calc(50% + 70px);transform:translateX(-50%);min-width:170px;padding:4px 9px 5px;background:rgba(14,14,12,.62);font-size:12px;line-height:1.35;color:#ece6d6;text-align:center;white-space:nowrap}
+#wlHp.hidden{display:none}#wlHp .wb{height:5px;background:rgba(255,255,255,.14);margin-top:3px}#wlHp .wb i{display:block;height:100%;width:0}#wlHp .wh{color:#9fc6e8;font-size:11px;margin-top:2px}`;document.head.appendChild(st);
+  const el=document.createElement('div');el.id='wlHp';el.className='hidden';el.innerHTML='<div class="wn"></div><div class="wb"><i></i></div><div class="wh"></div>';const hud=$('#hud');if(hud&&hud.appendChild)hud.appendChild(el);WL.el=el}
+onHook('hud',()=>{const el=WL.el;if(!el||!el.querySelector)return;if((WL.hudN++)%3)return;let html='';
+  if(P&&P.alive&&S.active&&!anyOpen()){const h=WL.hold;if(h&&h.t>.25){const k=clamp(h.t/WL_HOLD,0,1);html=`d|${(k*100).toFixed(0)}`;
+      if(html!==WL.lastHud){el.querySelector('.wn').textContent=h.a.kind==='door'||h.a.kind==='rdoor'?'Picking up door…':'Demolishing… keep holding';const b=el.querySelector('.wb i');b.style.width=(k*100).toFixed(0)+'%';b.style.background='#e08a3a';el.querySelector('.wh').textContent='release to cancel'}}
+    else{const a=aim(5);if(wlIsPiece(a)){const T=wlTargetInfo(a);const pd=T.info;
+        const name=T.door?(pd.door.type==='sheet'?'Sheet Metal Door':'Wooden Door'):`${TIER[pd.tier].n} ${PIECE_N[pd.kind]||'Piece'}`;const hp=Math.max(0,Math.ceil(T.hp)),f=clamp(T.hp/T.max,0,1);
+        const ham=P.hot[P.sel]==='hammer';const hint=ham?(T.hp<T.max-.01?'R: repair · hold R: ':'hold R: ')+(T.door?'pick up':'demolish'):'';
+        const who=T.remote?((NET.names&&NET.names[T.owner])||'Teammate')+'\'s ':'';html=`p|${who}${name}|${hp}|${T.max}|${hint}`;
+        if(html!==WL.lastHud){el.querySelector('.wn').textContent=`${who}${name} · ${hp} / ${T.max}`;const b=el.querySelector('.wb i');b.style.width=(f*100).toFixed(1)+'%';b.style.background=f>.5?'#7fc06a':f>.25?'#e0b040':'#d0503a';el.querySelector('.wh').textContent=hint}}}}
+  if(html!==WL.lastHud){WL.lastHud=html;el.className=html?'':'hidden'}});
+
+/* ---- ticks / lifecycle ---- */
+onHook('anyTick',dt=>{if(!S)return;
+  for(let i=WL.q.length-1;i>=0;i--){const q=WL.q[i];q.t-=dt;if(q.t>0)continue;WL.q.splice(i,1);const p=q.p;p._doom=0;if(!pieces.includes(p)||wlSupported(p))continue;
+    if(q.ref){const it=wlDemolish(p,false);wlSettle(q.ref);wlGive(it,q.ref)}else wlBreak(p,{})}
+  WL.fireT-=dt;if(WL.fireT<=0){WL.fireT=.5;try{wlFireTick()}catch(e){console.error('walls fire',e)}}});
+onHook('newGame',()=>{WL.q.length=0;WL.rb={};WL.rov={};WL.est={};WL.booms.length=0;WL.hold=null;WL.lastHud='';if(WL.el)WL.el.className='hidden'});
+
+/* ---- info / guide ---- */
+try{INFO.piece.rows=[['Health','Twig 10 · Wood 250 · Stone 500 · Sheet Metal 1000'],['Breaking','Rock or hatchet for twig, axes for wood, explosives for stone and metal'],['Hammer','R repairs · hold R demolishes (50% back)']];
+  INFO.door.rows=[['Health','Wooden 200 · Sheet Metal 250'],['Hammer','Hold R to pick it up']]}catch(e){}
+if(typeof GUIDE!=='undefined'&&Array.isArray(GUIDE)&&!GUIDE.some(g=>g&&g.id==='wlbreak'))GUIDE.push({id:'wlbreak',t:'Breaking, Repairing & Demolishing',h:`<h2>Breaking, Repairing &amp; Demolishing</h2>
+<p>Every building piece and door has health, and the grade decides how much: <b>Twig 10</b>, <b>Wood 250</b>, <b>Stone 500</b>, <b>Sheet Metal 1000</b>. Wooden doors have 200, sheet metal doors 250. Look at a piece to see its health under the crosshair. Cracks show up as it gets weaker.</p>
+<h3>What breaks what</h3><ul><li><b>Twig</b>: a rock or hatchet breaks it in a couple of hits.</li><li><b>Wood</b>: takes a sustained effort with tools (hatchets and axes do the most). Molotov fire burns it.</li><li><b>Stone and sheet metal</b>: melee and bullets barely scratch them. You need explosives such as pipe bombs, fuel canisters or a wrecked vehicle.</li></ul>
+<p>Walls have a soft side. Hits from outside the base do full damage, hits from inside only half.</p>
+<p>The infected can crowd around a closed, locked base and bang on it, but they cannot break in. Even a Burster's blast only dents your walls.</p>
+<h3>Hammer</h3><ul><li><b>R</b> on a damaged piece repairs it for a small cost. You can't repair right after it was hit.</li><li><b>Hold R</b> to demolish a piece or pick up a door. You get about half of the grade's materials back. Anything resting on that piece collapses.</li><li><b>Left click</b> opens the upgrade menu, which now also has Repair, Demolish and Pick up door.</li></ul>
+<p>In co-op every player counts as a teammate: you can repair and demolish each other's pieces. Twig can be demolished by anyone.</p>`});
+
 /* ================= RENDER ================= */
 const tmpC=new THREE.Color(),tmpC2=new THREE.Color();
 const SKY={dayTop:new THREE.Color('#4a82c4'),dayBot:new THREE.Color('#bcd2de'),setTop:new THREE.Color('#3b4f7a'),setBot:new THREE.Color('#e8a26a'),nightTop:new THREE.Color('#03050b'),nightBot:new THREE.Color('#080b12'),
