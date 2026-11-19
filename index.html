@@ -3068,11 +3068,11 @@ function zmSpawnPoint(p,town,poi,rmin,rmax){const isP=p===P,fx=isP?-Math.sin(P.y
     const dx=x-p.x,dz=z-p.z;if(!indoor&&(dx*fx+dz*fz)/d>.35&&d<(ZMS.night?40:115)&&zmLos(p.x,(p.y||0)+1.6,p.z,x,groundH(x,z)+1.5,z))continue;
     return{x,z,y,indoor}}
   return null}
-function zmPopulate(){if(S.time<100)return;const night=ZMS.night,cap=ZMS.low?40:55;let alive=0;for(const zb of zombies)if(!zb.dead)alive++;
+function zmPopulate(){if(S.time<100)return;const night=ZMS.night,cap=Math.round((ZMS.low?40:55)*(typeof savDensity==='function'?Math.max(1,savDensity()):1));let alive=0;for(const zb of zombies)if(!zb.dead)alive++;
   ZMS.wildT-=.5;if(ZMS.wildT<=0){ZMS.wildT=R(50,80);ZMS.wild=RI(3,6)}
   for(const p of ZMS.players){if(p===P?!P.alive:p.dead)continue;let near=0,stalk=0,brutes=0;
     for(const zb of zombies){if(zb.dead||zb.mirror)continue;if(Math.abs(zb.x-p.x)>150||Math.abs(zb.z-p.z)>150)continue;if(zb.kind==='stalker'){if(zb.hunt===p||zb.foe===p)stalk++}else{near++;if(zb.kind==='brute')brutes++}}
-    const town=zmInTown(p.x,p.z,70),poi=town?null:zmPoi(p.x,p.z);let want=town?(night?34:26):poi?(night?12:7):(night?9:ZMS.wild);if(S.time<200)want=Math.min(want,2);
+    const town=zmInTown(p.x,p.z,70),poi=town?null:zmPoi(p.x,p.z);let want=town?(night?34:26):poi?(night?12:7):(night?9:ZMS.wild);want=Math.round(want*(typeof savDensity==='function'?savDensity():1));if(S.time<200)want=Math.min(want,2);
     let spawned=0;
     while(near<want&&alive<cap&&spawned<2){const kind=zmPickKind(town,night,brutes);const pt=zmSpawnPoint(p,town,poi,45,140);if(!pt)break;spawned++;
       const cnt=kind==='shambler'?(town||pt.indoor?RI(1,2):RI(1,3)):1;const grp=++ZMS.grp;
@@ -10264,6 +10264,435 @@ onHook('death',c=>{try{dcStart(c)}catch(e){}});
 onHook('respawn',()=>{DC.on=false;WK.t=0;WK.side=Math.random()<.5?-1:1;FP.nod=FP.nodS=0});
 onHook('newGame',()=>{DC.on=false;WK.t=9;ML=[];FZ.length=0;for(const a of AFL)if(a._f2)a._f2.on=false;AFL.length=0;FP.A=null;FP.nod=FP.nodS=0;FP.cY.fill(0);FP.cZ.fill(0)});
 return{DC,WK,FP,AFL,dbg:()=>({ml:ML.length,afl:AFL.length,dc:DC.on})}})();
+
+/* ================= SAVES, ACCOUNTS AND SERVER BROWSER ================= */
+// Browser-only persistence (localStorage) for worlds ("servers") and characters, plus a server browser that replaces the
+// old Play / Host / Join lobby (the old lobby DOM and functions stay for compatibility).
+// · Account = the player's name (case-insensitive key) + a per-browser random token (localStorage 'rss-acct-token').
+// · World save = seed + settings + time/weather + diffs on top of the seeded generation (NET.gone/mods/spawned, which this
+//   module also records in solo games) + every player's character keyed by account (position, vitals, inventory, hotbar,
+//   gear, blueprints, objective/tips, skills, weapon durability, sleeping bags, dog, and the player's whole base with
+//   tiers, doors, locks, deployables, box/TC contents and trap state). Restore = newGame(seed) then apply the diffs and
+//   rebuild pieces/deployables through the core's own addPiece / placeDep / placeDoor / placeLock.
+// · Extensible: runHook('saveState',world) / runHook('loadState',world) for world data (use world.ext.<key>) and
+//   runHook('saveChar',ch) / runHook('loadChar',ch) for per-player data (use ch.ext.<key>). The vehicle, dog, stray,
+//   town-container, event and skills bits below are implemented through these same hooks.
+// · Multiplayer: the host stores each client's character (clients push 'sv_char' every 25 s and on leave), returns it in the
+//   welcome ('m.sv.ch') when someone joins with a known name, shows offline players' bases as static 'off:<acct>' remote
+//   bases, and hosts a saved world under its stable invite code (fallback to a new code if the id is taken). Clients keep a
+//   local backup per server code + account. Status pings use a PeerJS connection with metadata {ping:1} answered by 'sv_pong'.
+// · Settings: PvP (player hits on avatars, routed through the host), infected density (patch on the infected spawner),
+//   day length (S.dayLen, sent to clients), starter kit for fresh characters.
+// Storage keys: rss-sv-index, rss-sv-w-<id>, rss-sv-last, rss-sv-recent, rss-sv-cb-<CODE>-<acct>, rss-acct-token, rss-name.
+const SAV={cur:null,ready:false,seed:0,lastSave:0,lastPush:0,peerAcct:{},client:null,joinCode:null,cfg:null,pend:[],starting:null,
+  pendWelcome:null,hostTry:0,tab:'mine',pingRes:{},pinged:0,confirmDel:null,renaming:null,form:null,restoring:false};
+const SAV_DEF={pvp:false,dens:'normal',day:'normal',kit:false};
+const SAV_DAY={short:360,normal:600,long:1080};
+const SAV_DENS={low:.5,normal:1,high:1.6};
+const SAVK={idx:'rss-sv-index',w:'rss-sv-w-',last:'rss-sv-last',recent:'rss-sv-recent',tok:'rss-acct-token',name:'rss-name',cb:'rss-sv-cb-'};
+const SAV_PK=['x','y','z','yaw','pitch','hp','cal','hyd','rad','poison','bleed','regen','temp','wet','oxy','comfort','mag','sel','stam','alive'];
+const SAV_SW=['time','dayLen','raining','rain','rainT','nextDrop','active','started','plan','dplan','queue','feed','kfeed','noise','lootbags','bags','tc','lastSeenByNpc','piece','moved'];
+const SAV_KIT={stone_hatchet:1,stone_pickaxe:1,spear:1,building_plan:1,hammer:1,sleeping_bag:1,bandage:3,cooked_meat:4,wood:300,stone:150,cloth:20};
+function savDensity(){return SAV_DENS[(SAV.cfg||SAV_DEF).dens]||1}
+function savCfg(){return Object.assign({},SAV_DEF,SAV.cfg||{})}
+const savEsc=s=>String(s==null?'':s).replace(/[<>&"']/g,c=>'&#'+c.charCodeAt(0)+';');
+
+/* ---- storage ---- */
+function savGet(k){try{return localStorage.getItem(k)}catch(e){return null}}
+function savJSON(k,d){try{const v=JSON.parse(savGet(k)||'null');return v==null?d:v}catch(e){return d}}
+function savSetRaw(k,v){try{localStorage.setItem(k,v);return true}catch(e){return e||new Error('storage error')}}
+function savDel(k){try{localStorage.removeItem(k)}catch(e){}}
+const savIsQuota=e=>!!e&&e!==true&&(e.name==='QuotaExceededError'||e.name==='NS_ERROR_DOM_QUOTA_REACHED'||e.code===22||e.code===1014);
+function savPurge(keep){const ks=[];try{for(let i=0;i<localStorage.length;i++){const k=localStorage.key(i);if(k&&k.indexOf(SAVK.cb)===0&&k!==keep)ks.push(k)}}catch(e){}ks.forEach(savDel);return ks.length}
+function savWrite(k,str){let r=savSetRaw(k,str);if(r===true)return true;if(savIsQuota(r)&&savPurge(k)){r=savSetRaw(k,str);if(r===true)return true}return r}
+const savRound=(k,v)=>typeof v==='number'?(Number.isInteger(v)?v:(isFinite(v)?Math.round(v*100)/100:0)):v;
+
+/* ---- account ---- */
+function savToken(){let t=savGet(SAVK.tok);if(t&&t.length>=8)return t;t='';const c='abcdefghijklmnopqrstuvwxyz0123456789';
+  try{const a=new Uint8Array(16);if(typeof crypto!=='undefined'&&crypto.getRandomValues)crypto.getRandomValues(a);else for(let i=0;i<16;i++)a[i]=Math.random()*256;for(const b of a)t+=c[b%36]}catch(e){t=Math.random().toString(36).slice(2)+Math.random().toString(36).slice(2)}
+  savSetRaw(SAVK.tok,t);return t}
+const savKey=n=>String(n||'').trim().toLowerCase().slice(0,16)||'survivor';
+function savName(){const el=$('#savName');let n=String(el&&el.value||'').trim();if(!n){const l=$('#lName');n=String(l&&l.value||'').trim()}if(!n)n=String(savGet(SAVK.name)||'').trim();return(n||'Survivor').slice(0,16)}
+function savSetName(n){n=String(n||'').trim().slice(0,16);if(!n)return;savSetRaw(SAVK.name,n);const a=$('#savName'),b=$('#lName');if(a&&a.value!==n)a.value=n;if(b)b.value=n}
+function savMe(){return savKey(NET.name||savName())}
+
+/* ---- world index ---- */
+function savIndex(){const a=savJSON(SAVK.idx,[]);return Array.isArray(a)?a.filter(m=>m&&m.id):[]}
+function savLoad(id){const w=savJSON(SAVK.w+id,null);return w&&typeof w==='object'&&isFinite(w.seed)?w:null}
+const savNewId=()=>'w'+Date.now().toString(36)+Math.random().toString(36).slice(2,6);
+const savNewCode=()=>(Math.random().toString(36).slice(2,8)+'QX7K2M').slice(0,6).toUpperCase();
+function savDay(w){return w&&w.time!=null?Math.floor(w.time/(w.dayLen||600))+1:1}
+function savStore(w){const str=JSON.stringify(w,savRound);const r=savWrite(SAVK.w+w.id,str);if(r!==true)return r;
+  const idx=savIndex().filter(m=>m.id!==w.id);idx.push({id:w.id,name:w.name,created:w.created,last:w.last||0,day:savDay(w),players:Object.keys(w.chars||{}).length,size:str.length,cfg:w.cfg,code:w.code});
+  idx.sort((a,b)=>(b.last||b.created||0)-(a.last||a.created||0));const r2=savWrite(SAVK.idx,JSON.stringify(idx));return r2===true?true:r2}
+function savDefName(){const base=savName().replace(/s$/i,'')+'\'s Island';const used=new Set(savIndex().map(m=>m.name));if(!used.has(base))return base;for(let i=2;i<99;i++)if(!used.has(base+' '+i))return base+' '+i;return base}
+function savCreate(o){o=o||{};const cfg=Object.assign({},SAV_DEF,o.cfg||{});
+  const w={v:1,id:savNewId(),name:String(o.name||'').trim().slice(0,40)||savDefName(),seed:o.seed||(((Math.random()*2**31)|0)||7),created:Date.now(),last:0,cfg,dayLen:SAV_DAY[cfg.day]||600,
+    code:o.code||savNewCode(),owner:savKey(savName()),time:null,chars:{},ext:{}};
+  const r=savStore(w);return r===true?w:r}
+function savRecent(){const a=savJSON(SAVK.recent,[]);return(Array.isArray(a)?a:[]).filter(r=>r&&r.code).sort((a,b)=>(b.last||0)-(a.last||0)).slice(0,12)}
+function savRecentPut(o){const a=savRecent().filter(r=>r.code!==o.code);a.unshift(o);savWrite(SAVK.recent,JSON.stringify(a.slice(0,12)))}
+
+/* ---- plain-data helpers ---- */
+function savPlain(v,d){if(v===null||v===undefined)return true;const t=typeof v;if(t==='number'||t==='string'||t==='boolean')return true;if(t!=='object'||d>3)return false;
+  if(Array.isArray(v)){if(v.length>500)return false;for(const x of v)if(!savPlain(x,d+1))return false;return true}
+  const pr=Object.getPrototypeOf(v);if(pr!==Object.prototype&&pr!==null)return false;const ks=Object.keys(v);if(ks.length>500)return false;for(const k of ks)if(!savPlain(v[k],d+1))return false;return true}
+function savPrims(o,skip){const r={};for(const k in o){if(skip&&skip.indexOf(k)>=0)continue;const v=o[k];if(v===null||typeof v==='number'||typeof v==='string'||typeof v==='boolean')r[k]=v}return r}
+function savCleanInv(o){const r={};if(o&&typeof o==='object')for(const k in o){const n=Math.floor(+o[k]);if(ITEMS[k]&&n>0&&isFinite(n))r[k]=n}return r}
+const savClone=v=>JSON.parse(JSON.stringify(v));
+
+/* ---- quiet mode: no tips/feed/sounds/objective popups while rebuilding a save ---- */
+function savQuiet(fn){const keep={tip,feedMsg,sfx,checkObjective,killfeed},ex={},nop=()=>{};tip=nop;feedMsg=nop;sfx=nop;checkObjective=nop;killfeed=nop;
+  if(typeof gainXP==='function'){ex.gainXP=gainXP;gainXP=()=>0}if(typeof dogToast==='function'){ex.dogToast=dogToast;dogToast=nop}const wasR=SAV.restoring;SAV.restoring=true;
+  try{return fn()}finally{tip=keep.tip;feedMsg=keep.feedMsg;sfx=keep.sfx;checkObjective=keep.checkObjective;killfeed=keep.killfeed;if(ex.gainXP)gainXP=ex.gainXP;if(ex.dogToast)dogToast=ex.dogToast;SAV.restoring=wasR}}
+
+/* ---- solo bookkeeping of world changes (the core only tracks them while hosting) ---- */
+function savPendAdd(e){if(!e||!S||SAV.restoring)return;if(e.t==='crate'||(typeof respawnDelay==='function'&&respawnDelay(e.t))){SAV.pend.push({t:e.t,x:+(+e.x).toFixed(1),z:+(+e.z).toFixed(1)});if(SAV.pend.length>80)SAV.pend.shift()}}
+function savPendTake(e){if(!e)return;const i=SAV.pend.findIndex(p=>p.t===e.t&&(e.t!=='crate'||dist2(p.x,p.z,e.x,e.z)<2));if(i>=0)SAV.pend.splice(i,1)}
+{const _g=netGone;netGone=function(e,how){if(e&&e.id!==undefined&&S&&NET.role!=='client'){savPendAdd(e);if(!NET.role){NET.gone[e.id]=1;delete NET.mods[e.id]}}return _g.apply(this,arguments)}}
+{const _e=netEnt;netEnt=function(e){if(e&&e.id!==undefined&&!NET.role&&S)NET.mods[e.id]={k:'ent',id:e.id,amt:e.amt,hp:e.hp};return _e.apply(this,arguments)}}
+{const _s=netSpawned;netSpawned=function(e){if(e&&S&&NET.role!=='client'){savPendTake(e);if(!NET.role)NET.spawned[e.id]={k:'spawn',id:e.id,t:e.t,x:e.x,z:e.z,kind:e.kind,s:e.s,sy:e.sy,rot:e.rot}}return _s.apply(this,arguments)}}
+{const _a=applyGone;applyGone=function(m,anim){if(NET.role==='host'&&m&&!SAV.restoring)savPendAdd(findEnt(m.id));return _a.apply(this,arguments)}}
+onHook('newGame',seed=>{SAV.seed=seed||0;NET.mods={};NET.gone={};NET.spawned={};SAV.pend=[];if(NET.role!=='client')NET.builds={}});
+
+/* ---- capture ---- */
+function savBaseState(){return{baseY:S.baseY,pieces:pieces.map(p=>{const q=savPrims(p,['obj']);if(p.door)q.door=savPrims(p.door);return q}),
+  deps:deps.map(d=>{const q=savPrims(d,['solid']);q.r=d.obj?+d.obj.rotation.y||0:0;q.store=savCleanInv(d.store);
+    if(d.tr&&typeof d.tr==='object'){const t={};for(const k of['hp','max','charge','fuel','on','kills','broken'])if(d.tr[k]!==undefined)t[k]=d.tr[k];q.tr=t}return q})}}
+function savCharState(){const p={};for(const k of SAV_PK)if(P[k]!==undefined&&typeof P[k]!=='object')p[k]=P[k];
+  const inv=savCleanInv(P.inv);for(const q of S.queue||[])for(const [k,v] of Object.entries(q.cost||{}))if(ITEMS[k])inv[k]=(inv[k]||0)+v*(q.left||0); // queued crafts are refunded
+  const s={};for(const k in S){if(SAV_SW.indexOf(k)>=0)continue;const v=S[k];if(v===undefined||typeof v==='function')continue;if(v===null||typeof v!=='object'){s[k]=v;continue}
+    if(savPlain(v,0)){const j=JSON.stringify(v);if(j&&j.length<30000)s[k]=JSON.parse(j)}}
+  const ch={v:1,name:NET.name||savName(),tok:savToken(),t:Date.now(),seed:NET.seed||SAV.seed,p,inv,hot:P.hot.slice(0,6),gear:Object.assign({},P.gear),
+    ixDur:P.ixDur&&savPlain(P.ixDur,0)?savClone(P.ixDur):null,s,
+    bags:S.bags.map(b=>({x:b.x,y:b.y,z:b.z,r:b.obj?+b.obj.rotation.y||0:0,name:b.name,ready:b.ready||0})),base:savBaseState(),ext:{}};
+  runHook('saveChar',ch);return ch}
+function savCollect(){const w=SAV.cur;w.v=1;w.last=Date.now();w.time=S.time;w.dayLen=S.dayLen;
+  w.wx={raining:!!S.raining,rain:S.rain||0,rainT:S.rainT,nextDrop:S.nextDrop};
+  const gone=new Set(Object.keys(NET.gone));const sp=Object.values(NET.spawned).filter(m=>!gone.delete(String(m.id))); // spawned-then-gone cancels out
+  w.diff={gone:[...gone].map(k=>isNaN(+k)?k:+k),mods:Object.values(NET.mods).filter(m=>m&&!NET.gone[m.id]).map(m=>[m.id,m.amt==null?null:m.amt,m.hp==null?null:m.hp]),spawned:sp,
+    nextId:NET.nextId,bagN:NET.bagN,pend:SAV.pend.slice(-80),loot:S.lootbags.filter(b=>b&&b.inv).map(b=>[b.id||0,b.x,b.z,b.inv,b.ttl,b.hadKey?1:0])};
+  w.chars=w.chars||{};const me=savMe();if(w.owner&&w.owner!==me&&w.chars[w.owner]&&w.ownerMoved===me)delete w.chars[w.owner];w.chars[me]=savCharState();if(!w.owner||w.ownerMoved===me){w.owner=me;delete w.ownerMoved}
+  w.ext={};runHook('saveState',w);return w}
+function savEnsureCur(){if(SAV.cur||NET.role==='client'||SAV.clientGame||!SAV.seed)return;const w=savCreate({seed:SAV.seed,code:NET.code||undefined,name:savDefName()});if(w&&w.id){SAV.cur=w;if(!NET.role)savSetRaw(SAVK.last,w.id)}}
+function savSaveNow(reason){if(!S||!P||!SAV.ready)return false;
+  if(NET.role==='client'){savClientPush();if(reason==='manual')savToast('Character saved · sent to the host');return true}
+  if(SAV.clientGame)return false; // a game joined as a client that has since disconnected: never turn it into a local world
+  savEnsureCur();if(!SAV.cur)return false;let r;try{savCollect();r=savStore(SAV.cur)}catch(e){console.error('saves: save failed',e);r=e}SAV.lastSave=performance.now();
+  if(r===true){if(reason==='manual'||reason==='auto'||reason==='pause'||reason==='menu')savToast(reason==='auto'?'Autosaved':'Saved');return true}
+  savToast(savIsQuota(r)?'Save failed: browser storage is full. Export or delete old servers.':'Save failed: '+((r&&r.message)||r),true);return false}
+
+/* ---- restore ---- */
+let SAV_DEPID=null;
+function savDepItem(t){if(!SAV_DEPID){SAV_DEPID={};for(const k in ITEMS){const d=ITEMS[k].dep;if(d&&!SAV_DEPID[d])SAV_DEPID[d]=k}}return SAV_DEPID[t]}
+function savPlaceDep(type,x,y,z,ry){const id=savDepItem(type);if(!id||!isFinite(x)||!isFinite(z))return null;const _pd=planDep,yaw=P.yaw,n=deps.length,nb=S.bags.length;
+  planDep=()=>({ok:true,point:new V3(x,isFinite(y)?y:groundH(x,z),z),onF:true});P.yaw=ry||0;P.inv[id]=(P.inv[id]||0)+1;
+  try{placeDep(id)}catch(e){console.error('saves: placeDep '+type,e)}finally{planDep=_pd;P.yaw=yaw}
+  if(type==='bag')return S.bags.length>nb?S.bags[S.bags.length-1]:null;return deps.length>n?deps[deps.length-1]:null}
+function savRestoreBase(b){if(!b||typeof b!=='object')return;const ps=Array.isArray(b.pieces)?b.pieces:[];if(b.baseY!=null&&isFinite(b.baseY))S.baseY=+b.baseY;
+  const doors=[];const ord={foundation:0,wall:1,doorway:1,roof:2};
+  if(S.baseY!=null)for(const q of ps.filter(q=>q&&ord[q.kind]!==undefined).sort((a,c)=>ord[a.kind]-ord[c.kind])){const p=Object.assign({},q);delete p.door;if(!TIER[p.tier])p.tier='twig';
+    if(p.kind==='foundation'){if(!isFinite(p.gx)||!isFinite(p.gz)||cells.has(ck(p.gx,p.gz)))continue;if(!isFinite(p.min))p.min=S.baseY-1;cells.set(ck(p.gx,p.gz),p)}
+    else if(p.kind==='roof'){if(!isFinite(p.gx)||!isFinite(p.gz)||roofs.has(ck(p.gx,p.gz)))continue;roofs.set(ck(p.gx,p.gz),p)}
+    else{if(typeof p.key!=='string'||edges.has(p.key))continue;edges.set(p.key,p)}
+    try{addPiece(p)}catch(e){console.error('saves: addPiece',e);continue}if(isFinite(q.hp)&&typeof wallsApplyHp==='function')try{wallsApplyHp(p,+q.hp)}catch(e){}if(p.kind==='doorway'&&q.door&&q.door.type)doors.push([p,q.door])}
+  const _aim=aim;
+  for(const [p,dd] of doors){const did=dd.type==='sheet'?'sheet_door':'wooden_door';if(!ITEMS[did])continue;
+    try{aim=()=>({kind:'piece',e:p});P.inv[did]=(P.inv[did]||0)+1;placeDoor(did);
+      if(p.door&&dd.lock){const lid=dd.lock==='code'?'code_lock':'key_lock';if(ITEMS[lid]){aim=()=>({kind:'door',e:p});P.inv[lid]=(P.inv[lid]||0)+1;placeLock(lid)}}if(p.door&&isFinite(dd.hp)&&typeof wallsApplyHp==='function')wallsApplyHp(p.door,+dd.hp)}catch(e){console.error('saves: door',e)}finally{aim=_aim}
+    if(p.door){for(const k in dd)if(['type','open','lock'].indexOf(k)<0)p.door[k]=dd[k];if(dd.open){p.door.open=true;p.door.obj.rotation.y=p.key[0]==='x'?-Math.PI/2:Math.PI/2}}}
+  rebuildBoxes();
+  for(const d of Array.isArray(b.deps)?b.deps:[]){if(!d||d.type==='bag')continue;const nd=savPlaceDep(d.type,+d.x,+d.y,+d.z,+d.r||0);if(!nd)continue;nd.store=savCleanInv(d.store);
+    for(const k in d)if(['type','x','y','z','r','store','tr','solid'].indexOf(k)<0&&(d[k]===null||typeof d[k]!=='object'))nd[k]=d[k];
+    if(d.tr&&nd.tr&&typeof nd.tr==='object')for(const k in d.tr)nd.tr[k]=d.tr[k]}
+  rebuildBoxes()}
+function savApplyChar(ch){if(!ch||typeof ch!=='object')return false;
+  savQuiet(()=>{
+    if(ch.s&&typeof ch.s==='object')for(const k in ch.s)if(SAV_SW.indexOf(k)<0)S[k]=ch.s[k];
+    try{savRestoreBase(ch.base)}catch(e){console.error('saves: base restore',e)}
+    for(const b of Array.isArray(ch.bags)?ch.bags:[]){const nb=savPlaceDep('bag',+b.x,+b.y,+b.z,+b.r||0);if(nb){if(b.name)nb.name=String(b.name).slice(0,24);nb.ready=+b.ready||0}}
+    const p=ch.p||{};for(const k of SAV_PK)if(k!=='alive'&&(typeof p[k]==='number'||typeof p[k]==='boolean'))P[k]=p[k];
+    P.inv=savCleanInv(ch.inv);P.hot=(Array.isArray(ch.hot)?ch.hot:[]).slice(0,6).map(id=>id&&ITEMS[id]?id:null);while(P.hot.length<6)P.hot.push(null);
+    P.gear={head:null,chest:null,legs:null};for(const sl in P.gear){const id=ch.gear&&ch.gear[sl];if(id&&ITEMS[id])P.gear[sl]=id}
+    if(ch.ixDur&&typeof ch.ixDur==='object')P.ixDur=ch.ixDur;
+    P.sel=clamp(P.sel|0,0,5);P.vx=P.vz=P.vy=0;P.anim=null;P.pending=null;P.cd=0;
+    if(p.alive===false||!(P.hp>0)||!isFinite(P.x)||!isFinite(P.z)){const sp=beachSpawn();P.x=sp.x;P.z=sp.z;P.y=groundH(sp.x,sp.z);P.hp=60;P.cal=Math.max(P.cal||0,140);P.hyd=Math.max(P.hyd||0,100);P.bleed=0;P.poison=0;P.rad=0}
+    else{P.x=clamp(P.x,6,WS-6);P.z=clamp(P.z,6,WS-6);const y=isFinite(P.y)?P.y:groundH(P.x,P.z);P.y=Math.max(y,supportH(P.x,P.z,y+.3))}
+    P.alive=true;P.onGround=true;P.airPeak=P.y;
+    runHook('loadChar',ch)});
+  updateHotbar();renderObjective();return true}
+function savGiveKit(){savQuiet(()=>{for(const [k,n] of Object.entries(SAV_KIT))if(ITEMS[k])gain(k,n,true)});updateHotbar();feedMsg('Starter kit added to your inventory')}
+function savPlaceholder(acct){const w=SAV.cur;const ch=w&&w.chars&&w.chars[acct];const b=ch&&ch.base;if(!b||!((b.pieces||[]).length||(b.deps||[]).length))return;const id='off:'+acct;
+  try{buildRemote(id,b)}catch(e){console.error('saves: offline base',e);return}if(NET.role==='host'){NET.builds[id]=b;for(const c of Object.values(NET.conns))if(c&&c.open)try{c.send({k:'build',from:id,d:b})}catch(e){}}}
+function savDropPlaceholder(acct,exceptPeer){const id='off:'+acct;delete NET.builds[id];const rb=remoteBases[id];if(rb){world.remove(rb.g);delete remoteBases[id];rebuildBoxes()}
+  if(NET.role==='host')for(const [pid,c] of Object.entries(NET.conns))if(pid!==exceptPeer&&c&&c.open)try{c.send({k:'left',id,from:NET.myId})}catch(e){}}
+function savRestoreWorld(w){const me=savMe();
+  savQuiet(()=>{S.dayLen=w.dayLen||SAV_DAY[(w.cfg||{}).day]||600;if(w.time!=null&&isFinite(w.time))S.time=+w.time;
+    if(w.wx){S.raining=!!w.wx.raining;S.rain=+w.wx.rain||0;if(isFinite(w.wx.rainT))S.rainT=+w.wx.rainT;if(isFinite(w.wx.nextDrop))S.nextDrop=+w.wx.nextDrop}
+    const D=w.diff||{};let maxId=0;const role=NET.role;
+    for(const sp of D.spawned||[]){if(!sp||sp.id===undefined)continue;try{if(!findEnt(sp.id))spawnFromMsg(sp)}catch(e){continue}NET.spawned[sp.id]=sp;if(+sp.id>maxId)maxId=+sp.id}
+    NET.role=null;try{for(const id of D.gone||[]){applyGone({id,how:'fell'},false);NET.gone[id]=1}}finally{NET.role=role} // role cleared: no host respawn scheduling for restored removals
+    for(const m of D.mods||[]){if(!Array.isArray(m))continue;const md={k:'ent',id:m[0],amt:m[1],hp:m[2]};applyEnt(md);NET.mods[m[0]]=md}
+    NET.nextId=Math.max(NET.nextId,+D.nextId||0,maxId+1);if(isFinite(D.bagN))NET.bagN=Math.max(NET.bagN,+D.bagN);
+    SAV.pend=(D.pend||[]).filter(p=>p&&p.t).slice(-80);
+    for(const p of SAV.pend.slice()){if(p.t==='crate')setTimeout(()=>{if(S&&SAV.cur===w)netSpawned(spawnCrate(p.x,p.z))},R(20,60)*1000);else if(typeof respawnDelay==='function'&&respawnDelay(p.t))respawnLater(p.t,R(15,45))}
+    for(const l of D.loot||[]){if(!Array.isArray(l)||!l[3])continue;try{const b=makeBag(l[0]||((NET.myId||'l')+':'+(NET.bagN++)),+l[1],+l[2],l[3],false);if(b){b.ttl=+l[4]||300;b.hadKey=!!l[5]}}catch(e){}}
+    try{runHook('loadState',w)}catch(e){console.error('saves: loadState',e)}});
+  w.chars=w.chars||{};let ch=w.chars[me];if(!ch&&w.owner&&w.owner!==me&&w.chars[w.owner]){ch=w.chars[w.owner];w.ownerMoved=me} // owner renamed their account
+  if(ch){savApplyChar(ch);savToast('Welcome back · Day '+(Math.floor(S.time/S.dayLen)+1))}else if((w.cfg||{}).kit)savGiveKit();
+  for(const acct of Object.keys(w.chars))if(acct!==me&&acct!==(w.ownerMoved===me?w.owner:''))savPlaceholder(acct);
+  if(w.time==null&&!w.owner)w.owner=me}
+
+/* ---- module-specific state through the hooks ---- */
+onHook('saveState',w=>{
+  if(typeof WX!=='undefined'&&WX&&Array.isArray(WX.conts))w.ext.wx={s:WX.conts.filter(e=>e&&e.searched).map(e=>e.id),g:(WX.gas||[]).filter(e=>e&&e.dead).map(e=>e.id),rf:WX.refill?[...WX.refill]:[],gr:WX.gasResp?[...WX.gasResp]:[]};
+  if(typeof vehicles!=='undefined'&&Array.isArray(vehicles))w.ext.veh=vehicles.map(v=>({id:v.id,x:v.x,y:v.y,z:v.z,yaw:v.yaw,hp:v.hp,fuel:v.fuel,dead:v.dead?1:0,salv:v.salv?1:0}));
+  if(typeof dogStrays!=='undefined'&&Array.isArray(dogStrays))w.ext.strays={n:typeof DOG!=='undefined'?DOG.srN|0:0,l:dogStrays.map(s=>({id:s.id,x:s.x,z:s.z,coat:s.coat,sc:s.sc,voice:s.voice,name:s.name||'',hx:s.home?s.home.x:s.x,hz:s.home?s.home.z:s.z}))};
+  if(typeof EV!=='undefined'&&EV){const e={};for(const k of['storm','stormRoll','rainN','crashDay','crashAt','crashN','cacheN'])e[k]=EV[k];w.ext.ev=e}});
+onHook('loadState',w=>{const x=w.ext||{};
+  if(x.wx&&typeof WX!=='undefined'&&WX){try{if(typeof applyState==='function')applyState({s:x.wx.s||[],g:x.wx.g||[]});for(const [id,t] of x.wx.rf||[])if(WX.refill)WX.refill.set(id,t);for(const [id,t] of x.wx.gr||[])if(WX.gasResp)WX.gasResp.set(id,t)}catch(e){console.error('saves: town state',e)}}
+  if(Array.isArray(x.veh)&&typeof vhById==='function')for(const o of x.veh){const v=vhById(o.id);if(!v)continue;try{
+    if(o.dead){if(!v.dead)vhBlowUp(v,false,true);v.salv=!!o.salv}else{vhResetLocal(v,[+o.x,+o.y,+o.z,+o.yaw||0,clamp(+o.fuel||0,0,100)]);v.hp=clamp(+o.hp||1,1,v.K.hp)}}catch(e){console.error('saves: vehicle',e)}}
+  if(x.strays&&Array.isArray(x.strays.l)&&typeof dogStrayAdd==='function'&&NET.role!=='client'){try{for(const s of dogStrays.slice())dogStrayRemove(s);for(const o of x.strays.l)if(o&&isFinite(o.x)&&isFinite(o.z))dogStrayAdd(o);DOG.srN=Math.max(DOG.srN|0,x.strays.n|0)}catch(e){console.error('saves: strays',e)}}
+  if(x.ev&&typeof EV!=='undefined'&&EV){for(const k of['stormRoll','rainN','crashDay','crashAt','crashN','cacheN'])if(x.ev[k]!==undefined)EV[k]=x.ev[k];if(x.ev.storm&&typeof evSetStorm==='function')try{evSetStorm(true,true)}catch(e){}}});
+onHook('saveChar',ch=>{
+  if(typeof sklS==='function'){const s=sklS();if(s)ch.ext.skl={xp:Object.assign({},s.xp),lv:Object.assign({},s.lv),perks:Object.assign({},s.perks)}}
+  if(typeof DOG!=='undefined'&&DOG&&DOG.mine&&DOG.mine.state!=='runoff'){const d=DOG.mine;ch.ext.dog={coat:d.coat,sc:d.sc,voice:d.voice,name:d.name,x:d.x,y:d.y,z:d.z,yaw:d.yaw,hp:d.hp,mode:d.mode,stayX:d.stayX,stayZ:d.stayZ,hx:d.home?d.home.x:d.x,hz:d.home?d.home.z:d.z,down:d.state==='downed'||d.dead?1:0}}});
+onHook('loadChar',ch=>{const x=ch.ext||{};
+  if(x.skl&&typeof sklS==='function'){const s=sklS();if(s){for(const t of['xp','lv','perks'])if(x.skl[t]&&typeof x.skl[t]==='object')s[t]=Object.assign(t==='perks'?{}:s[t],x.skl[t]);s.dirty=true;if(typeof sklUI!=='undefined'&&sklUI)sklUI.panelDirty=true}}
+  if(x.dog&&typeof dogMakeMine==='function'){try{const o=x.dog;const near=dist2(o.x,o.z,P.x,P.z)<40&&o.mode!=='stay';const dx=near?P.x+1.2:+o.x,dz=near?P.z+1.2:+o.z;
+    const d=dogMakeMine({coat:o.coat|0,sc:+o.sc||1,voice:+o.voice||1,name:o.name,x:dx,y:groundH(dx,dz),z:dz,yaw:+o.yaw||0,home:{x:+o.hx||dx,z:+o.hz||dz}});
+    if(d){d.hp=o.down?45:clamp(+o.hp||100,10,d.maxHp||100);if(o.mode==='stay'&&isFinite(o.stayX)){d.mode='stay';d.stayX=+o.stayX;d.stayZ=+o.stayZ}}}catch(e){console.error('saves: dog',e)}}});
+
+/* ---- start flow ---- */
+{const _sg=startGame;startGame=function(seed,cb){const fresh=seed!==undefined||!S;if(seed===undefined&&!S)seed=(((Math.random()*2**31)|0)||1);
+  if(fresh){SAV.ready=false;SAV.clientGame=NET.role==='client';if(SAV.starting===null&&NET.role!=='client'){SAV.cur=null;SAV.cfg=null}const o=$('#savOv');if(o)o.classList.add('hidden')}
+  return _sg.call(this,seed,()=>{try{if(cb)cb()}catch(e){console.error('saves: start callback',e)}
+    if(fresh){if(NET.role==='client'&&SAV.pendWelcome){const pw=SAV.pendWelcome;SAV.pendWelcome=null;try{savClientRestore(pw)}catch(e){console.error('saves: client restore',e)}}
+      SAV.starting=null;SAV.ready=true;SAV.lastSave=performance.now();SAV.lastPush=performance.now()-17000;try{renderPauseNet()}catch(e){}}})}}
+function savStart(w,mode,oldCode){if(SAV.ready&&S&&NET.role!=='client'&&SAV.cur&&SAV.cur.id!==w.id)savSaveNow('switch');
+  SAV.cur=w;SAV.client=null;SAV.pendWelcome=null;SAV.cfg=Object.assign({},SAV_DEF,w.cfg||{});SAV.starting=w.id;SAV.peerAcct={};if(!NET.role)NET.name=savName();savSetRaw(SAVK.last,w.id);
+  const o=$('#savOv');if(o)o.classList.add('hidden');$('#lobby').classList.add('hidden');
+  startGame(w.seed,()=>{savRestoreWorld(w);
+    if(mode==='host')tip('mphost','You are hosting '+savEsc(w.name),'Your browser runs this server — keep the tab open. Invite code <b>'+savEsc(NET.code)+'</b> (link on the pause screen). Friends who join with the same name get their character back. Press <b>Enter</b> to chat.',true);
+    if(oldCode)setTimeout(()=>tip('codechg','New invite code','This server\'s usual code <b>'+savEsc(oldCode)+'</b> was still taken, so it now uses <b>'+savEsc(NET.code)+'</b>. Send your friends the new link — it is kept for next time.',true),4000);
+    SAV.ready=true;savSaveNow('start')})}
+function savNetReset(){const strip=o=>{try{if(o&&o.removeAllListeners)o.removeAllListeners()}catch(e){}};
+  strip(NET.host);for(const c of Object.values(NET.conns))strip(c);if(NET.peer){strip(NET.peer);try{NET.peer.destroy()}catch(e){}}
+  NET.peer=null;NET.role=null;NET.host=null;NET.myId=null;NET.code=null;for(const k in NET.conns)delete NET.conns[k];for(const k in NET.names)delete NET.names[k];for(const k in remotes)delete remotes[k];NET.builds={};SAV.peerAcct={};
+  const ni=$('#netinfo');if(ni)ni.textContent=''}
+function savPlay(id){const w=savLoad(id);if(!w){savStatus('<span class="warn">That save could not be read.</span>');return}
+  if(S&&SAV.ready&&SAV.cur&&SAV.cur.id===id&&NET.role!=='client'){const o=$('#savOv');if(o)o.classList.add('hidden');startGame();return} // same world still in memory: resume
+  savSetName(savName());savNetReset();savStart(w,'solo')}
+function savContinue(){const ix=savIndex();const id=savGet(SAVK.last);const m=ix.find(x=>x.id===id)||ix[0];if(m)savPlay(m.id);else savQuickNew()}
+function savQuickNew(cfg,name){savSetName(savName());const w=savCreate({name,cfg});if(!w||!w.id){savToast(savIsQuota(w)?'Not enough browser storage for a new world. Delete or export old servers.':'Could not create the world.',true);return null}savNetReset();savStart(w,'solo');return w}
+
+/* ---- hosting with a stable invite code ---- */
+function savOnConn(conn){
+  if(conn.metadata&&conn.metadata.ping){conn.on('open',()=>{try{conn.send({k:'sv_pong',name:SAV.cur?SAV.cur.name:'',host:NET.name,players:1+Object.keys(NET.conns).length,day:S?Math.floor(S.time/S.dayLen)+1:1})}catch(e){}setTimeout(()=>{try{conn.close()}catch(e){}},1500)});return}
+  conn.on('open',()=>{NET.conns[conn.peer]=conn});
+  conn.on('data',m=>{if((!S||!SAV.ready)&&m&&m.k==='hello'){conn.send({k:'wait'});return}onMsg(m,conn)});
+  conn.on('close',()=>{const acct=SAV.peerAcct[conn.peer];removePeer(conn.peer);netBroadcast({k:'left',id:conn.peer});delete SAV.peerAcct[conn.peer];
+    if(acct&&SAV.cur&&!Object.values(SAV.peerAcct).includes(acct))savPlaceholder(acct)})}
+function savHost(id){if(SAV.cur&&S&&SAV.ready&&NET.role!=='client'&&!SAV.clientGame)savSaveNow('switch');SAV.ready=false;const w=savLoad(id); // (the running world is saved before the network state changes)
+if(!w){savStatus('<span class="warn">That save could not be read.</span>');return}
+  const nm=savName();savSetName(nm);savNetReset();NET.name=nm;SAV.hostTry=0;savStatus('Opening your server…');savOpenHost(w,w.code||savNewCode(),null)}
+function savOpenHost(w,code,oldCode){loadPeer(()=>{if(!window.Peer){savStatus('<span class="warn">Could not load the networking library.</span>');return}let peer;
+  try{peer=new Peer('rustschool-'+code,peerOpts())}catch(e){savStatus('<span class="warn">Network error: '+savEsc(e&&e.message||e)+'</span>');return}NET.peer=peer;let opened=false;
+  peer.on('open',id=>{opened=true;NET.role='host';NET.myId=id;NET.code=code;NET.seed=w.seed;NET.names[id]=NET.name;if(w.code!==code){w.code=code;savStore(w)}
+    savStatus('<span class="good">Server online.</span> Invite code <b>'+savEsc(code)+'</b>');savStart(w,'host',oldCode)});
+  peer.on('connection',savOnConn);
+  peer.on('error',e=>{const t=e&&e.type;if(!opened&&t==='unavailable-id'){try{peer.destroy()}catch(_){}if(NET.peer===peer)NET.peer=null;
+      if(SAV.hostTry++<2){savStatus('Invite code '+savEsc(code)+' is still registered, retrying…');setTimeout(()=>savOpenHost(w,code,oldCode),2500)}
+      else{const nc=savNewCode();savStatus('<span class="warn">Code '+savEsc(code)+' is taken.</span> Using new code '+nc+'…');savOpenHost(w,nc,oldCode||code)}return}
+    const msg='<span class="warn">Network error: '+savEsc(t||e)+'</span>';if(!opened)savStatus(msg);else netStatus(msg)});
+  peer.on('disconnected',()=>{try{peer.reconnect()}catch(e){}})})}
+{const _sw=sendWelcome;sendWelcome=function(conn){const acct=savKey(NET.names[conn.peer]);const dup=acct===savMe()||Object.entries(SAV.peerAcct).some(([pid,a])=>pid!==conn.peer&&a===acct&&NET.conns[pid]);
+  SAV.peerAcct[conn.peer]=acct;const ch=!dup&&SAV.cur&&SAV.cur.chars?SAV.cur.chars[acct]||null:null;if(!dup)savDropPlaceholder(acct,conn.peer);
+  const own=Object.prototype.hasOwnProperty.call(conn,'send'),os=conn.send;
+  conn.send=function(m){if(m&&m.k==='welcome')m.sv={v:1,cfg:savCfg(),dayLen:S.dayLen,ch,dup:dup?1:0,srv:SAV.cur?{id:SAV.cur.id,name:SAV.cur.name}:null};return os.apply(conn,arguments)};
+  try{return _sw.apply(this,arguments)}finally{if(own)conn.send=os;else delete conn.send}}}
+{const _ow=onWelcome;onWelcome=function(m){SAV.pendWelcome=(m&&m.sv)||{};SAV.cur=null;SAV.starting=null;SAV.client={code:SAV.joinCode||'',host:(m&&m.names&&m.names[m.from])||'Host',seed:m&&m.seed};return _ow.apply(this,arguments)}}
+{const _nj=netJoin;netJoin=function(code){SAV.joinCode=String(code||'').trim().toUpperCase().replace(/.*JOIN=/i,'');return _nj.apply(this,arguments)}}
+{const _ns=netStatus;netStatus=function(t){_ns(t);const el=$('#savStatus');if(el)el.innerHTML=t}}
+const savCbKey=()=>SAVK.cb+((SAV.client&&SAV.client.code)||'X')+'-'+savMe();
+function savClientRestore(pw){SAV.cfg=Object.assign({},SAV_DEF,pw.cfg||{});if(isFinite(pw.dayLen)&&pw.dayLen>60)S.dayLen=+pw.dayLen;
+  const bk=savJSON(savCbKey(),null);let ch=pw.ch&&typeof pw.ch==='object'?pw.ch:null;
+  if(!pw.dup&&bk&&typeof bk==='object'&&(!bk.seed||bk.seed===NET.seed)&&(!ch||(+bk.t||0)>(+ch.t||0)))ch=bk;
+  if(ch){savApplyChar(ch);savToast('Welcome back · your character was restored')}else if(SAV.cfg.kit)savGiveKit();
+  if(pw.dup)setTimeout(()=>feedMsg('Someone named '+NET.name+' is already playing here: you start fresh'),1500);
+  const c=SAV.client||{};if(c.code)savRecentPut({code:c.code,name:(pw.srv&&pw.srv.name)||(c.host+'\'s server'),host:c.host,last:Date.now(),seed:NET.seed})}
+function savClientPush(){if(NET.role!=='client'||!S||!P||!SAV.ready)return;SAV.lastPush=performance.now();let ch;try{ch=savCharState()}catch(e){console.error('saves: char state',e);return}
+  hostSend({k:'sv_char',d:ch});const r=savWrite(savCbKey(),JSON.stringify(ch,savRound));if(r!==true&&savIsQuota(r))savToast('Local backup failed: browser storage is full',true)}
+onHook('netMsg',(m,conn)=>{if(!m||typeof m.k!=='string'||m.k.slice(0,3)!=='sv_')return;
+  if(m.k==='sv_char'&&NET.role==='host'&&SAV.cur){const acct=SAV.peerAcct[m.from];if(!acct||acct===savMe()||!m.d||typeof m.d!=='object')return;let n=0;try{n=JSON.stringify(m.d).length}catch(e){return}if(n>400000)return;
+    SAV.cur.chars=SAV.cur.chars||{};m.d.name=String(NET.names[m.from]||acct).slice(0,16);if(!(+m.d.t>0))m.d.t=Date.now();SAV.cur.chars[acct]=m.d}
+  else if(m.k==='sv_pvp'&&NET.role==='host'){if(!savPvp())return;const dmg=clamp(+m.dmg||0,0,150),by=NET.names[m.from]||'A player';
+    if(m.to===NET.myId){if(P&&P.alive){hurt(dmg,'npc',+m.x||P.x,+m.z||P.z);if(!P.alive)$('#dCause').textContent='Killed by '+by+(m.w?' ('+m.w+')':'')}}
+    else sendTo(m.to,{k:'hurt',dmg,x:+m.x||0,z:+m.z||0,by,w:m.w,cause:'npc'})}});
+
+/* ---- PvP (server setting, off by default = original co-op behaviour) ---- */
+function savPvp(){return !!(NET.role&&SAV.cfg&&SAV.cfg.pvp)}
+function savPvpOK(a){return !(typeof safeZone==='function'&&(safeZone(P.x,P.z)||safeZone(a.x,a.z)))}
+function savPvpHit(a,dmg,w){if(!a||!savPvpOK(a))return;dmg=Math.round(clamp(+dmg||0,0,150));if(!dmg)return;
+  if(NET.role==='host')sendTo(a.id,{k:'hurt',dmg,x:P.x,z:P.z,by:NET.name,w,cause:'npc'});else hostSend({k:'sv_pvp',to:a.id,dmg,w,x:P.x,z:P.z})}
+AIM_EXT.push((o,d,maxT,consider)=>{if(!savPvp())return;for(const id in avatars){const a=avatars[id];if(!a||!a.init||!a.alive)continue;if(Math.abs(a.x-o.x)>maxT+2||Math.abs(a.z-o.z)>maxT+2)continue;consider(rayCyl(o,d,a.x,a.z,.4,a.y,a.y+1.85,maxT),{kind:'svpvp',e:a})}});
+HIT_EXT.svpvp=(a,m,id)=>{savPvpHit(a.e,m&&m.dmg||10,ITEMS[id]?ITEMS[id].n:'');hitmark(false);if(a.point)burst(a.point,CHIP.flesh,6,1.5,1.2);sfx('flesh',.6,a.point);return true};
+PROJ_EXT.push((pr,o,dir,L,test)=>{if(pr.owner!=='player'||!savPvp())return;for(const id in avatars){const a=avatars[id];if(a&&a.init&&a.alive)test(['svpvp',a],a,.4,a.y,a.y+1.8)}});
+PROJ_HIT.svpvp=(pr,a,np)=>{let dmg=pr.dmg;if(pr.kind==='bullet')dmg*=falloff(pr.dist||0);savPvpHit(a,dmg,pr.wname||'Arrow');hitmark(false);burst(np,CHIP.flesh,6,1.5,1.2)};
+PROMPTS.svpvp=PROMPTS.svpvp||'Attack';
+
+/* ---- autosave triggers ---- */
+onHook('anyTick',()=>{if(!SAV.ready||!S||!inGame())return;const now=performance.now();
+  if(NET.role==='client'){if(now-SAV.lastPush>25000)savClientPush()}else if(now-SAV.lastSave>60000)savSaveNow('auto')});
+{const _p=pause;pause=function(){const r=_p.apply(this,arguments);if(S&&SAV.ready&&inGame()){const now=performance.now();if(NET.role==='client'){if(now-SAV.lastPush>8000)savClientPush()}else if(now-SAV.lastSave>8000)savSaveNow('pause')}return r}}
+{const _sm=showMenu;showMenu=function(){if(S&&SAV.ready&&inGame())savSaveNow('menu');const r=_sm.apply(this,arguments);savRefreshMenu();return r}}
+{const _rp=renderPauseNet;renderPauseNet=function(){_rp.apply(this,arguments);const el=$('#pNet');if(!el)return;const w=SAV.cur;let t='';
+  if(w&&NET.role!=='client')t='Server <b>'+savEsc(w.name)+'</b> · saved automatically every minute'+(NET.role==='host'?' · code <b>'+savEsc(NET.code)+'</b>':'');
+  else if(NET.role==='client')t='Your character is kept by the host under the name <b>'+savEsc(NET.name)+'</b>';
+  if(t)el.insertAdjacentHTML('beforeend','<div class="lab" style="margin-top:8px;text-transform:none;letter-spacing:.02em">'+t+'</div>')}}
+addEventListener('beforeunload',()=>{if(S&&SAV.ready&&inGame())savSaveNow('unload')});
+document.addEventListener('visibilitychange',()=>{if(document.hidden&&S&&SAV.ready&&inGame())savSaveNow('hidden')});
+
+/* ---- UI: styles, toast, pause button, menu, server browser ---- */
+{const st=document.createElement('style');st.textContent=`
+#menu .mbtn small{display:block;font-size:13px;color:var(--dim);letter-spacing:.06em;font-weight:400;text-transform:none;margin-top:1px}
+#menu .mbtn.sv2{font-size:20px;color:#a39b8d;padding:5px 0}
+#savOv .win{width:920px}
+#savOv .bd{padding:16px 18px 14px}
+.savacct{display:flex;gap:14px;align-items:flex-end;background:rgba(0,0,0,.22);padding:10px 12px;border-left:3px solid var(--yellow)}
+.savacct .inp{width:220px;font-size:16px;font-weight:700;margin-top:3px}
+.savacct p{margin:0;color:var(--dim);font-size:13px;line-height:1.4;flex:1}
+.savtabs{display:flex;gap:2px;margin:14px 0 12px;border-bottom:1px solid rgba(255,255,255,.08);flex-wrap:wrap}
+.savtab{background:none;border:0;border-bottom:3px solid transparent;color:var(--dim);font-weight:700;letter-spacing:.12em;text-transform:uppercase;padding:8px 14px;cursor:pointer;font-size:13px}
+.savtab:hover{color:var(--text)}.savtab.on{color:var(--text);border-bottom-color:var(--red)}
+.savtool{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:10px}.savtool .grow{flex:1}
+.savrow{display:flex;align-items:center;gap:14px;background:rgba(255,255,255,.04);padding:10px 12px;margin-bottom:6px;border-left:3px solid transparent;transition:background .12s}
+.savrow:hover{background:rgba(255,255,255,.07)}.savrow.last{border-left-color:var(--green)}
+.savday{width:54px;text-align:center;flex:none}.savday b{display:block;font-size:24px;line-height:1;color:#e8e0d2}.savday span{font-size:10px;letter-spacing:.15em;color:var(--dim)}
+.savrow .nm{flex:1;min-width:0}.savrow .nm>b{font-size:16.5px;display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.savmeta{color:var(--dim);font-size:12.5px;margin-top:2px}
+.savtags{display:flex;gap:4px;flex-wrap:wrap;margin-top:5px}.savtag{font-size:10.5px;letter-spacing:.06em;text-transform:uppercase;background:rgba(255,255,255,.07);color:#c9c1b3;padding:2px 6px}
+.savtag.hot{background:rgba(205,65,43,.28);color:#f2b3a3}
+.savacts{display:flex;gap:4px;flex-wrap:wrap;justify-content:flex-end;max-width:330px}
+.btn.blue{background:var(--blue)}.btn.blue:hover{background:#4f9ad4}
+.savbadge{font-size:11px;font-weight:700;letter-spacing:.08em;padding:3px 8px;text-transform:uppercase;white-space:nowrap}
+.savbadge.on{background:rgba(113,134,58,.38);color:#d8eca6}.savbadge.off{background:rgba(205,65,43,.25);color:#f0a08a}.savbadge.chk{background:rgba(255,255,255,.08);color:var(--dim)}
+.savform{background:rgba(0,0,0,.25);padding:12px 14px;margin-bottom:12px;display:grid;grid-template-columns:150px 1fr;gap:9px 14px;align-items:center;border-top:3px solid var(--green)}
+.savform .lab{font-size:11.5px}.savform h3{grid-column:1/-1;margin:0;font-size:15px;letter-spacing:.1em;text-transform:uppercase}
+.savseg{display:inline-flex;gap:2px;flex-wrap:wrap}.savseg button{background:#3a372f;color:#cfc7b9;border:0;padding:6px 12px;font-family:inherit;font-weight:700;font-size:12.5px;letter-spacing:.05em;text-transform:uppercase;cursor:pointer}
+.savseg button:hover{background:#4a463c}.savseg button.on{background:var(--green);color:#fff}
+.savform .hint{grid-column:2;color:var(--dim);font-size:12px;margin-top:-4px}
+.savempty{padding:22px;text-align:center;color:var(--dim);background:rgba(255,255,255,.03)}
+#savStatus{font-size:14px;margin:12px 0 0;min-height:18px}
+#savToast{position:fixed;left:50%;bottom:118px;transform:translate(-50%,8px);background:var(--panel2);border-left:3px solid var(--green);padding:7px 16px;font-weight:700;letter-spacing:.1em;
+  text-transform:uppercase;font-size:13px;z-index:70;opacity:0;transition:opacity .25s,transform .25s;pointer-events:none;box-shadow:0 6px 24px rgba(0,0,0,.5);max-width:calc(100vw - 32px);text-align:center}
+#savToast.on{opacity:1;transform:translate(-50%,0)}#savToast.bad{border-left-color:var(--red);text-transform:none;letter-spacing:.02em}
+@media(max-width:700px){.savrow{flex-wrap:wrap}.savacts{max-width:none;justify-content:flex-start;width:100%}.savform{grid-template-columns:1fr}.savform .hint{grid-column:1}.savacct{flex-direction:column;align-items:stretch}.savacct .inp{width:100%}}`;
+  document.head.appendChild(st)}
+{const t=document.createElement('div');t.id='savToast';document.body.appendChild(t);
+  const ov=document.createElement('div');ov.id='savOv';ov.className='ov hidden';ov.style.zIndex='56';
+  ov.innerHTML=`<div class="win"><div class="hd"><h2>Servers</h2><button class="close" id="savClose">Close</button></div><div class="bd">
+  <div class="savacct"><div><div class="lab">Account name</div><input id="savName" class="inp" maxlength="16" placeholder="Your survivor name"></div>
+  <p>Your characters are saved under this name. Join a friend's server with the same name to get your character, gear and base back.<br><span class="lab" id="savTok"></span></p></div>
+  <div class="savtabs"><button class="savtab on" data-t="mine">My Servers</button><button class="savtab" data-t="recent">Recent Servers</button><button class="savtab" data-t="join">Join by Code</button></div>
+  <div id="savPaneMine"><div class="savtool"><button class="btn" id="savNewBtn">+ Create new server</button><button class="btn gray" id="savImpBtn">Import</button><span class="grow"></span><span class="lab" id="savUse"></span></div><div id="savForm"></div><div id="savList"></div></div>
+  <div id="savPaneRecent" class="hidden"><div class="savtool"><span class="lab grow">Servers you joined before. Status is checked live; the host's tab must be open.</span><button class="btn gray sm" id="savPing">Check status</button></div><div id="savRecent"></div></div>
+  <div id="savPaneJoin" class="hidden"><div class="sec">Join a friend</div><div class="actions"><input id="savCode" class="inp" placeholder="Invite code or link" style="flex:1;font-size:16px;text-transform:uppercase"><button class="btn" id="savJoinBtn">Join</button></div>
+  <p class="lab" style="margin-top:10px;text-transform:none;letter-spacing:.02em;font-size:13px">Paste the 6-letter code or the whole invite link. Peer-to-peer: works on most home networks; strict school or office networks can block it.</p></div>
+  <p id="savStatus"></p></div></div>`;
+  document.body.appendChild(ov);const f=document.createElement('input');f.type='file';f.id='savFile';f.accept='.json,application/json';f.className='hidden';document.body.appendChild(f)}
+function savToast(t,bad){const el=$('#savToast');if(!el)return;el.textContent=t;el.classList.toggle('bad',!!bad);el.classList.add('on');clearTimeout(savToast._t);savToast._t=setTimeout(()=>el.classList.remove('on'),bad?5200:1700)}
+function savStatus(t){const el=$('#savStatus');if(el)el.innerHTML=t||''}
+function savAgo(t){if(!t)return'never';const s=(Date.now()-t)/1000;if(s<60)return'just now';if(s<3600)return Math.floor(s/60)+' min ago';if(s<86400)return Math.floor(s/3600)+' h ago';if(s<86400*30)return Math.floor(s/86400)+' d ago';return new Date(t).toLocaleDateString()}
+const savKB=n=>n>1048576?(n/1048576).toFixed(1)+' MB':Math.max(1,Math.round((n||0)/1024))+' KB';
+const SAV_LBL={dens:{low:'Low',normal:'Normal',high:'High'},day:{short:'Short (6 min)',normal:'Normal (10 min)',long:'Long (18 min)'}};
+function savRenderMine(){const box=$('#savList');if(!box)return;const ix=savIndex(),last=savGet(SAVK.last);let tot=0;
+  if(!ix.length){box.innerHTML='<div class="savempty">No saved servers yet. Create one here, or press <b>Continue</b> / <b>New World</b> on the main menu: worlds are saved automatically.</div>'}
+  else box.innerHTML=ix.map(m=>{tot+=m.size||0;const c=Object.assign({},SAV_DEF,m.cfg||{});const id=savEsc(m.id);
+    const tags=`<span class="savtag ${c.pvp?'hot':''}">PvP ${c.pvp?'on':'off'}</span><span class="savtag ${c.dens==='high'?'hot':''}">Infected: ${SAV_LBL.dens[c.dens]||c.dens}</span><span class="savtag">Day: ${(SAV_LBL.day[c.day]||c.day).split(' ')[0]}</span>${c.kit?'<span class="savtag">Starter kit</span>':''}${m.code?`<span class="savtag">Code ${savEsc(m.code)}</span>`:''}`;
+    const name=SAV.renaming===m.id?`<div class="actions" style="margin:0"><input class="inp" id="savRenIn" maxlength="40" value="${savEsc(m.name)}" style="flex:1"><button class="btn sm" data-a="rensave" data-id="${id}">Save</button><button class="btn sm gray" data-a="rencancel">Cancel</button></div>`:`<b>${savEsc(m.name)}</b>`;
+    const acts=SAV.confirmDel===m.id?`<span class="warn" style="font-weight:700;align-self:center;margin-right:4px">Delete forever?</span><button class="btn sm red" data-a="delyes" data-id="${id}">Delete</button><button class="btn sm gray" data-a="delno">Keep</button>`
+      :`<button class="btn" data-a="play" data-id="${id}">${m.last?'Play':'Start'}</button><button class="btn blue" data-a="host" data-id="${id}">Host online</button><button class="btn sm gray" data-a="ren" data-id="${id}">Rename</button><button class="btn sm gray" data-a="exp" data-id="${id}">Export</button><button class="btn sm red" data-a="del" data-id="${id}">Delete</button>`;
+    return `<div class="savrow ${m.id===last?'last':''}"><div class="savday"><b>${m.day||1}</b><span>DAY</span></div><div class="nm">${name}<div class="savmeta">${m.last?'Played '+savAgo(m.last):'Created '+savAgo(m.created)} · ${m.players||0} player${m.players===1?'':'s'} · ${savKB(m.size)}</div><div class="savtags">${tags}</div></div><div class="savacts">${acts}</div></div>`}).join('');
+  const u=$('#savUse');if(u)u.textContent=ix.length?ix.length+' server'+(ix.length>1?'s':'')+' · '+savKB(tot)+' used':'';
+  const ri=$('#savRenIn');if(ri){ri.focus();ri.select();ri.onkeydown=e=>{if(e.key==='Enter'){e.preventDefault();savRename(SAV.renaming,ri.value)}else if(e.key==='Escape'){e.stopPropagation();SAV.renaming=null;savRenderMine()}}}}
+function savRenderForm(){const box=$('#savForm');if(!box)return;const f=SAV.form;if(!f){box.innerHTML='';return}
+  const seg=(k,opts)=>`<div class="savseg" data-k="${k}">${opts.map(([v,l])=>`<button data-v="${v}" class="${String(f[k])===String(v)?'on':''}">${l}</button>`).join('')}</div>`;
+  box.innerHTML=`<div class="savform"><h3>New server</h3><span class="lab">Server name</span><input class="inp" id="savFName" maxlength="40" value="${savEsc(f.name)}">
+   <span class="lab">PvP</span>${seg('pvp',[[false,'Off'],[true,'On']])}<span class="hint">On: players can hurt each other (not inside the safe camp). Off is the classic co-op island.</span>
+   <span class="lab">Infected density</span>${seg('dens',[['low','Low'],['normal','Normal'],['high','High']])}
+   <span class="lab">Day length</span>${seg('day',[['short','Short · 6 min'],['normal','Normal · 10 min'],['long','Long · 18 min']])}
+   <span class="lab">Starter kit</span>${seg('kit',[[false,'Off'],[true,'On']])}<span class="hint">Fresh characters start with stone tools, a spear, a building plan, a hammer, a bag, food and some wood and stone.</span>
+   <span></span><div class="actions" style="margin:0"><button class="btn" data-a="fplay">Create &amp; play</button><button class="btn blue" data-a="fhost">Create &amp; host online</button><button class="btn gray" data-a="fcancel">Cancel</button></div></div>`;
+  const nm=$('#savFName');if(nm)nm.oninput=()=>{f.name=nm.value}}
+function savRenderRecent(){const box=$('#savRecent');if(!box)return;const list=savRecent();
+  if(!list.length){box.innerHTML='<div class="savempty">No recent servers. When you join a friend, their server shows up here for one-click rejoining.</div>';return}
+  box.innerHTML=list.map(r=>{const p=SAV.pingRes[r.code]||{};const code=savEsc(r.code);
+    const badge=p.st==='on'?`<span class="savbadge on">Online${p.players?' · '+p.players+' playing':''}${p.day?' · Day '+p.day:''}</span>`:p.st==='off'?'<span class="savbadge off">Offline</span>':p.st==='chk'?'<span class="savbadge chk">Checking…</span>':'<span class="savbadge chk">Unknown</span>';
+    return `<div class="savrow"><div class="nm"><b>${savEsc(p.name||r.name||'Server '+r.code)}</b><div class="savmeta">Hosted by ${savEsc(r.host||'?')} · code ${code} · joined ${savAgo(r.last)}</div></div>${badge}<div class="savacts"><button class="btn" data-a="rjoin" data-code="${code}">Join</button><button class="btn sm gray" data-a="rforget" data-code="${code}">Forget</button></div></div>`}).join('')}
+function savTab(t){SAV.tab=t;document.querySelectorAll('#savOv .savtab').forEach(b=>b.classList.toggle('on',b.dataset.t===t));
+  for(const [k,id] of [['mine','#savPaneMine'],['recent','#savPaneRecent'],['join','#savPaneJoin']]){const el=$(id);if(el)el.classList.toggle('hidden',k!==t)}
+  if(t==='mine'){savRenderForm();savRenderMine()}if(t==='recent'){savRenderRecent();if(performance.now()-SAV.pinged>20000)savPingAll()}if(t==='join'){const c=$('#savCode');if(c)setTimeout(()=>c.focus(),30)}}
+function savOpen(t){const n=$('#savName');if(n&&!n.value)n.value=savGet(SAVK.name)||'';const tk=$('#savTok');if(tk)tk.textContent='Device key '+savToken().slice(0,6)+'…';SAV.confirmDel=null;SAV.renaming=null;savStatus('');
+  $('#savOv').classList.remove('hidden');savTab(t||SAV.tab||'mine')}
+function savRename(id,name){name=String(name||'').trim().slice(0,40);SAV.renaming=null;if(!name){savRenderMine();return}const w=savLoad(id);if(!w){savRenderMine();return}w.name=name;
+  if(SAV.cur&&SAV.cur.id===id)SAV.cur.name=name;const r=savStore(w);if(r!==true)savStatus('<span class="warn">Could not rename: storage error.</span>');savRenderMine();savRefreshMenu()}
+function savDelete(id){savDel(SAVK.w+id);const ix=savIndex().filter(m=>m.id!==id);savWrite(SAVK.idx,JSON.stringify(ix));if(savGet(SAVK.last)===id)savDel(SAVK.last);if(SAV.cur&&SAV.cur.id===id){SAV.cur=null;SAV.ready=false}
+  SAV.confirmDel=null;savStatus('Server deleted.');savRenderMine();savRefreshMenu()}
+function savExport(id){const str=savGet(SAVK.w+id);if(!str){savStatus('<span class="warn">Nothing to export.</span>');return}let nm='world';try{nm=JSON.parse(str).name||nm}catch(e){}
+  try{const blob=new Blob([str],{type:'application/json'});const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=String(nm).replace(/[^a-z0-9]+/gi,'_').replace(/^_|_$/g,'')+'.rsworld.json';document.body.appendChild(a);a.click();
+    setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove()},1500);savStatus('Exported <b>'+savEsc(nm)+'</b> as a file. Import it on any browser to continue there.')}catch(e){savStatus('<span class="warn">Export failed: '+savEsc(e.message||e)+'</span>')}}
+function savImportText(txt){let w;try{w=JSON.parse(txt)}catch(e){savStatus('<span class="warn">That file is not a valid world save.</span>');return false}
+  if(!w||typeof w!=='object'||!isFinite(w.seed)||typeof w.chars!=='object'){savStatus('<span class="warn">That file is not a world save from this game.</span>');return false}
+  const ix=savIndex();w.id=savNewId();w.cfg=Object.assign({},SAV_DEF,w.cfg||{});w.name=String(w.name||'Imported world').slice(0,36);if(ix.some(m=>m.name===w.name))w.name=(w.name+' (imported)').slice(0,40);
+  if(!w.code||ix.some(m=>m.code===w.code))w.code=savNewCode();w.created=w.created||Date.now();const r=savStore(w);
+  if(r!==true){savStatus('<span class="warn">'+(savIsQuota(r)?'Not enough browser storage to import it. Delete or export other servers first.':'Import failed.')+'</span>');return false}
+  savStatus('Imported <b>'+savEsc(w.name)+'</b>.');savTab('mine');savRefreshMenu();return true}
+function savJoin(code){code=String(code||'').trim().toUpperCase().replace(/.*JOIN=/i,'').replace(/[^A-Z0-9]/g,'');if(!code){savStatus('<span class="warn">Enter an invite code.</span>');return}
+  const nm=savName();savSetName(nm);if(S&&SAV.ready&&NET.role!=='client')savSaveNow('switch');savNetReset();SAV.cur=null;SAV.ready=false;netJoin(code)}
+function savPingAll(){const list=savRecent();SAV.pinged=performance.now();if(!list.length)return;for(const r of list)SAV.pingRes[r.code]=Object.assign({},SAV.pingRes[r.code],{st:'chk'});savRenderRecent();
+  loadPeer(()=>{if(!window.Peer){for(const r of list)SAV.pingRes[r.code]={st:'off'};savRenderRecent();return}let pp;try{pp=new Peer(peerOpts())}catch(e){return}const done={};let n=0;
+    const fin=(code,res)=>{if(done[code])return;done[code]=1;n++;SAV.pingRes[code]=res;savRenderRecent();if(n>=list.length){clearTimeout(to);setTimeout(()=>{try{pp.destroy()}catch(e){}},600)}};
+    const to=setTimeout(()=>{for(const r of list)fin(r.code,{st:'off'})},8000);
+    pp.on('open',()=>{for(const r of list){let c;try{c=pp.connect('rustschool-'+r.code,{reliable:true,serialization:'json',metadata:{ping:1}})}catch(e){fin(r.code,{st:'off'});continue}if(!c){fin(r.code,{st:'off'});continue}
+      c.on('open',()=>setTimeout(()=>{fin(r.code,{st:'on'});try{c.close()}catch(e){}},2500));c.on('data',m=>{if(m&&m.k==='sv_pong'){fin(r.code,{st:'on',players:m.players|0,day:m.day|0,name:typeof m.name==='string'?m.name.slice(0,40):''});try{c.close()}catch(e){}}});
+      c.on('error',()=>fin(r.code,{st:'off'}))}});
+    pp.on('error',e=>{const mm=String(e&&e.message||'').match(/rustschool-([A-Z0-9]+)/i);if(mm)fin(mm[1].toUpperCase(),{st:'off'});else if(e&&e.type!=='peer-unavailable')for(const r of list)fin(r.code,{st:'off'})})})}
+function savRefreshMenu(){const mp=$('#mPlay');if(!mp)return;const ix=savIndex();const id=savGet(SAVK.last);const m=ix.find(x=>x.id===id)||ix[0];
+  mp.innerHTML=m?'Continue<small>'+savEsc(m.name)+' · Day '+(m.day||1)+' · '+savAgo(m.last||m.created)+'</small>':'Training Island<small>Start a new island · saved automatically</small>'}
+// wire up
+{const ov=$('#savOv');
+  $('#savClose').onclick=()=>ov.classList.add('hidden');ov.addEventListener('mousedown',e=>{if(e.target===ov)ov.classList.add('hidden')});
+  document.querySelectorAll('#savOv .savtab').forEach(b=>b.onclick=()=>savTab(b.dataset.t));
+  const nm=$('#savName');nm.onchange=()=>{const v=nm.value.trim();if(v)savSetName(v)};
+  $('#savNewBtn').onclick=()=>{SAV.form=SAV.form?null:Object.assign({name:savDefName()},SAV_DEF);savRenderForm();const i=$('#savFName');if(i)i.focus()};
+  $('#savImpBtn').onclick=()=>{const f=$('#savFile');f.value='';f.click()};
+  $('#savFile').onchange=e=>{const file=e.target.files&&e.target.files[0];if(!file)return;if(file.size>8e6){savStatus('<span class="warn">That file is too big to be a world save.</span>');return}file.text().then(savImportText,()=>savStatus('<span class="warn">Could not read the file.</span>'))};
+  $('#savPing').onclick=savPingAll;$('#savJoinBtn').onclick=()=>savJoin($('#savCode').value);
+  $('#savCode').addEventListener('keydown',e=>{if(e.key==='Enter')savJoin(e.target.value)});
+  $('#savForm').addEventListener('click',e=>{const b=e.target.closest('button');if(!b)return;const f=SAV.form;if(!f)return;const sg=b.parentElement&&b.parentElement.classList.contains('savseg')?b.parentElement:null;
+    if(sg){const k=sg.dataset.k,v=b.dataset.v;f[k]=v==='true'?true:v==='false'?false:v;savRenderForm();return}
+    const a=b.dataset.a;if(a==='fcancel'){SAV.form=null;savRenderForm();return}
+    if(a==='fplay'||a==='fhost'){const cfg={pvp:!!f.pvp,dens:f.dens,day:f.day,kit:!!f.kit};SAV.form=null;savSetName(savName());const w=savCreate({name:f.name,cfg});
+      if(!w||!w.id){savStatus('<span class="warn">'+(savIsQuota(w)?'Not enough browser storage. Delete or export old servers.':'Could not create the server.')+'</span>');return}
+      savRenderForm();savRenderMine();if(a==='fplay'){savNetReset();savStart(w,'solo')}else savHost(w.id)}});
+  $('#savList').addEventListener('click',e=>{const b=e.target.closest('button[data-a]');if(!b)return;const a=b.dataset.a,id=b.dataset.id;
+    if(a==='play')savPlay(id);else if(a==='host')savHost(id);else if(a==='ren'){SAV.renaming=id;SAV.confirmDel=null;savRenderMine()}else if(a==='rensave')savRename(id,($('#savRenIn')||{}).value);
+    else if(a==='rencancel'){SAV.renaming=null;savRenderMine()}else if(a==='exp')savExport(id);else if(a==='del'){SAV.confirmDel=id;SAV.renaming=null;savRenderMine()}else if(a==='delyes')savDelete(id);else if(a==='delno'){SAV.confirmDel=null;savRenderMine()}});
+  $('#savRecent').addEventListener('click',e=>{const b=e.target.closest('button[data-a]');if(!b)return;const code=b.dataset.code;
+    if(b.dataset.a==='rjoin')savJoin(code);else if(b.dataset.a==='rforget'){savWrite(SAVK.recent,JSON.stringify(savRecent().filter(r=>r.code!==code)));savRenderRecent()}});
+  document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!ov.classList.contains('hidden')&&!(e.target&&e.target.id==='savRenIn')){ov.classList.add('hidden');e.stopPropagation()}},true)}
+// main menu: Continue (last world) · New World · Servers · Play with a friend
+{const mp=$('#mPlay');mp.insertAdjacentHTML('afterend','<button class="mbtn sv2" id="savMNew">New World</button><button class="mbtn sv2" id="savMServers">Servers</button>');
+  const cont=()=>savContinue();mp.onclick=cont;setTimeout(()=>{mp.onclick=cont},0); // the core MENU section (after this module) assigns mPlay.onclick again
+  $('#savMNew').onclick=()=>savQuickNew();$('#savMServers').onclick=()=>savOpen('mine');$('#mOnline').onclick=()=>savOpen(savRecent().length?'recent':'join');
+  savRefreshMenu();const n=savGet(SAVK.name);if(n)savSetName(n);savToken()}
+// pause screen: manual Save button
+{const pa=document.querySelector('#pause .card .actions');if(pa){pa.insertAdjacentHTML('afterbegin','<button class="btn" id="savBtn">Save</button>');const b=$('#savBtn');
+  b.onclick=e=>{e.stopPropagation();savSaveNow('manual')}}}
+// invite links (?join=CODE) open the server browser instead of the old lobby
+{let q=null;try{q=new URLSearchParams(location.search).get('join')}catch(e){}if(q){$('#lobby').classList.add('hidden');savOpen('join');$('#savCode').value=q.toUpperCase();savStatus('Your friend invited you. Check your account name and press <b>Join</b>.')}}
 
 /* ================= RENDER ================= */
 const tmpC=new THREE.Color(),tmpC2=new THREE.Color();
