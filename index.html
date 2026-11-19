@@ -10078,6 +10078,193 @@ if(typeof GUIDE!=='undefined'&&Array.isArray(GUIDE)&&!GUIDE.some(g=>g&&g.id==='w
 <h3>Hammer</h3><ul><li><b>R</b> on a damaged piece repairs it for a small cost. You can't repair right after it was hit.</li><li><b>Hold R</b> to demolish a piece or pick up a door. You get about half of the grade's materials back. Anything resting on that piece collapses.</li><li><b>Left click</b> opens the upgrade menu, which now also has Repair, Demolish and Pick up door.</li></ul>
 <p>In co-op every player counts as a teammate: you can repair and demolish each other's pieces. Twig can be demolished by anyone.</p>`});
 
+/* ================= ANIMATION PASS 2 ================= */
+// anim2: second animation-quality pass layered over the anim + polish modules (wraps only, no patches; runs last).
+// Rigs (infected, NPCs, co-op avatars): physics-style death topple (gravity pendulum, ground impact with bounce + limb flop,
+//   sideways tumble/twist, settles onto the terrain slope), directional hit flinch with a lagging head whip,
+//   infected gait variety (head loll, stumbling lurches, twitches, lean). Animals: directional hit jolt.
+// First person: bites/gulps for food & drink, bandage wrapping, syringe jab, revolver reload choreography (cylinder flick,
+//   brass eject, per-round drum steps with clicks, snap shut), placement push, hammer impact, physical death-camera
+//   fall and a respawn wake-up. All per-frame work is allocation-free and distance-limited.
+const ANIM2=(()=>{
+const HP=Math.PI/2,TAU=Math.PI*2,SENT=1e5,ASENT=1e-6;
+const eIn=t=>t*t,eOut=t=>1-(1-t)*(1-t),eIO=t=>t*t*(3-2*t);
+const bump=(t,a,b)=>t>a&&t<b?Math.sin(Math.PI*(t-a)/(b-a)):0;
+const fin=v=>typeof v==='number'&&isFinite(v);
+const wrapA=a=>{a=(a+Math.PI)%TAU;if(a<0)a+=TAU;return a-Math.PI};
+// underdamped spring around 0 (semi-implicit Euler, sub-stepped)
+function spr(s,k,c,dt){if(!(dt>0))return;const n=Math.min(12,Math.max(1,Math.ceil(dt/.016))),h=dt/n;for(let i=0;i<n;i++){s.v+=(-k*s.x-c*s.v)*h;s.x+=s.v*h}if(!fin(s.x)||!fin(s.v)){s.x=0;s.v=0}}
+// spring toward a target
+function sprT(s,tg,k,c,dt){if(!(dt>0))return;const n=Math.min(12,Math.max(1,Math.ceil(dt/.016))),h=dt/n;for(let i=0;i<n;i++){s.v+=(k*(tg-s.x)-c*s.v)*h;s.x+=s.v*h}if(!fin(s.x)||!fin(s.v)){s.x=tg;s.v=0}}
+// implicit critically damped spring (same integrator as the anim module, used to cancel its filtered jitter exactly)
+function cds(a,i,tg,w,dt){const x=a[i],v=a[i+1],f=1+2*dt*w,hoo=dt*w*w,hh=dt*hoo,di=1/(f+hh);a[i]=(f*x+dt*v+hh*tg)*di;a[i+1]=(v+hoo*(tg-x))*di}
+function kick(p,y,r){if(typeof PLSH!=='undefined'&&PLSH&&PLSH.kick)try{PLSH.kick(p,y,r)}catch(e){}}
+function hash(s){let h=2166136261;s=String(s);for(let i=0;i<s.length;i++){h^=s.charCodeAt(i);h=Math.imul(h,16777619)}return h>>>0}
+const camOK=()=>!(typeof PHM!=='undefined'&&PHM&&PHM.on);
+
+/* =============== rig layer =============== */
+function A2(r){const st=r.state;return st._a2||(st._a2={acc:0,lfl:0,fp:{x:0,v:0},fr:{x:0,v:0},tw:{x:0,v:0},hd:{x:0,v:0},tj:{x:0,v:0},lph:0,lu:0,ls:1,lD:.55,twT:R(1.5,5),d:null})}
+/* ---- death: knees buckle, then a gravity pendulum topples the body; impacts bounce and fling the limbs ---- */
+function dStart(r,a,deadV,dir,side){const d=a.d||(a.d={on:false,t:0,th:0,th0:.05,w:0,done:false,dir:1,side:0,Tb:.15,G:9,imp:0,fl:{x:0,v:0},tx:0,tz:0,gx:0,gz:0,sT:0,b:0});
+  d.on=true;d.t=0;d.th0=R(.03,.07);d.th=d.th0;d.side=clamp((fin(+side)?+side:0)*.8+R(-.3,.3),-1,1);d.w=R(.35,.9)+Math.abs(d.side)*.3;d.done=deadV>=.95;d.dir=+dir<0?-1:1;d.Tb=R(.1,.2);
+  d.G=9.8*.82/Math.max(.5,(r.H||1)*(r.scale||1));d.imp=0;d.fl.x=d.fl.v=0;d.tx=d.tz=d.gx=d.gz=0;d.sT=0;d.b=0;if(d.done){d.th=HP;d.w=0;d.b=1;d.t=3}return d}
+function dStep(d,dt){if(d.done){d.t+=dt;return}if(dt>.6){d.done=true;d.th=HP;d.w=0;d.b=1;d.t+=dt;return}
+  const n=Math.min(60,Math.max(1,Math.ceil(dt/.008))),h=dt/n;
+  for(let i=0;i<n;i++){d.t+=h;if(d.done||d.t<d.Tb)continue;d.w+=d.G*Math.sin(d.th)*h;d.w*=1-.25*h;d.th+=d.w*h;
+    if(d.th>=HP){d.th=HP;if(d.w>1.1&&d.imp<3){d.fl.v-=d.w*(d.imp?.8:1.6);d.w=-d.w*(d.imp?.22:.3);d.imp++}else{d.w=0;d.done=true}}}
+  if(!fin(d.th)||!fin(d.w)){d.th=HP;d.w=0;d.done=true}d.b=d.done?1:clamp((d.th-d.th0)/(HP-d.th0),0,1)}
+// map the simulated angle onto the anim module's death curve (dp .22 = knees buckled, b = eIn((dp-.22)/.6) = topple fraction, .82 = lying, no canned bounce)
+function dDP(d){if(d.done)return .82;if(d.t<d.Tb)return .22*eOut(d.t/d.Tb);return .22+.6*Math.sqrt(d.b)}
+function preDead(r,deadV,dir,side,dt){const st=r.state;if(!st||!st.p)return false;const a=A2(r);
+  if(!(deadV>0)){if(a.d)a.d.on=false;return false}
+  const d=a.d&&a.d.on?a.d:dStart(r,a,deadV,dir,side);dStep(d,dt);
+  st.deadP=dDP(d)-Math.min((st.acc||0)+dt,.5)*1.7;return true}
+function slope(r,d){if(typeof groundH!=='function')return;try{r.g.updateWorldMatrix(true,false)}catch(e){}const e=r.g.matrixWorld.elements,x=e[12],y=e[13],z=e[14];if(!fin(x)||!fin(z))return;
+  const g0=groundH(x,z);if(!fin(g0)||Math.abs(g0-y)>.3){d.gx=d.gz=0;return}
+  let zx=e[8],zz=e[10];const zl=Math.hypot(zx,zz)||1;zx/=zl;zz/=zl;let xx=e[0],xz=e[2];const xl=Math.hypot(xx,xz)||1;xx/=xl;xz/=xl;
+  const L=1.45*(r.H||1)*(r.scale||1),s=d.dir,dh=groundH(x+zx*L*s,z+zz*L*s)-g0;d.gx=clamp(-s*Math.asin(clamp(dh/L,-.6,.6)),-.5,.5);
+  const mx=x+zx*L*.5*s,mz=z+zz*L*.5*s,dl=groundH(mx+xx*.45,mz+xz*.45)-groundH(mx-xx*.45,mz-xz*.45);d.gz=clamp(Math.asin(clamp(dl/.9,-.6,.6)),-.45,.45);
+  if(!fin(d.gx))d.gx=0;if(!fin(d.gz))d.gz=0}
+function postDead(r,d,dt){const B=r.bones,b=d.done?1:d.b;spr(d.fl,170,9,dt);const f=clamp(d.fl.x,-.8,.8),af=Math.abs(f),sd=d.side;
+  // tumble toward the push side mid-fall, end partly rolled and twisted
+  B[0].rotation.z-=sd*(.32*Math.sin(Math.PI*b)+.28*b);B[0].rotation.y+=sd*.4*b;
+  // limbs and head keep moving after the body lands
+  B[6].rotation.z-=af*.5;B[9].rotation.z+=af*.5;B[7].rotation.x+=af*.4;B[10].rotation.x+=af*.3;B[5].rotation.x-=f*.45*d.dir;B[2].rotation.x-=f*.12*d.dir;B[13].rotation.x-=af*.35;B[16].rotation.x-=af*.25;
+  // settle onto the slope instead of floating / clipping
+  d.sT-=dt;if(d.t<d.Tb+3&&d.sT<=0&&b>.3){d.sT=.25;slope(r,d)}const k=Math.min(1,dt*6);d.tx+=(d.gx-d.tx)*k;d.tz+=(d.gz-d.tz)*k;B[0].rotation.x+=d.tx*b;B[0].rotation.z+=d.tz*b}
+/* ---- live: directional flinch + head whip ---- */
+function kickFl(a,e,amt){let dx=camera.position.x-e[12],dz=camera.position.z-e[14];const l=Math.hypot(dx,dz);let fr=1,sd=0;
+  if(l>.05&&l<40){dx/=l;dz/=l;let fx=-e[8],fz=-e[10];const fl=Math.hypot(fx,fz)||1;fx/=fl;fz/=fl;let rx=e[0],rz=e[2];const rl=Math.hypot(rx,rz)||1;rx/=rl;rz/=rl;fr=dx*fx+dz*fz;sd=dx*rx+dz*rz}
+  const k=4.5+5*clamp(amt,0,1);a.fp.v+=k*fr;a.fr.v+=k*.8*sd;a.tw.v-=k*.5*sd}
+function flinch(r,a,dt){spr(a.fp,150,10,dt);spr(a.fr,150,10,dt);spr(a.tw,120,10,dt);sprT(a.hd,a.fp.x,90,9,dt);
+  const p=clamp(a.fp.x,-.7,.7),q=clamp(a.fr.x,-.6,.6),w=clamp(a.tw.x,-.5,.5),h=clamp(a.hd.x,-.8,.8);if(Math.abs(p)+Math.abs(q)+Math.abs(w)+Math.abs(h)<1e-3)return;
+  const B=r.bones;B[2].rotation.x+=p*.45;B[3].rotation.x+=p*.35;B[5].rotation.x+=h*.55;B[2].rotation.z+=q*.4;B[3].rotation.z+=q*.25;B[5].rotation.z+=q*.35;B[3].rotation.y+=w*.6;B[5].rotation.y+=w*.4;
+  const ap=Math.min(.8,Math.abs(p)+Math.abs(q));B[6].rotation.z-=ap*.45;B[9].rotation.z+=ap*.45;B[6].rotation.x+=p*.3;B[9].rotation.x+=p*.3;
+  B[13].rotation.x-=ap*.3;B[16].rotation.x-=ap*.25;B[12].rotation.x+=ap*.15;B[15].rotation.x+=ap*.1;B[1].position.y-=ap*.04*(r.H||1)}
+/* ---- infected gait variety ---- */
+function lurch(r,a,dt){const st=r.state,p=st.p,B=r.bones,v=r.variant|0;
+  const m=clamp((p[0]||0)/1.1,0,1),busy=clamp(Math.max(p[12]||0,p[32]||0,(p[16]||0)*.8,p[28]||0,p[30]||0),0,1),k=1-busy;
+  const ph=st.ph||0;if(ph<a.lph-3&&m>.3&&a.lu<=0&&Math.random()<(v===1?.4:.22)){a.lu=1e-4;a.ls=Math.random()<.5?-1:1;a.lD=R(.45,.7)}a.lph=ph;
+  if(k<.02)return;
+  const lo=(v===3?.16:.09)*m+.04;B[5].rotation.z+=k*lo*Math.sin(ph+v*1.3);B[5].rotation.x+=k*.05*m*Math.sin(2*ph+.5);
+  a.twT-=dt;if(a.twT<=0){a.twT=v===2?R(.8,2.5):R(2.5,7);a.tj.v+=R(-1,1)*(v===2?14:8)}spr(a.tj,320,12,dt);const j=clamp(a.tj.x,-.5,.5);B[5].rotation.y+=k*j;B[5].rotation.z+=k*j*.5;B[3].rotation.y+=k*j*.15;
+  if(a.lu>0){a.lu+=dt/a.lD;if(a.lu>=1)a.lu=0;else{const en=Math.sin(Math.PI*a.lu)*k*m,s=a.ls,arm=s>0?B[9]:B[6];
+    B[1].position.y-=.07*en*(r.H||1);B[1].rotation.z+=s*.06*en;B[2].rotation.x-=.24*en;B[3].rotation.z+=s*.14*en;B[5].rotation.z+=s*.3*en;B[5].rotation.x+=.18*en*Math.sin(TAU*a.lu);
+    arm.rotation.x+=.55*en;arm.rotation.z+=s*.25*en;B[13].rotation.x-=.35*en;B[16].rotation.x-=.3*en}}
+  if(v===1){B[2].rotation.z+=.07*k;B[5].rotation.z-=.05*k}}
+// after the core pose: sentinel on foreL.z (the core resets it on every run) tells whether this call actually re-posed the rig
+function post(r,dt,ran){const st=r.state;if(!st||!st.p)return;const a=A2(r);a.acc+=dt;
+  const fl=+st.fl||0;if(fl>a.lfl+.15)a.hitP=Math.max(a.hitP||0,fl);a.lfl=fl;if(!ran)return;const d=Math.min(a.acc,.5);a.acc=0;const hit=a.hitP||0;a.hitP=0;
+  if(a.d&&a.d.on){postDead(r,a.d,d);return}
+  const e=r.g.matrixWorld.elements,dc=Math.hypot(camera.position.x-e[12],camera.position.z-e[14]);if(dc>50)return;
+  if(hit)kickFl(a,e,hit);flinch(r,a,d);if(r.infected&&dc<40)lurch(r,a,d)}
+function sentOn(r){const b=r.bones[7].rotation,z=b.z;b.z=SENT;return z}
+function sentOff(r,z){const b=r.bones[7].rotation;if(b.z===SENT){b.z=z;return false}return true}
+// global animateRig (infected and any module calling it)
+if(typeof animateRig==='function'){const _ar=animateRig;animateRig=function(r,s,dt){if(!r||!r.bones||!r.state||r.fb||!r.bones[7])return _ar.apply(this,arguments);dt=+dt||0;
+  let ov=false,sd0;try{ov=preDead(r,s?+s.dead||0:0,s&&s.deadDir,s&&s.staggerDir,dt)}catch(e){ov=false}if(ov&&s){sd0=s.dead;s.dead=1}const z=sentOn(r);
+  try{return _ar.apply(this,arguments)}finally{if(ov&&s)s.dead=sd0;const ran=sentOff(r,z);try{post(r,dt,ran)}catch(e){}}}}
+// live NPCs (posed through the anim module's internal path)
+if(typeof animateNpc==='function'){const _an=animateNpc;animateNpc=function(n,dt){const r=n&&n.m&&n.m.rig;if(!r||!r.bones||!r.state||!r.state.p)return _an.apply(this,arguments);dt=+dt||0;
+  const z=sentOn(r);try{return _an.apply(this,arguments)}finally{const ran=sentOff(r,z);try{post(r,dt,ran)}catch(e){}}}}
+// NPC deaths (anim module's updateFalling): take over the fall timing
+let ML=[];const FZ=[];
+if(typeof updateFalling==='function'&&typeof ANIMX!=='undefined'){const _uf=updateFalling;updateFalling=function(dt){dt=+dt||0;FZ.length=0;
+  try{if(typeof dying!=='undefined'&&dying.length)for(const d of dying){const n=d&&d.n;if(!n||!n.m||!n.m.rig||d._a2)continue;d._a2=1;
+      if(d.dir===undefined){const f=n.foe&&n.foe.x!==undefined?n.foe:(NET.role==='client'?P:null);d.vy=n._an?n._an.vy:n.yaw;let sd=0;
+        if(f){const dx=f.x-n.x,dz=f.z-n.z,l=Math.hypot(dx,dz)||1,ra=wrapA(Math.atan2(dx,dz)-d.vy);d.dir=Math.abs(ra)<HP?1:-1;d.side=clamp(Math.sin(ra),-1,1);sd=-(dx*-Math.cos(d.vy)+dz*Math.sin(d.vy))/l}
+        else{d.dir=Math.random()<.5?1:-1;d.side=0}d._sd=sd;if(typeof rigFlash==='function')rigFlash(n.m.rig,1)}
+      ML.push(d)}
+    for(const d of ML){const r=d.n.m.rig;if(!r||!r.bones||!r.state||!r.state.p)continue;if(preDead(r,.5,d.dir,d._sd||0,dt)){if(d.t<.95)d.t=.95;FZ.push(r,sentOn(r))}}}catch(e){}
+  try{return _uf.apply(this,arguments)}finally{for(let i=0;i<FZ.length;i+=2){const r=FZ[i],ran=sentOff(r,FZ[i+1]);try{post(r,dt,ran)}catch(e){}}FZ.length=0;
+    if(ML.length)ML=ML.filter(d=>d.t<=9&&d.n&&d.n.obj&&d.n.obj.parent)}}}
+// co-op avatars
+if(typeof animateAvatars==='function'){const _aa=animateAvatars;const AL=[];animateAvatars=function(dt){dt=+dt||0;AL.length=0;
+  try{if(typeof avatars!=='undefined')for(const id in avatars){const a=avatars[id],r=a&&a.rig;if(!r||!r.bones||!r.state||!r.state.p||!a.init||!a.bn)continue;
+      if(a.deadT>=0){const h=hash(id),raw=(a.deadT+dt)/.9;if(preDead(r,Math.max(.01,raw),h&1?1:-1,((h>>3)%5-2)/2,dt)&&a.deadT<.9)a.deadT=.9-dt}else preDead(r,0,1,0,dt);
+      AL.push(r,sentOn(r))}}catch(e){}
+  try{return _aa.apply(this,arguments)}finally{for(let i=0;i<AL.length;i+=2){const r=AL[i],ran=sentOff(r,AL[i+1]);try{post(r,dt,ran)}catch(e){}}AL.length=0}}}
+
+/* =============== animals: directional hit jolt =============== */
+const AFL=[];
+function aKick(a,src){const f=a._f2||(a._f2={p:{x:0,v:0},r:{x:0,v:0},h:{x:0,v:0},ap:0,ar:0,ah:0,on:false,t:0});
+  const s=src&&src!=='player'&&src.x!==undefined?src:P;let dx=a.x-s.x,dz=a.z-s.z;const l=Math.hypot(dx,dz);if(l<.05){dx=0;dz=1}else{dx/=l;dz/=l}
+  const yw=a.yaw||0,fw=dx*Math.sin(yw)+dz*Math.cos(yw),sd=dx*-Math.cos(yw)+dz*Math.sin(yw);
+  f.p.v+=-fw*3;f.r.v+=sd*4;f.h.v+=.9;f.t=0;if(!f.on){f.on=true;AFL.push(a)}}
+function animalFlinch(dt){for(let i=AFL.length-1;i>=0;i--){const a=AFL[i],f=a._f2,b=a.m&&a.m.body;if(!b){f.on=false;AFL.splice(i,1);continue}
+  if(b.rotation.y===ASENT){b.rotation.z-=f.ap;b.rotation.x-=f.ar;b.position.y-=f.ah}f.ap=f.ar=f.ah=0;f.t+=dt;
+  if(a.dead||f.t>2||!a.obj||!a.obj.parent){b.rotation.y=0;f.on=false;f.p.x=f.p.v=f.r.x=f.r.v=f.h.x=f.h.v=0;AFL.splice(i,1);continue}
+  if(Math.hypot(a.x-camera.position.x,a.z-camera.position.z)>60)continue;
+  spr(f.p,180,9,dt);spr(f.r,180,9,dt);spr(f.h,220,14,dt);f.ap=clamp(f.p.x,-.4,.4);f.ar=clamp(f.r.x,-.4,.4);f.ah=clamp(f.h.x,-.12,.12);
+  b.rotation.z+=f.ap;b.rotation.x+=f.ar;b.position.y+=f.ah;b.rotation.y=ASENT}}
+if(typeof damageAnimal==='function'&&typeof ANIMX!=='undefined'){const _da=damageAnimal;damageAnimal=function(a,dmg,src){const was=!!(a&&!a.dead);const r=_da.apply(this,arguments);
+  try{if(was&&a&&!a.dead&&a.m&&a.m.body&&dmg>0)aKick(a,src)}catch(e){}return r}}
+
+/* =============== first person =============== */
+const FP={nod:0,nodS:0,cY:new Float32Array(2),cZ:new Float32Array(2),A:null,bite:-1,ej:false,step:-1,d0:0,v:new V3()};
+const SM=typeof ANIMX!=='undefined';
+function crumbs(it){try{FP.v.set(R(-.04,.04),-.13,-.38).applyMatrix4(camera.matrixWorld);burst(FP.v,[it.c||'#a07050','#6a4a30'],3,.5,.4,9.8,.45)}catch(e){}}
+function brass(){try{if(!vmCur)return;FP.v.setFromMatrixPosition(vmCur.matrixWorld);burst(FP.v,['#c9a64a','#e0c060','#a8862e'],6,.7,1.1,9.8,.7)}catch(e){}}
+const DRINK=/milk|water|juice|tea|drink|bottle|soda|broth/i;
+function fpLayer(dt){FP.nod=0;if(!P||typeof vm==='undefined'||!vm)return;const A=P.alive?P.anim:null,id=vmId,it=id&&ITEMS[id];
+  if(A!==FP.A){FP.A=A;FP.bite=-1;FP.ej=false;FP.step=-1;if(vmCur&&vmCur.userData&&vmCur.userData.drum)FP.d0=vmCur.userData.drum.rotation.y}
+  const t=A?Math.min(1,A.t||0):0,mine=!!A&&((A.type==='eat'&&it&&it.food)||(A.type==='use'&&it&&it.heal));
+  // the core shakes the item during eat/use; the anim module springs it (linear filter), so filtering the same signal and subtracting it removes it exactly
+  let jy=0,jz=0;if(A&&(A.type==='eat'||A.type==='use')&&t>.25&&t<.8){jy=Math.sin(t*55)*.008;if(A.type==='use')jz=Math.sin(t*30)*.2}
+  if(SM&&dt>0&&dt<.25){cds(FP.cY,0,jy,17.1,dt);cds(FP.cZ,0,jz,19,dt)}else{FP.cY[0]=jy;FP.cZ[0]=jz;FP.cY[1]=FP.cZ[1]=0}
+  if(!A)return;const p=vm.position,r=vm.rotation;if(mine){p.y-=FP.cY[0];r.z-=FP.cZ[0]}
+  const env=t<.25?eOut(t/.25):t>.8?1-eOut((t-.8)/.2):1;
+  if(A.type==='eat'&&it&&it.food){const f=it.food;
+    if(DRINK.test(id)||(f.hyd||0)>(f.cal||0)*1.5){const u=clamp((t-.22)/.6,0,1),g=u>0&&u<1?Math.max(0,Math.sin(u*Math.PI*3)):0;r.x+=.35*env;r.z+=.15*env;p.y+=.03*env+.008*g;p.z+=.03*env;FP.nod=.07*env+.012*g}
+    else{const u=(t-.25)/.55;let bt=0;if(u>0&&u<1){const ph=u*3,bi=Math.floor(ph),l=ph-bi;bt=l<.3?eOut(l/.3):1-eIO((l-.3)/.7);if(bi!==FP.bite&&l>=.3){FP.bite=bi;crumbs(it)}}
+      p.z+=.05*bt;p.y+=.018*bt;r.x+=.14*bt;r.z+=.06*bt;FP.nod=-.02*bt-.015*env}}
+  else if(A.type==='use'&&it&&it.heal){
+    if(/syringe|inject|needle/i.test(id)){const aE=eIO(clamp((t-.2)/.18,0,1))*(1-eIO(clamp((t-.82)/.12,0,1))),jab=t<.42?0:t<.48?eIn((t-.42)/.06):t<.74?1:t<.84?1-eIO((t-.74)/.1):0,pr=bump(t,.5,.72);
+      r.x-=.75*aE;r.z+=.25*aE;p.x+=.05*aE;p.y-=.05*aE+.035*jab-Math.sin(t*90)*.0015*pr;p.z-=.06*jab;FP.nod=-.1*aE;if(jab>.99&&!FP.ej){FP.ej=true;kick(-.006,0,0)}}
+    else{const u=clamp((t-.25)/.55,0,1),am=Math.sin(Math.PI*u),an=u*TAU*2.5,tug=bump(t,.74,.86);p.x+=.035*Math.cos(an)*am+.03*tug;p.y+=.028*Math.sin(an)*am;r.z+=.32*Math.sin(an)*am-.2*tug;r.y+=.14*Math.cos(an)*am;FP.nod=-.08*env}}
+  else if(A.type==='place'){const pu=bump(t,.15,.6),an=bump(t,0,.2);p.z-=.045*pu;p.y+=.012*an-.012*bump(t,.5,1);r.x+=.08*an}
+  else if(A.type==='reload'&&vmCur&&vmCur.userData&&vmCur.userData.drum){const dr=vmCur.userData.drum,open=bump(t,.1,.22),ej=bump(t,.22,.34),cl=bump(t,.8,.9);
+    r.z+=.18*open-.3*cl;p.y+=.05*ej;r.x+=.4*ej;p.x+=.02*ej;if(t>.27&&!FP.ej){FP.ej=true;brass()}
+    const u=(t-.36)/.42*6;if(u>0&&u<6){const k=Math.floor(u),l=u-k,pu=bump(l,0,.55);p.z+=.014*pu;r.x-=.05*pu;dr.rotation.y=FP.d0+(k+eIO(clamp((l-.35)/.4,0,1)))*Math.PI/3;
+      if(k!==FP.step&&l>.5){FP.step=k;if(typeof sfx==='function')try{sfx('click',.1)}catch(e){}}}
+    else if(t>=.3)dr.rotation.y=FP.d0}}
+const _uvm=updateVM;updateVM=function(dt){const r=_uvm.apply(this,arguments);try{fpLayer(+dt||0)}catch(e){}return r};
+// hammer hits on a building piece get the same impact feedback as melee
+if(typeof openUpgrade==='function'){const _ou=openUpgrade;openUpgrade=function(){try{const A=P&&P.anim;if(A&&A.type==='swing'&&P.hot[P.sel]==='hammer'&&A.t>.35&&typeof PLSH!=='undefined'&&PLSH){PLSH.hitStop(.05);PLSH.kick(-.014,0,R(-.004,.004))}}catch(e){}return _ou.apply(this,arguments)}}
+if(typeof addPiece==='function'){const _ap=addPiece;addPiece=function(){const r=_ap.apply(this,arguments);try{const A=P&&P.anim;if(A&&A.type==='place'&&A.t<.6)kick(-.006,0,0)}catch(e){}return r}}
+if(typeof placeDep==='function'){const _pd=placeDep;placeDep=function(){const n0=typeof deps!=='undefined'?deps.length:0;const r=_pd.apply(this,arguments);try{if(typeof deps!=='undefined'&&deps.length>n0)kick(-.005,0,0)}catch(e){}return r}}
+
+/* =============== death camera & respawn wake-up =============== */
+const LH={x:0,z:0,t:-99};
+const _hurt=hurt;hurt=function(dmg,cause,fx,fz){try{if(S&&fin(+fx)&&fin(+fz)){LH.x=+fx;LH.z=+fz;LH.t=S.time}}catch(e){}return _hurt.apply(this,arguments)};
+const DC={on:false,t:0,y:1.6,y0:1.6,vy:0,bn:0,p0:0,pT:0,rT:0,side:1,back:1,dx:0,dz:0,pc:{x:0,v:0},rc:{x:0,v:0}};
+function dcStart(c){if(!P)return;DC.on=true;DC.t=0;DC.y0=DC.y=clamp(P.eye||1.62,.6,1.8);DC.vy=0;DC.bn=0;DC.p0=fin(P.pitch)?P.pitch:0;
+  let fr=R(-.3,.3),sd=Math.random()<.5?-1:1;const sy=Math.sin(P.yaw||0),cy=Math.cos(P.yaw||0);
+  if(S&&S.time-LH.t<1.2){const dx=LH.x-P.x,dz=LH.z-P.z,l=Math.hypot(dx,dz);if(l>.05){fr=(-dx*sy-dz*cy)/l;const s=(dx*cy-dz*sy)/l;if(Math.abs(s)>.15)sd=s>0?1:-1}}
+  if(c==='fall'||c==='drown')fr=-.6;DC.back=fr>.2?1:fr<-.2?-1:(Math.random()<.5?1:-1);DC.side=sd;
+  DC.pc.x=DC.p0;DC.pc.v=0;DC.rc.x=0;DC.rc.v=0;DC.pT=DC.back>0?R(.45,.7):R(-.75,-.5);DC.rT=sd*R(.8,1.25);
+  DC.dx=sy*DC.back*.3-cy*.18*sd;DC.dz=cy*DC.back*.3+sy*.18*sd}
+function deathCam(dt){DC.t+=dt;
+  if(DC.t<.12)DC.y-=dt*.6;else{DC.vy-=9.8*.9*dt;DC.y+=DC.vy*dt;if(DC.y<.3){DC.y=.3;if(DC.vy<-1.3&&DC.bn<2){DC.vy*=-.25;DC.bn++;DC.rc.v+=DC.side*1.2;DC.pc.v-=DC.back*1}else DC.vy=0}}
+  const f=clamp((DC.y0-DC.y)/Math.max(.1,DC.y0-.3),0,1),e=eIO(f);
+  sprT(DC.pc,lerp(DC.p0,DC.pT,e),60,7,dt);sprT(DC.rc,DC.rT*eIn(f),45,5.5,dt);
+  const x=P.x+DC.dx*e,z=P.z+DC.dz*e;let y=P.y+DC.y;if(typeof groundH==='function'){const g=groundH(x,z);if(fin(g))y=Math.max(y,g+.2)}
+  if(!fin(x)||!fin(y)||!fin(z))return;camera.position.set(x,y,z);camera.rotation.set(clamp(DC.pc.x,-1.5,1.5),(P.yaw||0)+DC.side*.2*e,clamp(DC.rc.x,-1.6,1.6),'YXZ')}
+const WK={t:9,dur:1.5,side:1};
+function wake(dt){WK.t+=dt;const u=clamp(WK.t/WK.dur,0,1),l=1-eIO(clamp((u-.08)/.92,0,1));if(l<=0)return;
+  camera.position.y-=l*Math.max(0,(P.eye||1.62)-.45);camera.rotation.x+=l*.55;camera.rotation.z+=WK.side*l*(.45+.05*Math.sin(WK.t*3))}
+function frameFX(dt){if(!S||!P)return;dt=Math.min(.1,Math.max(0,+dt||0));
+  try{animalFlinch(dt)}catch(e){}
+  if(!camOK()||P.vehicle)return;
+  if(!P.alive){if(DC.on)try{deathCam(dt)}catch(e){}return}
+  if(WK.t<WK.dur)try{wake(dt)}catch(e){}
+  FP.nodS+=(FP.nod-FP.nodS)*Math.min(1,dt*10);if(Math.abs(FP.nodS)>1e-5)camera.rotation.x+=FP.nodS}
+onHook('render',frameFX);
+onHook('death',c=>{try{dcStart(c)}catch(e){}});
+onHook('respawn',()=>{DC.on=false;WK.t=0;WK.side=Math.random()<.5?-1:1;FP.nod=FP.nodS=0});
+onHook('newGame',()=>{DC.on=false;WK.t=9;ML=[];FZ.length=0;for(const a of AFL)if(a._f2)a._f2.on=false;AFL.length=0;FP.A=null;FP.nod=FP.nodS=0;FP.cY.fill(0);FP.cZ.fill(0)});
+return{DC,WK,FP,AFL,dbg:()=>({ml:ML.length,afl:AFL.length,dc:DC.on})}})();
+
 /* ================= RENDER ================= */
 const tmpC=new THREE.Color(),tmpC2=new THREE.Color();
 const SKY={dayTop:new THREE.Color('#4a82c4'),dayBot:new THREE.Color('#bcd2de'),setTop:new THREE.Color('#3b4f7a'),setBot:new THREE.Color('#e8a26a'),nightTop:new THREE.Color('#03050b'),nightBot:new THREE.Color('#080b12'),
